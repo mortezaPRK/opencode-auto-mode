@@ -21,6 +21,8 @@
     "test:integration": "bun run integration/opencode.ts"
   },
   "dependencies": {
+    "@bufbuild/cel": "0.6.1",
+    "@bufbuild/protobuf": "2.16.0",
     "@opencode/plugin": "^2.0.14"
   },
   "peerDependencies": {

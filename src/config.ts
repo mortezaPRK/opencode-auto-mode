@@ -1,8 +1,9 @@
 import type { PolicyOptions } from "./policy.js";
 import type { Decision } from "./reviewer.js";
+import { compileExpression } from "./rules.js";
 
 export type ReviewerModel = { id: string; providerID: string; variant?: string };
-export type UserRule = { action: string; resource?: string; decision: Decision };
+export type UserRule = { expression: string; decision: Decision };
 export type DecisionProvider = {
   model?: string;
   apiKeyEnv?: string;
@@ -41,9 +42,9 @@ function model(value: unknown): value is ReviewerModel {
 }
 
 function rule(value: unknown): value is UserRule {
-  return object(value) && only(value, ["action", "resource", "decision"]) && text(value.action) &&
-    (value.resource === undefined || text(value.resource)) &&
-    typeof value.decision === "string" && ["allow", "deny", "ask"].includes(value.decision);
+  if (!object(value) || !only(value, ["expression", "decision"]) || !text(value.expression) ||
+      typeof value.decision !== "string" || !["allow", "deny", "ask"].includes(value.decision)) return false;
+  try { compileExpression(value.expression); return true; } catch { return false; }
 }
 
 export function localEndpoint(value: string): string {

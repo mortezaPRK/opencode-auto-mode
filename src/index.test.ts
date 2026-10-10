@@ -27,7 +27,7 @@ function event(effect: Evaluation["effect"] = "ask"): Evaluation {
 
 describe("OpenCode permission hook", () => {
   it("preserves host denials even with permissive or invalid configuration", async () => {
-    for (const config of [{ classifier: { stages: [{ type: "rules", rules: [{ action: "*", decision: "allow" }] }] } }, { classifier: { stages: [] } }]) {
+    for (const config of [{ classifier: { stages: [{ type: "rules", rules: [{ expression: "true", decision: "allow" }] }] } }, { classifier: { stages: [] } }]) {
       const host = await setup(config);
       const pending = event("deny");
       await host.evaluate(pending);
@@ -83,7 +83,7 @@ describe("OpenCode permission hook", () => {
     }
   });
   it("keeps repeated policy denials denied and disposes partial setup", async () => {
-    const host = await setup({ classifier: { stages: [{ type: "rules", rules: [{ action: "shell", decision: "deny" }] }] } });
+    const host = await setup({ classifier: { stages: [{ type: "rules", rules: [{ expression: 'action == "shell"', decision: "deny" }] }] } });
     for (let i = 0; i < 25; i++) {
       const pending = event(); await host.evaluate(pending); assert.equal(pending.effect, "deny");
     }

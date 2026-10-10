@@ -126,7 +126,10 @@ async function until<T>(get: () => Promise<T>, ready: (value: T) => boolean) {
   throw new Error(`OpenCode readiness timed out: ${String(last)} ${logs.slice(-2000)}`);
 }
 function stage(type: string): ClassifierStage {
-  if (type === "rules") return { type, rules: [{ action: "shell", resource: "pwd", decision: "allow" }, { action: "shell", resource: "touch denied-file", decision: "deny" }] };
+  if (type === "rules") return { type, rules: [
+    { expression: 'action == "shell" && resource == "pwd"', decision: "allow" },
+    { expression: 'action == "shell" && resource == "touch denied-file"', decision: "deny" },
+  ] };
   if (type === "laya") return { type, endpoint: `${endpoint}/v1/systemone`, timeoutMs: 100 };
   if (type === "jev" || type === "openai-decision") return { type, apiKeyEnv: "AUTO_MODE_INTEGRATION_API_KEY", timeoutMs: 100 };
   return { type } as ClassifierStage;
@@ -239,10 +242,33 @@ try {
     const missing = await fixture({ classifier: { stages: [{ type: "jev", apiKeyEnv: "AUTO_MODE_MISSING_TEST_KEY" }, stage("llm")] } });
     calls.length = 0; await expectPermission(missing, "ask"); assert.deepEqual(calls, []);
   });
+  await run("CEL coverage, errors, limits, and ask precedence", async () => {
+    const covered = await fixture({ classifier: { stages: [{ type: "rules", rules: [
+      { expression: 'resource == "touch a"', decision: "allow" },
+      { expression: 'resource == "touch b"', decision: "allow" },
+    ] }] } });
+    await expectPermission(covered, "allow", ["touch a", "touch b"]);
+    await expectPermission(covered, "ask", ["touch a", "touch c"]);
+    for (const expression of ['resource', 'unknown == "pwd"', 'action ==', '[1].all(x, x > 0)']) {
+      const f = await fixture({ classifier: { stages: [{ type: "rules", rules: [{ expression, decision: "allow" }] }, stage("static"), stage("llm")] } });
+      calls.length = 0; await expectPermission(f, "ask", ["pwd"]); assert.deepEqual(calls, []);
+    }
+    const bounded = await fixture({ classifier: { stages: [{ type: "rules", rules: [{ expression: "true", decision: "allow" }] }, stage("llm")] } });
+    calls.length = 0; await expectPermission(bounded, "ask", ["x".repeat(4097)]); assert.deepEqual(calls, []);
+    const escalated = await fixture({ classifier: { stages: [stage("llm"), { type: "rules", rules: [{ expression: 'action == "shell"', decision: "ask" }] }] } });
+    calls.length = 0; await expectPermission(escalated, "ask"); assert.deepEqual(calls, []);
+    const denied = await fixture({ classifier: { stages: [{ type: "rules", rules: [
+      { expression: "resource", decision: "allow" },
+      { expression: 'resource == "pwd"', decision: "deny" },
+    ] }, stage("llm")] } });
+    calls.length = 0; await expectPermission(denied, "deny", ["pwd"]); assert.deepEqual(calls, []);
+  });
   const toolCases: { name: string; stages: ClassifierStage[]; expected: Verdict; profile: Profile; command?: string; reached?: string[] }[] = [
     { name: "static read-only", stages: [stage("static")], expected: "allow", profile: {}, command: "pwd" },
-    { name: "user allow", stages: [{ type: "rules", rules: [{ action: "shell", decision: "allow" }] }], expected: "allow", profile: {} },
-    { name: "user deny", stages: [{ type: "rules", rules: [{ action: "shell", decision: "deny" }] }], expected: "deny", profile: {} },
+    { name: "user allow", stages: [{ type: "rules", rules: [{ expression: 'action == "shell"', decision: "allow" }] }], expected: "allow", profile: {} },
+    { name: "user deny", stages: [{ type: "rules", rules: [{ expression: 'action == "shell"', decision: "deny" }] }], expected: "deny", profile: {} },
+    { name: "CEL predicate", stages: [{ type: "rules", rules: [{ expression: 'agent == "auto" && action == "shell" && resource == "printf integration > tool-result.txt"', decision: "allow" }] }], expected: "allow", profile: {} },
+    { name: "CEL invalid result", stages: [{ type: "rules", rules: [{ expression: "resource", decision: "allow" }] }, stage("llm")], expected: "ask", profile: {} },
     { name: "LLM allow", stages: [stage("llm")], expected: "allow", profile: {} },
     { name: "LLM deny", stages: [stage("llm")], expected: "deny", profile: { triage: "BLOCK", verdict: "DENY: out of scope" } },
     { name: "LLM ask", stages: [stage("llm")], expected: "ask", profile: { triage: "BLOCK", verdict: "ASK: uncertain" } },
