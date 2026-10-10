@@ -21,8 +21,7 @@ Add the checkout to your global `~/.config/opencode/opencode.jsonc`, using its a
   "agents": {
     "auto": {
       "mode": "primary",
-      "description": "Build with automatic permission review",
-      "permissions": [{ "action": "*", "resource": "*", "effect": "ask" }]
+      "description": "Build with automatic permission review"
     }
   },
   "plugins": [
