@@ -1,7 +1,14 @@
 {
-  "name": "@mellena1/opencode-auto-mode",
+  "name": "@mortezaprk/opencode-auto-mode",
   "version": "0.5.2",
-  "description": "OpenCode v2 plugin that mimics Claude Code auto mode: a cheap LLM auto-approves/denies permission requests, falling back to the user when uncertain.",
+  "description": "Configurable automatic permission review for OpenCode v2.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mortezaPRK/opencode-auto-mode.git"
+  },
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
+  },
   "type": "module",
   "license": "MIT",
   "files": ["src"],
