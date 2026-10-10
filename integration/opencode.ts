@@ -262,6 +262,12 @@ try {
       { expression: 'resource == "pwd"', decision: "deny" },
     ] }, stage("llm")] } });
     calls.length = 0; await expectPermission(denied, "deny", ["pwd"]); assert.deepEqual(calls, []);
+    const mixed = await fixture({ classifier: { stages: [{ type: "rules", rules: [{
+      expression: 'resource == "pwd" ? true : unknown', decision: "deny",
+    }] }, stage("llm")] } });
+    for (const resources of [["pwd", "other"], ["other", "pwd"]]) {
+      calls.length = 0; await expectPermission(mixed, "deny", resources); assert.deepEqual(calls, []);
+    }
   });
   const toolCases: { name: string; stages: ClassifierStage[]; expected: Verdict; profile: Profile; command?: string; reached?: string[] }[] = [
     { name: "static read-only", stages: [stage("static")], expected: "allow", profile: {}, command: "pwd" },

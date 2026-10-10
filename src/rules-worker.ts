@@ -13,13 +13,19 @@ function evaluate() {
       if (rule.decision !== decision) continue;
       try {
         const predicate = compileExpression(rule.expression);
-        const matches = resources.map((resource) => {
-          const result = predicate({ ...bindings, resource });
-          if (typeof result !== "boolean") throw new Error("CEL rules must return a boolean");
-          return result;
-        });
+        const matches = resources.map(() => false);
+        for (const [resourceIndex, resource] of resources.entries()) {
+          try {
+            const result = predicate({ ...bindings, resource });
+            if (typeof result !== "boolean") throw new Error("CEL rules must return a boolean");
+            matches[resourceIndex] = result;
+            if (result && decision !== "allow") {
+              results[index] = { any: true, coverage: hasResources ? matches : [] };
+              return results;
+            }
+          } catch { failed = true; }
+        }
         results[index] = { any: matches.some(Boolean), coverage: hasResources ? matches : [] };
-        if (results[index].any && decision !== "allow") return results;
       } catch { failed = true; }
     }
     if (failed) return null;

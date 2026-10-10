@@ -7,6 +7,7 @@ const environment = celEnv({ variables: {
   action: CelScalar.STRING, resource: CelScalar.STRING, agent: CelScalar.STRING,
   projectDir: CelScalar.STRING, isDelegation: CelScalar.BOOL,
 } });
+let activeWorkers = 0;
 
 export function compileExpression(expression: string) {
   if (typeof expression !== "string" || !expression.trim() || expression.length > 4096)
@@ -51,9 +52,11 @@ export async function evaluateRules(rules: UserRule[], request: PermissionReques
       strings.some((value) => typeof value !== "string" || value.length > 4096) ||
       strings.reduce((sum, value) => sum + Buffer.byteLength(value), 0) > 65_536)
     throw new Error("CEL request exceeds evaluation limits");
+  if (activeWorkers >= 4) throw new Error("CEL evaluator is busy");
   const worker = new Worker(new URL("./rules-worker.ts", import.meta.url), {
     workerData: { rules, resources, bindings, hasResources: request.resources.length > 0 },
   });
+  activeWorkers++;
   try {
     const matches = await new Promise<{ any: boolean; coverage: boolean[] }[]>((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error("CEL evaluation timed out")), 1000);
@@ -69,5 +72,7 @@ export async function evaluateRules(rules: UserRule[], request: PermissionReques
       });
     });
     return matches.map((match, index) => ({ ...match, rule: rules[index] }));
-  } finally { await worker.terminate(); }
+  } finally {
+    try { await worker.terminate(); } finally { activeWorkers--; }
+  }
 }

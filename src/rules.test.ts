@@ -61,4 +61,18 @@ describe("CEL rules", () => {
     ] }];
     assert.equal((await compositeDecision(stages, { ...request, resources: ["pwd"] }, unused)).decision, "deny");
   });
+  it("preserves any resource denial even when other resources fail evaluation", async () => {
+    const stages: ClassifierStage[] = [{ type: "rules", rules: [{
+      expression: 'resource == "pwd" ? true : unknown', decision: "deny",
+    }] }];
+    for (const resources of [["pwd", "other"], ["other", "pwd"]])
+      assert.equal((await compositeDecision(stages, { ...request, resources }, unused)).decision, "deny");
+  });
+  it("bounds concurrent evaluation and restores capacity after cleanup", async () => {
+    const stages: ClassifierStage[] = [rules("true"), { type: "llm" }];
+    const results = await Promise.all(Array.from({ length: 12 }, () => compositeDecision(stages, request, unused)));
+    assert.ok(results.some((result) => result.decision === "ask"));
+    assert.ok(results.every((result) => ["allow", "ask"].includes(result.decision)));
+    assert.equal((await compositeDecision(stages, request, unused)).decision, "allow");
+  });
 });
