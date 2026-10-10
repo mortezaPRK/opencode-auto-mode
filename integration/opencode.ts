@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { once } from "node:events";
+import { randomUUID } from "node:crypto";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -87,11 +88,16 @@ writeFileSync(join(root, "config/opencode/opencode.json"), JSON.stringify(global
 const portServer = createServer(); portServer.listen(0, "127.0.0.1"); await once(portServer, "listening");
 const address = portServer.address(); assert.ok(address && typeof address !== "string");
 const port = address.port; await new Promise<void>((done) => portServer.close(() => done()));
+const password = randomUUID();
+const hostEnv = { ...process.env, OPENCODE_SERVER_PASSWORD: password, OPENCODE_DISABLE_MODELS_FETCH: "true",
+  OPENCODE_AUTO_MODE_TEST_ENDPOINT: endpoint, AUTO_MODE_INTEGRATION_API_KEY: "local-test-key",
+  OPENCODE_DISABLE_PROJECT_CONFIG: "false", OPENCODE_DISABLE_LOCAL_CONFIG: "false",
+  XDG_CONFIG_HOME: join(root, "config"), XDG_DATA_HOME: join(root, "data"), XDG_CACHE_HOME: join(root, "cache"),
+  XDG_STATE_HOME: join(root, "state"), TMPDIR: join(root, "tmp") };
+for (const key of ["OPENCODE_CONFIG", "OPENCODE_CONFIG_CONTENT", "OPENCODE_CONFIG_DIR", "OPENCODE_SIMULATE", "OPENCODE_DRIVE"])
+  delete (hostEnv as Record<string, string | undefined>)[key];
 const host = spawn(binary, ["serve", "--hostname", "127.0.0.1", "--port", String(port), "--print-logs", "--log-level", "warn"], {
-  cwd: root, env: { ...process.env, OPENCODE_SERVER_PASSWORD: "local-integration-test", OPENCODE_DISABLE_MODELS_FETCH: "true",
-    OPENCODE_AUTO_MODE_TEST_ENDPOINT: endpoint, AUTO_MODE_INTEGRATION_API_KEY: "local-test-key",
-    XDG_CONFIG_HOME: join(root, "config"), XDG_DATA_HOME: join(root, "data"), XDG_CACHE_HOME: join(root, "cache"),
-    XDG_STATE_HOME: join(root, "state"), TMPDIR: join(root, "tmp") },
+  cwd: root, env: hostEnv,
   stdio: ["ignore", "pipe", "pipe"],
 });
 let logs = "";
@@ -103,7 +109,7 @@ const base = `http://127.0.0.1:${port}`;
 async function api(path: string, body?: unknown) {
   const response = await fetch(`${base}${path}`, {
     method: body === undefined ? "GET" : "POST", signal: AbortSignal.timeout(15_000),
-    headers: { authorization: `Basic ${Buffer.from("opencode:local-integration-test").toString("base64")}`, "content-type": "application/json" },
+    headers: { authorization: `Basic ${Buffer.from(`opencode:${password}`).toString("base64")}`, "content-type": "application/json" },
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   });
   if (!response.ok) throw new Error(`${path}: ${response.status} ${await response.text()}`);
