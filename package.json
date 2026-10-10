@@ -17,7 +17,8 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "bun test"
+    "test": "bun test",
+    "test:integration": "bun run integration/opencode.ts"
   },
   "dependencies": {
     "@opencode/plugin": "^2.0.14"
