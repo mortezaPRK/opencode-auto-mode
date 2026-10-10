@@ -2,6 +2,10 @@
   "name": "@mortezaprk/opencode-auto-mode",
   "version": "0.5.2",
   "description": "Configurable automatic permission review for OpenCode v2.",
+  "author": {
+    "name": "Andrew Mellen",
+    "url": "https://github.com/mellena1"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/mortezaPRK/opencode-auto-mode.git"

@@ -1,20 +1,135 @@
 # OpenCode Auto Mode
 
-Automatic permission review for OpenCode v2. Read-only operations can be approved immediately; other actions go to a reviewer that allows, denies, or asks you to decide.
+## What this solves
 
-Maintained independently at [mortezaPRK/opencode-auto-mode](https://github.com/mortezaPRK/opencode-auto-mode). Requires OpenCode v2 with the `@opencode/plugin` 2.0 API.
+OpenCode's permission prompts can interrupt routine work. This plugin reviews actions automatically and returns **allow**, **deny**, or **ask**, leaving uncertain decisions to you. Combine built-in checks, your own CEL rules, decision providers, and an LLM reviewer to choose how approvals work.
 
-## Install
+This is an independently maintained project for OpenCode v2 (`@opencode/plugin` 2.0). **Review applies to all agents by default**, including Build and Plan. An Auto agent is optional; adding one does not limit review unless you also configure `options.agents`.
 
-Clone this repository and install its dependencies:
+## Install from GitHub Packages
 
-```sh
-git clone https://github.com/mortezaPRK/opencode-auto-mode.git
-cd opencode-auto-mode
-bun install --frozen-lockfile
+The package is `@mortezaprk/opencode-auto-mode`. Publishing is configured, but the first release must be published before these registry install steps work.
+
+Add this line to your user `~/.npmrc`:
+
+```ini
+@mortezaprk:registry=https://npm.pkg.github.com
 ```
 
-Add the checkout to your global `~/.config/opencode/opencode.jsonc`, using its absolute path:
+Authenticate with your GitHub username and a personal access token (classic) with `read:packages`, using the token as the password:
+
+```sh
+npm login --scope=@mortezaprk --registry=https://npm.pkg.github.com --auth-type=legacy
+```
+
+Keep registry credentials in your user configuration. Add the plugin to your global `~/.config/opencode/opencode.jsonc` using an example below. OpenCode installs the package; no separate project dependency is needed. Restart the service after changing plugins:
+
+```sh
+opencode service restart
+```
+
+## Configuration examples
+
+### Built-in checks followed by an LLM
+
+This reviews **all agents** because `agents` is omitted. Built-in checks allow supported read-only commands such as `pwd` and block known dangerous shell operations. Other supported actions go to the LLM using OpenCode's default model; uncertain decisions require manual approval.
+
+```json
+{
+  "plugins": [
+    {
+      "package": "@mortezaprk/opencode-auto-mode",
+      "options": {
+        "review": "all"
+      }
+    }
+  ]
+}
+```
+
+Set `options.model` to `{ "id": "your-model", "providerID": "your-provider" }` to select the reviewer model. `review: "all"` reviews eligible actions even when OpenCode would allow them; `review: "prompts"` reviews only actions already requiring approval. OpenCode's explicit denies remain authoritative.
+
+### Static checks and your own rules, without a model
+
+This also reviews **all agents**. `pwd` passes the static checks, `git status --short` matches the exact CEL allow rule, `curl` matches the deny rule, and edits or writes require your approval. Unmatched actions require manual approval because there is no model stage.
+
+```json
+{
+  "plugins": [
+    {
+      "package": "@mortezaprk/opencode-auto-mode",
+      "options": {
+        "review": "all",
+        "classifier": {
+          "stages": [
+            { "type": "static" },
+            {
+              "type": "rules",
+              "rules": [
+                {
+                  "expression": "action == 'shell' && command == 'git' && args == ['status', '--short']",
+                  "decision": "allow"
+                },
+                {
+                  "expression": "action == 'shell' && command == 'curl'",
+                  "decision": "deny"
+                },
+                {
+                  "expression": "action in ['edit', 'write']",
+                  "decision": "ask"
+                }
+              ]
+            }
+          ]
+        }
+      }
+    }
+  ]
+}
+```
+
+Rules use [Buf's CEL evaluator](https://github.com/bufbuild/cel-es). Available variables are `action`, `resource`, `command`, `args`, `agent`, `projectDir`, and `isDelegation`. For shell resources, `command` is the literal executable and `args` contains its decoded arguments. Every resource must be covered by allow rules within a rules stage. Matching deny rules take precedence across stages, followed by ask rules, before any allow decision. Collection macros are disabled; invalid expressions or evaluation limits require manual approval.
+
+Shell review uses OpenCode's subcommand parsing and a literal-command guard. A permitted `pwd` does not authorize the rest of `pwd ; sudo rm -rf`; the dangerous operation is denied. Unsupported syntax, such as redirects or substitutions, and Windows shells require manual approval.
+
+### Decision providers with an LLM fallback
+
+This reviews **all agents** too. Static checks run first, followed by Jev, OpenAI Decisions, local Laya, and an LLM. Remove or reorder provider stages to suit your setup; you do not need all of them.
+
+```json
+{
+  "plugins": [
+    {
+      "package": "@mortezaprk/opencode-auto-mode",
+      "options": {
+        "review": "all",
+        "classifier": {
+          "stages": [
+            { "type": "static" },
+            { "type": "jev", "minConfidence": 0.9 },
+            { "type": "openai-decision", "minConfidence": 0.9 },
+            { "type": "laya", "endpoint": "http://127.0.0.1:8000/v1/systemone" },
+            { "type": "llm" }
+          ]
+        }
+      }
+    }
+  ]
+}
+```
+
+| Stage | Setup |
+| --- | --- |
+| `jev` | Set `TYPESAFE_API_KEY`; default model is `jev-latest`. |
+| `openai-decision` | Set `OPENAI_API_KEY`; default model is `gpt-6-luna`. |
+| `laya` | Run a compatible local `/v1/systemone` service; optionally set `LAYA_API_KEY`. Only loopback endpoints are accepted. |
+| `llm` | Uses OpenCode's default model, or the configured reviewer model. |
+
+A valid provider allow/deny result below `minConfidence` continues to the next stage. An explicit ask, provider error, timeout, or invalid response requires manual approval and stops the pipeline. Export API keys in the environment of the OpenCode service. Provider stages also accept `model`, `apiKeyEnv`, and `timeoutMs`.
+
+## Tips: an optional Auto agent
+
+Add an Auto agent if you want a separate agent for automatic review, then restrict the plugin with `options.agents: ["auto"]`. **Only this example limits review to Auto**; Build, Plan, and other agents retain their normal OpenCode permission behavior.
 
 ```json
 {
@@ -26,43 +141,20 @@ Add the checkout to your global `~/.config/opencode/opencode.jsonc`, using its a
   },
   "plugins": [
     {
-      "package": "/absolute/path/to/opencode-auto-mode",
+      "package": "@mortezaprk/opencode-auto-mode",
       "options": {
-        "model": { "id": "your-model", "providerID": "your-provider" },
         "review": "all",
-        "agents": ["auto"],
-        "allowInProjectEdits": false
+        "agents": ["auto"]
       }
     }
   ]
 }
 ```
 
-Omit `model` to use OpenCode's default model. Restart the OpenCode service after changing plugins:
+Select Auto alongside Build and Plan. To review all agents while keeping Auto available, omit `options.agents`.
 
-```sh
-opencode service restart
-```
+Keep ordinary OpenCode permission rules requiring approval for sensitive actions so prompts remain available when the plugin is disabled. `trusted`, `blocks`, and `exceptions` replace the corresponding model-review policy lists. Configure these globally. The TUI integration shows review status and provides manual allow/deny commands.
 
-Select `auto` alongside `plan` and `build`. The configurable classifier feature scopes automatic review to the agent names in `options.agents`.
+## Credit
 
-Releases of `@mortezaprk/opencode-auto-mode` are published to GitHub Packages. Set `@mortezaprk:registry=https://npm.pkg.github.com` in your user npm configuration and authenticate to that registry with a GitHub token granting `read:packages`. Then replace the checkout path with `@mortezaprk/opencode-auto-mode` in the plugin entry.
-
-## Configuration
-
-`review: "all"` reviews eligible actions even when OpenCode would allow them. `review: "prompts"` reviews actions that already require approval. OpenCode's explicit denies remain authoritative.
-
-`classifier.stages` selects an ordered combination of `static`, `rules`, `jev`, `openai-decision`, `laya`, and `llm` classifiers. The default is static checks followed by an LLM reviewer. Rules use [Buf's CEL evaluator](https://github.com/bufbuild/cel-es): `{ "expression": "action == 'shell' && command == 'pwd' && size(args) == 0", "decision": "allow" }`. Expressions can use `action`, `resource`, `command`, `args`, `agent`, `projectDir`, and `isDelegation`; all resources must match allow rules, and deny rules take precedence. Shell resources use OpenCode's command parsing; unsupported syntax and Windows shells require manual approval. Collection macros are disabled, and invalid results or evaluation limits require manual approval. Jev uses `TYPESAFE_API_KEY`, OpenAI Decisions uses `OPENAI_API_KEY`, and local Laya uses the loopback `/v1/systemone` endpoint with an optional `LAYA_API_KEY`.
-
-`trusted`, `blocks`, and `exceptions` replace the corresponding reviewer policy lists. Configure these in your global config. Keep ordinary OpenCode permission rules requiring approval for sensitive actions so manual prompts remain available when the plugin is disabled.
-
-The package's `./tui` entry provides a review indicator and manual allow/deny commands. Automatic decisions can be wrong; actions with unclear authorization should reach the normal permission dialog.
-
-## Development
-
-```sh
-bun test
-bun run typecheck
-```
-
-MIT licensed. Derived from [mellena1/opencode-auto-mode](https://github.com/mellena1/opencode-auto-mode); original copyright attribution is retained in [LICENSE](LICENSE).
+Created originally by [Andrew Mellen (mellena1)](https://github.com/mellena1) in [mellena1/opencode-auto-mode](https://github.com/mellena1/opencode-auto-mode), also credited as the author in [package.json](package.json). This independent project retains the original [MIT license](LICENSE).
