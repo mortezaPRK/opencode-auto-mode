@@ -15,7 +15,7 @@ export function privateFile(filename: string, write: boolean, append = false): n
   const directory = fs.lstatSync(STORAGE_DIR);
   if (!directory.isDirectory() || !owned(directory)) throw new Error("Unsafe storage directory");
   const fd = fs.openSync(path.join(STORAGE_DIR, filename),
-    (write ? fs.constants.O_RDWR | fs.constants.O_CREAT : fs.constants.O_RDONLY) | fs.constants.O_NOFOLLOW |
+    (write ? fs.constants.O_RDWR | fs.constants.O_CREAT : fs.constants.O_RDONLY) | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK |
       (append ? fs.constants.O_APPEND : 0), 0o600);
   const file = fs.fstatSync(fd);
   if (!file.isFile() || !owned(file) || file.nlink !== 1) {

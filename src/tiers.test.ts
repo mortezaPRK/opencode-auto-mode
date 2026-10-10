@@ -4,6 +4,7 @@ import { classify, isInProject } from "./tiers.js";
 import { mkdtempSync, rmSync, symlinkSync, writeFileSync, linkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { execFileSync } from "node:child_process";
 
 describe("classify", () => {
   it("auto-allows safe read-only shell commands", () => {
@@ -55,6 +56,12 @@ describe("classify", () => {
       assert.equal(classify("read", ["single.ts"], options).tier, "auto-allow");
       for (const target of [".env", ".npmrc", "id_rsa", "key.pem", ".opencode/opencode.jsonc", ".git/hooks/post-commit", "linked/passwd", "hardlinked.ts", "/etc/passwd"])
         assert.equal(classify("edit", [target], options).tier, "review", target);
+      assert.equal(classify("edit", [root], options).tier, "review");
+      if (process.platform !== "win32") {
+        execFileSync("mkfifo", [join(root, "pipe")]);
+        assert.equal(classify("read", ["pipe"], options).tier, "review");
+        assert.equal(classify("write", ["pipe"], options).tier, "review");
+      }
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 

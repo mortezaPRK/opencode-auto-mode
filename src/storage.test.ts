@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
+import { execFileSync } from "node:child_process";
 import { privateFile, STORAGE_DIR } from "./storage.js";
 
 describe("private review storage", () => {
@@ -24,6 +25,12 @@ describe("private review storage", () => {
       fs.linkSync(sentinel, target);
       assert.throws(() => privateFile(name, true));
       assert.equal(fs.readFileSync(sentinel, "utf8"), "unchanged");
+      fs.unlinkSync(target);
+      if (process.platform !== "win32") {
+        execFileSync("mkfifo", [target]);
+        assert.throws(() => privateFile(name, false));
+        assert.throws(() => privateFile(name, true));
+      }
       assert.throws(() => privateFile("../escape", true));
     } finally {
       fs.rmSync(target, { force: true });

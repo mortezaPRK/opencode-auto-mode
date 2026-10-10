@@ -34,7 +34,8 @@ function safeTarget(target: string, projectDir: string): boolean {
       current = path.join(current, part);
       try {
         const stat = lstatSync(current);
-        if (stat.isSymbolicLink() || (stat.isFile() && stat.nlink !== 1)) return false;
+        if ((!stat.isFile() && !stat.isDirectory()) || (stat.isFile() && stat.nlink !== 1) ||
+            (current === resolved && !stat.isFile())) return false;
       }
       catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") return false; }
     }
