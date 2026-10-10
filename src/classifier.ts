@@ -2,6 +2,7 @@ import { classify } from "./tiers.js";
 import type { ClassifierStage } from "./config.js";
 import type { PermissionRequest, ReviewResult } from "./reviewer.js";
 import { evaluateRules, type RuleMatch } from "./rules.js";
+import { guardShell } from "./shell.js";
 
 function ruleDecision(matches: RuleMatch[]): ReviewResult | undefined {
   for (const decision of ["deny", "ask"] as const) {
@@ -19,6 +20,8 @@ export async function compositeDecision(
   request: PermissionRequest,
   review: (stage: Exclude<ClassifierStage, { type: "static" } | { type: "rules" }>) => Promise<ReviewResult | undefined>,
 ): Promise<ReviewResult> {
+  const shellResult = request.action === "shell" ? guardShell(request.resources) : undefined;
+  if (shellResult?.decision === "deny") return shellResult;
   for (const stage of stages) {
     if (stage.type !== "static") continue;
     const result = classify(request.action, request.resources);
@@ -31,6 +34,7 @@ export async function compositeDecision(
     const result = ruleDecision(matches.filter((match) => match.rule.decision === decision));
     if (result) return result;
   }
+  if (shellResult) return shellResult;
   for (const stage of stages) {
     if (stage.type === "static") {
       const result = classify(request.action, request.resources, {

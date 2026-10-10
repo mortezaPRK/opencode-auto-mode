@@ -23,7 +23,8 @@
   "dependencies": {
     "@bufbuild/cel": "0.6.1",
     "@bufbuild/protobuf": "2.16.0",
-    "@opencode/plugin": "^2.0.14"
+    "@opencode/plugin": "^2.0.14",
+    "shell-quote": "1.12.0"
   },
   "peerDependencies": {
     "@opentui/core": ">=0.5.10",
@@ -33,9 +34,10 @@
   "devDependencies": {
     "@opencode/theme": "^2.0.14",
     "@opentui/core": "0.5.10",
-    "@opentui/solid": "0.5.10",
     "@opentui/keymap": "^0.5.10",
+    "@opentui/solid": "0.5.10",
     "@types/node": "^24.0.0",
+    "@types/shell-quote": "1.7.5",
     "solid-js": "1.9.14",
     "typescript": "^5.8.2"
   }

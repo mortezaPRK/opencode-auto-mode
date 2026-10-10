@@ -1,6 +1,7 @@
 import { parentPort, workerData } from "node:worker_threads";
 import { compileExpression, type RuleBindings } from "./rules.js";
 import type { UserRule } from "./config.js";
+import { shellWords } from "./shell.js";
 
 const { rules, resources, bindings, hasResources } = workerData as {
   rules: UserRule[]; resources: string[]; bindings: RuleBindings; hasResources: boolean;
@@ -16,7 +17,8 @@ function evaluate() {
         const matches = resources.map(() => false);
         for (const [resourceIndex, resource] of resources.entries()) {
           try {
-            const result = predicate({ ...bindings, resource });
+            const words = bindings.action === "shell" ? shellWords(resource) ?? [] : [];
+            const result = predicate({ ...bindings, resource, command: words[0] ?? "", args: words.slice(1) });
             if (typeof result !== "boolean") throw new Error("CEL rules must return a boolean");
             matches[resourceIndex] = result;
             if (result && decision !== "allow") {

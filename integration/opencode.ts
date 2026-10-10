@@ -269,12 +269,27 @@ try {
       calls.length = 0; await expectPermission(mixed, "deny", resources); assert.deepEqual(calls, []);
     }
   });
+  await run("shell parser guard before permissive classifiers", async () => {
+    const f = await fixture({ classifier: { stages: [{ type: "rules", rules: [{ expression: 'resource.startsWith("pwd")', decision: "allow" }] }, stage("llm")] } });
+    for (const resource of ["pwd ; sudo rm -rf", "pwd > parser-marker", "pwd $(touch parser-marker)", "pwd ; touch parser-marker", 'pwd "unclosed']) {
+      calls.length = 0;
+      await expectPermission(f, resource.includes("sudo") ? "deny" : "ask", [resource]);
+      assert.deepEqual(calls, []);
+    }
+  });
   const toolCases: { name: string; stages: ClassifierStage[]; expected: Verdict; profile: Profile; command?: string; reached?: string[] }[] = [
     { name: "static read-only", stages: [stage("static")], expected: "allow", profile: {}, command: "pwd" },
     { name: "user allow", stages: [{ type: "rules", rules: [{ expression: 'action == "shell"', decision: "allow" }] }], expected: "allow", profile: {} },
     { name: "user deny", stages: [{ type: "rules", rules: [{ expression: 'action == "shell"', decision: "deny" }] }], expected: "deny", profile: {} },
-    { name: "CEL predicate", stages: [{ type: "rules", rules: [{ expression: 'agent == "auto" && action == "shell" && resource == "printf integration > tool-result.txt"', decision: "allow" }] }], expected: "allow", profile: {} },
+    { name: "CEL predicate", stages: [{ type: "rules", rules: [{ expression: 'agent == "auto" && command == "touch" && args == ["tool-result.txt"]', decision: "allow" }] }], expected: "allow", profile: {} },
     { name: "CEL invalid result", stages: [{ type: "rules", rules: [{ expression: "resource", decision: "allow" }] }, stage("llm")], expected: "ask", profile: {} },
+    { name: "parsed read-only chain", stages: [stage("static")], expected: "allow", profile: {}, command: "pwd && ls" },
+    { name: "prefix chain", stages: [{ type: "rules", rules: [{ expression: 'resource.startsWith("pwd")', decision: "allow" }] }], expected: "ask", profile: {}, command: "pwd ; touch tool-result.txt" },
+    { name: "prefix redirect", stages: [{ type: "rules", rules: [{ expression: 'resource.startsWith("pwd")', decision: "allow" }] }, stage("llm")], expected: "ask", profile: {}, command: "pwd > tool-result.txt" },
+    { name: "command substitution", stages: [{ type: "rules", rules: [{ expression: "true", decision: "allow" }] }, stage("llm")], expected: "ask", profile: {}, command: "pwd $(touch tool-result.txt)" },
+    { name: "nested shell", stages: [{ type: "rules", rules: [{ expression: "true", decision: "allow" }] }, stage("llm")], expected: "ask", profile: {}, command: "sh -c 'touch tool-result.txt'" },
+    { name: "stateful alias", stages: [{ type: "rules", rules: [{ expression: "true", decision: "allow" }] }, stage("llm")], expected: "ask", profile: {}, command: "alias pwd='touch tool-result.txt'; pwd" },
+    { name: "quoted literal argument", stages: [{ type: "rules", rules: [{ expression: 'command == "touch" && args == ["tool-result.txt"]', decision: "allow" }] }], expected: "allow", profile: {}, command: "touch 'tool-result.txt'" },
     { name: "LLM allow", stages: [stage("llm")], expected: "allow", profile: {} },
     { name: "LLM deny", stages: [stage("llm")], expected: "deny", profile: { triage: "BLOCK", verdict: "DENY: out of scope" } },
     { name: "LLM ask", stages: [stage("llm")], expected: "ask", profile: { triage: "BLOCK", verdict: "ASK: uncertain" } },
@@ -284,7 +299,7 @@ try {
   ];
   for (const test of toolCases) await run(`real shell: ${test.name}`, async () => {
     const f = await fixture({ classifier: { stages: test.stages } });
-    profile = { ...test.profile, tool: test.command ?? "printf integration > tool-result.txt" };
+    profile = { ...test.profile, tool: test.command ?? "touch tool-result.txt" };
     calls.length = 0;
     await api(`/api/session/${f.sessionID}/prompt`, { text: "Run the requested local integration shell command once." });
     if (test.expected === "ask") {
@@ -297,7 +312,8 @@ try {
     const tool = context.flatMap((entry: { content?: unknown[] }) => entry.content ?? []).find((part: { type: string; name: string }) => part.type === "tool" && part.name === "shell");
     assert.ok(tool, "OpenCode must actually call its shell tool");
     assert.equal(tool.state.status, test.expected === "allow" ? "completed" : "error");
-    if (!test.command) assert.equal(existsSync(join(f.directory, "tool-result.txt")), test.expected === "allow");
+    if (!test.command || test.command.includes("tool-result.txt"))
+      assert.equal(existsSync(join(f.directory, "tool-result.txt")), test.expected === "allow");
     if (test.reached) assert.deepEqual(calls, test.reached);
     checks++;
   });

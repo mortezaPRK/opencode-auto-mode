@@ -1,4 +1,4 @@
-import { celEnv, CelScalar, parse, plan } from "@bufbuild/cel";
+import { celEnv, CelScalar, listType, parse, plan } from "@bufbuild/cel";
 import { Worker } from "node:worker_threads";
 import type { UserRule } from "./config.js";
 import type { PermissionRequest } from "./reviewer.js";
@@ -6,6 +6,7 @@ import type { PermissionRequest } from "./reviewer.js";
 const environment = celEnv({ variables: {
   action: CelScalar.STRING, resource: CelScalar.STRING, agent: CelScalar.STRING,
   projectDir: CelScalar.STRING, isDelegation: CelScalar.BOOL,
+  command: CelScalar.STRING, args: listType(CelScalar.STRING),
 } });
 let activeWorkers = 0;
 
