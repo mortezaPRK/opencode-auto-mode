@@ -1,7 +1,14 @@
 {
-  "name": "@mellena1/opencode-auto-mode",
+  "name": "@mortezaprk/opencode-auto-mode",
   "version": "0.5.2",
-  "description": "OpenCode v2 plugin that mimics Claude Code auto mode: a cheap LLM auto-approves/denies permission requests, falling back to the user when uncertain.",
+  "description": "Configurable automatic permission review for OpenCode v2.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mortezaPRK/opencode-auto-mode.git"
+  },
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
+  },
   "type": "module",
   "license": "MIT",
   "files": ["src"],
@@ -17,10 +24,14 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "bun test"
+    "test": "bun test",
+    "test:integration": "bun run integration/opencode.ts"
   },
   "dependencies": {
-    "@opencode/plugin": "^2.0.14"
+    "@bufbuild/cel": "0.6.1",
+    "@bufbuild/protobuf": "2.16.0",
+    "@opencode/plugin": "^2.0.14",
+    "shell-quote": "1.12.0"
   },
   "peerDependencies": {
     "@opentui/core": ">=0.5.10",
@@ -30,9 +41,10 @@
   "devDependencies": {
     "@opencode/theme": "^2.0.14",
     "@opentui/core": "0.5.10",
-    "@opentui/solid": "0.5.10",
     "@opentui/keymap": "^0.5.10",
+    "@opentui/solid": "0.5.10",
     "@types/node": "^24.0.0",
+    "@types/shell-quote": "1.7.5",
     "solid-js": "1.9.14",
     "typescript": "^5.8.2"
   }

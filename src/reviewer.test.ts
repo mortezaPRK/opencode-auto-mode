@@ -27,8 +27,9 @@ describe("parseDecision", () => {
     });
   });
 
-  it("falls back to leading keywords, then escalates", () => {
-    assert.equal(parseDecision("allow, looks fine").decision, "allow");
+  it("requires a complete unambiguous verdict", () => {
+    for (const text of ["allow, looks fine", "allowance unavailable", "ALLOW: safe\nDENY: unsafe", "ALLOW:", "ALLOW: yes\rno", "not allowed"])
+      assert.equal(parseDecision(text).decision, "ask", text);
     const unclear = parseDecision("maybe, need more context");
     assert.equal(unclear.decision, "ask");
     assert.match(unclear.reason, /unclear/);
@@ -43,8 +44,8 @@ describe("parseStage1", () => {
   });
 
   it("blocks on anything unrecognized", () => {
-    assert.equal(parseStage1("garbage"), "block");
-    assert.equal(parseStage1(""), "block");
+    for (const text of ["garbage", "", "not allowed", "No context; cannot decide", "ALLOW: uncertain", "ALLOW\nBLOCK"])
+      assert.equal(parseStage1(text), "block", text);
   });
 });
 
