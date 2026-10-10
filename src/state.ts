@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { privateFile, STORAGE_DIR } from "./storage.js";
 
 export type DecisionKind = "reviewing" | "allow" | "deny" | "ask";
 
@@ -9,39 +10,50 @@ export interface DecisionRecord {
   decision: DecisionKind;
   reason: string;
   at: number;
-  // Only present on "reviewing" records: the evaluate hook runs before a
-  // permission request exists, so there is no real request ID yet. Records
-  // use a synthetic ID and carry enough context for the TUI badge to render.
   action?: string;
   resources?: string[];
 }
 
-export const STATE_FILE = "/tmp/opencode-auto-mode/state.json";
+export const STATE_FILE = path.join(STORAGE_DIR, "state.json");
 
 const MAX_AGE_MS = 10 * 60 * 1000;
 
 export function readDecisions(): Record<string, DecisionRecord> {
+  let fd: number | undefined;
   try {
-    const raw = fs.readFileSync(STATE_FILE, "utf8");
+    fd = privateFile("state.json", false);
+    if (fs.fstatSync(fd).size > 65_536) return {};
+    const raw = fs.readFileSync(fd, "utf8");
     const parsed: unknown = JSON.parse(raw);
-    if (typeof parsed !== "object" || parsed === null) return {};
-    return parsed as Record<string, DecisionRecord>;
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return {};
+    return Object.fromEntries(Object.entries(parsed).filter(([id, value]) =>
+      id.length < 256 && typeof value === "object" && value !== null &&
+      value.requestID === id && typeof value.sessionID === "string" && value.sessionID.length < 256 &&
+      typeof value.reason === "string" && value.reason.length <= 4096 &&
+      typeof value.at === "number" && Number.isFinite(value.at) &&
+      (value.action === undefined || typeof value.action === "string") &&
+      (value.resources === undefined || (Array.isArray(value.resources) && value.resources.length <= 256 &&
+        value.resources.every((resource: unknown) => typeof resource === "string"))) &&
+      ["reviewing", "allow", "deny", "ask"].includes(value.decision))) as Record<string, DecisionRecord>;
   } catch {
     return {};
-  }
+  } finally { if (fd !== undefined) fs.closeSync(fd); }
 }
 
 export function recordDecision(record: DecisionRecord): void {
   const all = readDecisions();
-  all[record.requestID] = record;
+  Object.defineProperty(all, record.requestID, { value: record, enumerable: true, configurable: true });
   const cutoff = Date.now() - MAX_AGE_MS;
   for (const [id, rec] of Object.entries(all)) {
-    if (rec.at < cutoff) delete all[id];
+    if (rec.at < cutoff || Object.keys(all).length > 128) delete all[id];
   }
+  let fd: number | undefined;
   try {
-    fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
-    fs.writeFileSync(STATE_FILE, JSON.stringify(all, null, 2));
+    const data = JSON.stringify(all);
+    if (Buffer.byteLength(data) > 65_536) return;
+    fd = privateFile("state.json", true);
+    fs.ftruncateSync(fd, 0);
+    fs.writeSync(fd, data, 0);
   } catch {
-    // best effort — the TUI falls back to heuristics when the file is missing
-  }
+  } finally { if (fd !== undefined) fs.closeSync(fd); }
 }

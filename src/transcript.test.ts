@@ -54,4 +54,10 @@ describe("extractTranscript", () => {
     assert.ok(transcript.length < 6500);
     assert.match(transcript, /…/);
   });
+  it("keeps chronology and marks missing evidence", () => {
+    const chronology = extractTranscript([{ type: "user", text: "first" }, { type: "assistant", content: [{ type: "tool", name: "shell", state: { input: "middle" } }] }, { type: "user", text: "last" }]);
+    assert.ok(chronology.indexOf("first") < chronology.indexOf("middle"));
+    assert.ok(chronology.indexOf("middle") < chronology.indexOf("last"));
+    assert.match(extractTranscript(Array.from({ length: 11 }, () => ({ type: "user", text: "hello" }))), /incomplete/);
+  });
 });

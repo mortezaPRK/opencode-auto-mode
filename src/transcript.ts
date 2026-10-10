@@ -56,18 +56,16 @@ function formatTool(tool: ToolEntry): string {
 }
 
 export function extractTranscript(messages: unknown[]): string {
-  const users: string[] = [];
-  const tools: string[] = [];
+  const entries: { role: "user" | "tool"; text: string }[] = [];
   for (const message of messages) {
     const text = userText(message);
-    if (text !== undefined) users.push(text);
-    for (const tool of assistantTools(message)) tools.push(formatTool(tool));
+    if (text !== undefined) entries.push({ role: "user", text: truncate(text, MAX_ENTRY_CHARS) });
+    for (const tool of assistantTools(message)) entries.push({ role: "tool", text: formatTool(tool) });
   }
-  const recentUsers = users.slice(-MAX_USERS).map((text) => `- ${truncate(text, MAX_ENTRY_CHARS)}`);
-  const recentTools = tools.slice(-MAX_TOOLS).map((text) => `- ${text}`);
-  let transcript = "";
-  if (recentUsers.length > 0) transcript += `User messages (most recent last):\n${recentUsers.join("\n")}\n`;
-  if (recentTools.length > 0) transcript += `Prior tool calls (most recent last):\n${recentTools.join("\n")}\n`;
-  if (!transcript) return "(no prior user messages or tool calls in this session)";
-  return truncate(transcript, MAX_TRANSCRIPT_CHARS);
+  if (!entries.some((entry) => entry.role === "user")) return "(no prior user messages in this session)";
+  let users = 0;
+  let tools = 0;
+  const recent = entries.slice().reverse().filter((entry) => entry.role === "user" ? ++users <= MAX_USERS : ++tools <= MAX_TOOLS).reverse();
+  const incomplete = recent.length < entries.length ? "\n… incomplete session context" : "";
+  return truncate(`User messages and prior tool calls (chronological):\n${JSON.stringify(recent)}${incomplete}`, MAX_TRANSCRIPT_CHARS);
 }
