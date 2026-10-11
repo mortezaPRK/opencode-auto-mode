@@ -72,7 +72,7 @@ const provider = createServer(async (req, res) => {
     res.end(JSON.stringify(type === "openai-decision" ? { answers: [{ ...answer, name: "permission",
       probabilities: Object.entries(probabilities).map(([value, probability]) => ({ value, probability })) }] } :
       { answers: { permission: answer } }));
-  } catch (error) { res.writeHead(500); res.end("Internal Server Error"); }
+  } catch { res.writeHead(500); res.end("Internal Server Error"); }
 });
 provider.listen(0, "127.0.0.1");
 await once(provider, "listening");
