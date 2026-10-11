@@ -47,14 +47,15 @@
   "devDependencies": {
     "@eslint/js": "^10.0.1",
     "@opencode/theme": "^2.0.14",
-    "@opentui/core": "0.5.10",
+    "@opentui/core": "0.5.17",
     "@opentui/keymap": "^0.5.10",
-    "@opentui/solid": "0.5.10",
-    "@types/node": "^24.0.0",
+    "@opentui/solid": "0.5.17",
+    "@types/node": "^26.6.4",
     "@types/shell-quote": "1.7.5",
+    "@typescript/native": "npm:typescript@^7.0.2",
     "eslint": "^10.12.0",
-    "solid-js": "1.9.14",
-    "typescript": "^5.8.2",
+    "solid-js": "1.9.17",
+    "typescript": "npm:@typescript/typescript6@^6.0.2",
     "typescript-eslint": "^8.71.1"
   }
 }
