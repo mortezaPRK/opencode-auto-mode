@@ -11,133 +11,53 @@ on:
           - patch
           - minor
           - major
-  release:
-    types: [published]
 permissions:
-  contents: read
+  contents: write
+  id-token: write
 concurrency:
   group: npm-release
   cancel-in-progress: false
 jobs:
-  validate:
+  release:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-    outputs:
-      commit: ${{ steps.version.outputs.commit }}
-      version: ${{ steps.version.outputs.version }}
-      tag: ${{ steps.version.outputs.tag }}
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: ${{ github.sha }}
           fetch-depth: 0
-          persist-credentials: false
-      - name: Require main for manual releases
-        if: github.event_name == 'workflow_dispatch'
-        env:
-          RELEASE_REF: ${{ github.ref }}
-        run: |
-          if [ "$RELEASE_REF" != refs/heads/main ]; then
-            echo "::error::Run the release workflow from main."
-            exit 1
-          fi
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
-        with:
-          node-version: '24'
-      - run: git merge-base --is-ancestor HEAD origin/main
-      - name: Bump version
-        if: github.event_name == 'workflow_dispatch'
-        env:
-          BUMP: ${{ inputs.bump }}
-        run: |
-          case "$BUMP" in
-            patch|minor|major) ;;
-            *) echo "::error::Invalid version bump."; exit 1 ;;
-          esac
-          npm version "$BUMP" --no-git-tag-version --ignore-scripts
-      - name: Verify release version
-        id: version
-        env:
-          RELEASE_EVENT: ${{ github.event_name }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
-        run: |
-          node --input-type=module <<'NODE'
-          import fs from "node:fs";
-          import { execFileSync } from "node:child_process";
-          const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
-          if (pkg.name !== "@mortz.prk/opencode-auto-mode") throw new Error("Unexpected package name");
-          const tag = `v${pkg.version}`;
-          if (process.env.RELEASE_EVENT === "release" && process.env.RELEASE_TAG !== tag)
-            throw new Error("Release tag must match the package version");
-          const commit = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
-          fs.appendFileSync(process.env.GITHUB_OUTPUT, `commit=${commit}\nversion=${pkg.version}\ntag=${tag}\n`);
-          NODE
-      - run: npm exec --yes --package=bun@1.4.3 -- bun install --frozen-lockfile --ignore-scripts
-      - run: npm exec --yes --package=bun@1.4.3 -- bun test
-      - run: npm run lint
-      - run: npm run typecheck
-      - run: npm pack --dry-run --ignore-scripts
-  prepare:
-    if: github.event_name == 'workflow_dispatch'
-    needs: validate
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      contents: write
-    outputs:
-      commit: ${{ steps.prepare.outputs.commit }}
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          ref: ${{ needs.validate.outputs.commit }}
-          fetch-depth: 0
-          persist-credentials: false
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
-        with:
-          node-version: '24'
-      - name: Commit and tag the validated version
-        id: prepare
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
-          RELEASE_SOURCE_SHA: ${{ needs.validate.outputs.commit }}
-        run: |
-          gh auth setup-git
-          node scripts/release.mjs prepare
-  publish:
-    if: always() && needs.validate.result == 'success' && (needs.prepare.result == 'success' || needs.prepare.result == 'skipped')
-    needs: [validate, prepare]
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: write
-      id-token: write
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          ref: ${{ needs.prepare.outputs.commit || needs.validate.outputs.commit }}
-          persist-credentials: false
+      - name: Require main
+        run: test "$GITHUB_REF" = refs/heads/main
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: '24'
           registry-url: https://registry.npmjs.org
           scope: '@mortz.prk'
       - run: npm install --global npm@11
-      - name: Publish the validated commit
+      - run: npm exec --yes --package=bun@1.4.3 -- bun install --frozen-lockfile --ignore-scripts
+      - run: npm exec --yes --package=bun@1.4.3 -- bun test
+      - run: npm run lint
+      - run: npm run typecheck
+      - name: Bump version
+        id: version
         env:
-          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
-          RELEASE_COMMIT: ${{ needs.prepare.outputs.commit || needs.validate.outputs.commit }}
-        run: node scripts/release.mjs publish
+          BUMP: ${{ inputs.bump }}
+        run: |
+          TAG=$(npm version "$BUMP" --no-git-tag-version --ignore-scripts)
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+      - run: npm pack --dry-run --ignore-scripts
+      - name: Commit and tag
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add package.json
+          git commit -m "chore: release $TAG"
+          git tag -a "$TAG" -m "Release $TAG"
+          git push --atomic origin HEAD:main "$TAG"
+      - run: npm publish --access public --ignore-scripts --registry=https://registry.npmjs.org
       - name: Create GitHub release
-        if: github.event_name == 'workflow_dispatch'
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
-        run: |
-          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft > "$RUNNER_TEMP/release-draft"; then
-            if [ "$(cat "$RUNNER_TEMP/release-draft")" = true ]; then
-              gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false
-            fi
-          else
-            gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes --title "$RELEASE_TAG"
-          fi
+          TAG: ${{ steps.version.outputs.tag }}
+        run: gh release create "$TAG" --verify-tag --generate-notes --title "$TAG"

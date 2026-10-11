@@ -145,7 +145,7 @@ Keep ordinary OpenCode permission rules requiring approval for sensitive actions
 
 ## Publishing releases
 
-Open **Actions → Release npm package → Run workflow**, select `main`, choose `patch`, `minor`, or `major` (default: `patch`), and run it. The workflow increments `package.json`, runs tests, lint, typecheck, and a package dry run, commits the version, pushes its `v<version>` tag, publishes to npm, and creates a GitHub release with generated notes.
+Open **Actions → Release npm package → Run workflow**, select `main`, choose `patch`, `minor`, or `major` (default: `patch`), and run it. This manual workflow runs tests, lint, and typecheck, increments `package.json`, checks the package, commits and tags the version, publishes to npm, and creates an immutable GitHub release with generated notes.
 
 The same release can be started with one command:
 
@@ -155,9 +155,7 @@ gh workflow run publish.yml --repo mortezaPRK/opencode-auto-mode --ref main -f b
 
 Publishing uses the existing [npm trusted publisher](https://docs.npmjs.com/trusted-publishers/) for GitHub owner `mortezaPRK`, repository `opencode-auto-mode`, and workflow filename `publish.yml`. No npm token or additional personal access token is needed in repository secrets.
 
-Release runs are serialized, and the version commit and tag are pushed together. If `main` advances during validation, the workflow fails without pushing the release; start a new run from the updated `main`. For a failed publication, use **Re-run failed jobs**. Re-running the same workflow reuses its prepared version and tag rather than incrementing again; an already published version is accepted only when it came from the expected commit. npm may take a few minutes to make a newly published version available, so wait for processing before retrying a publication that was accepted by npm.
-
-Publishing an existing GitHub release remains supported. Its tag must match `package.json`, and the tagged commit must be on `main`.
+GitHub release immutability is enabled in the repository settings. Releases and tags do not trigger publication; only running this workflow does.
 
 ## Credit
 
