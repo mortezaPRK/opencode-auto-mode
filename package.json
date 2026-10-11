@@ -52,9 +52,10 @@
     "@opentui/solid": "0.5.17",
     "@types/node": "^26.6.4",
     "@types/shell-quote": "1.7.5",
+    "@typescript/native": "npm:typescript@^7.0.2",
     "eslint": "^10.12.0",
     "solid-js": "1.9.17",
-    "typescript": "^7.0.2",
+    "typescript": "npm:@typescript/typescript6@^6.0.2",
     "typescript-eslint": "^8.71.1"
   }
 }
