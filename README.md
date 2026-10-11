@@ -145,23 +145,17 @@ Keep ordinary OpenCode permission rules requiring approval for sensitive actions
 
 ## Publishing releases
 
-The package is public on npm. GitHub releases trigger `.github/workflows/publish.yml`, which uses npm trusted publishing through GitHub Actions OIDC. No npm token is needed in repository secrets.
+Open **Actions → Release npm package → Run workflow**, select `main`, choose `patch`, `minor`, or `major` (default: `patch`), and run it. This manual workflow runs tests, lint, and typecheck, increments `package.json`, checks the package, commits and tags the version, publishes to npm, and creates an immutable GitHub release with generated notes.
 
-For the first publication, enable two-factor authentication on the `mortz.prk` npm account. Merge the migration at version `0.1.1` to `main`, check out that commit, and run the project checks before publishing:
+The same release can be started with one command:
 
 ```sh
-bun install --frozen-lockfile --ignore-scripts
-bun test
-bun run lint
-bun run typecheck
-npm pack --dry-run
-npm login --registry=https://registry.npmjs.org
-npm publish --access public --ignore-scripts --registry=https://registry.npmjs.org
+gh workflow run publish.yml --repo mortezaPRK/opencode-auto-mode --ref main -f bump=patch
 ```
 
-After the package exists, configure its [npm trusted publisher](https://docs.npmjs.com/trusted-publishers/) with GitHub owner `mortezaPRK`, repository `opencode-auto-mode`, and workflow filename `publish.yml`. Leave the environment field empty and explicitly allow direct `npm publish`.
+Publishing uses the existing [npm trusted publisher](https://docs.npmjs.com/trusted-publishers/) for GitHub owner `mortezaPRK`, repository `opencode-auto-mode`, and workflow filename `publish.yml`. No npm token or additional personal access token is needed in repository secrets.
 
-For the first automated publication, bump the manifest to `0.1.2`, refresh the lockfile, merge to `main`, and publish GitHub release `v0.1.2` within two days of creating the trusted publisher. For later releases, update the version, merge to `main`, and publish a GitHub release with the matching `v<version>` tag. The workflow requires the tag's version to match `package.json` and its commit to be on `main`; it runs tests and a typecheck before publishing.
+GitHub release immutability is enabled in the repository settings. Releases and tags do not trigger publication; only running this workflow does.
 
 ## Credit
 

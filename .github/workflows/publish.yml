@@ -1,48 +1,63 @@
-name: Publish npm package
+name: Release npm package
 on:
-  release:
-    types: [published]
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Version bump
+        required: true
+        default: patch
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
 permissions:
-  contents: read
+  contents: write
+  id-token: write
+concurrency:
+  group: npm-release
+  cancel-in-progress: false
 jobs:
-  validate:
+  release:
     runs-on: ubuntu-latest
-    outputs:
-      commit: ${{ steps.commit.outputs.sha }}
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: ${{ github.event.release.tag_name }}
           fetch-depth: 0
-          persist-credentials: false
-      - id: commit
-        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
-        with:
-          node-version: '24'
-      - run: git merge-base --is-ancestor HEAD origin/main
-      - run: node --input-type=module -e 'import fs from "node:fs"; const pkg = JSON.parse(fs.readFileSync("package.json", "utf8")); if (process.env.RELEASE_TAG !== `v${pkg.version}` || pkg.name !== "@mortz.prk/opencode-auto-mode") process.exit(1);'
-        env:
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
-      - run: npm exec --yes --package=bun@1.4.3 -- bun install --frozen-lockfile --ignore-scripts
-      - run: npm exec --yes --package=bun@1.4.3 -- bun test
-      - run: npm run typecheck
-      - run: npm pack --dry-run
-  publish:
-    needs: validate
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: ${{ needs.validate.outputs.commit }}
-          persist-credentials: false
+      - name: Require main
+        run: test "$GITHUB_REF" = refs/heads/main
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
         with:
           node-version: '24'
           registry-url: https://registry.npmjs.org
           scope: '@mortz.prk'
       - run: npm install --global npm@11
-      - run: npm publish --access public --ignore-scripts
+      - run: npm exec --yes --package=bun@1.4.3 -- bun install --frozen-lockfile --ignore-scripts
+      - run: npm exec --yes --package=bun@1.4.3 -- bun test
+      - run: npm run lint
+      - run: npm run typecheck
+      - name: Bump version
+        id: version
+        env:
+          BUMP: ${{ inputs.bump }}
+        run: |
+          TAG=$(npm version "$BUMP" --no-git-tag-version --ignore-scripts)
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+      - run: npm pack --dry-run --ignore-scripts
+      - name: Commit and tag
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add package.json
+          git commit -m "chore: release $TAG"
+          git tag -a "$TAG" -m "Release $TAG"
+          git push --atomic origin HEAD:main "$TAG"
+      - run: npm publish --access public --ignore-scripts --registry=https://registry.npmjs.org
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: gh release create "$TAG" --verify-tag --generate-notes --title "$TAG"
