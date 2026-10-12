@@ -37,6 +37,30 @@ This reviews **all agents** because `agents` is omitted. Built-in checks allow s
 
 Set `options.model` to `{ "id": "your-model", "providerID": "your-provider" }` to select the reviewer model. `review: "all"` reviews eligible actions even when OpenCode would allow them; `review: "prompts"` reviews only actions already requiring approval. OpenCode's explicit denies remain authoritative.
 
+> **"Always" answers in permission prompts**
+>
+> With `"review": "all"` every action is re-reviewed — including ones OpenCode has already allowed, such as an action you approved with **Always** in a permission prompt. Because the reviewer can return `ask` for an already-approved action, OpenCode may prompt you again, so an **Always** answer does not persist with `"review": "all"`.
+>
+> To keep **Always** (and other persisted approvals) working, either:
+> - use `"review": "prompts"` instead of `"review": "all"` — the plugin then only reviews actions that still require approval, so your persisted "Always" approvals are honored; or
+> - keep `"review": "all"` and add an explicit `allow` CEL rule for the action you don't want re-prompted, for example:
+>
+>   ```json
+>   {
+>     "classifier": {
+>       "stages": [
+>         { "type": "static" },
+>         {
+>           "type": "rules",
+>           "rules": [
+>             { "expression": "action == 'shell' && command == 'git' && args[0] == 'status'", "decision": "allow" }
+>           ]
+>         }
+>       ]
+>     }
+>   }
+>   ```
+
 ### Static checks and your own rules, without a model
 
 This also reviews **all agents**. `pwd` passes the static checks, `git status --short` matches the exact CEL allow rule, `curl` matches the deny rule, and edits or writes require your approval. Unmatched actions require manual approval because there is no model stage.
