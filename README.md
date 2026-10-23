@@ -1,22 +1,12 @@
 # OpenCode Auto Mode
 
-OpenCode Auto Mode reviews permission prompts for OpenCode v2. It can allow,
-deny, or ask using built-in safety checks, typed decision models, and an LLM.
-
-OpenCode remains the source of truth for permissions. The plugin only sees
-actions that OpenCode has already resolved to `ask`; it never overrides an
-`allow` or `deny` decision.
-
-## Requirements
-
-- OpenCode v2 with `@opencode/plugin` 2.0
-- An LLM or decision provider if you want model-based review
-
-Built-in safety checks work without a model.
+Automatic review for OpenCode permission prompts. OpenCode decides which actions
+need approval. The plugin reviews only `ask` actions and returns `allow`, `deny`,
+or leaves them as `ask`.
 
 ## Install
 
-Add the plugin to your global `~/.config/opencode/opencode.jsonc`:
+Add the plugin to `~/.config/opencode/opencode.jsonc`, then restart OpenCode:
 
 ```jsonc
 {
@@ -24,55 +14,45 @@ Add the plugin to your global `~/.config/opencode/opencode.jsonc`:
   "plugins": ["@mortz.prk/opencode-auto-mode"]
 }
 ```
-
-Restart the OpenCode service after changing plugins:
 
 ```sh
 opencode service restart
 ```
 
-## Quick start
+## Configure
 
-OpenCode's default policy allows everything. To give the plugin something to
-review, add `ask` rules for the actions you want reviewed. For example:
+OpenCode allows everything by default. Add `ask` rules for what you want
+reviewed. This is a complete working setup:
 
 ```jsonc
 {
   "$schema": "https://opencode.ai/config.json",
   "permissions": [
+    { "action": "*", "resource": "*", "effect": "ask" }
+  ],
+  "plugins": [
+    {
+      "package": "@mortz.prk/opencode-auto-mode",
+      "options": {}
+    }
+  ]
+}
+```
+
+The default review runs built-in checks and then the session model.
+
+Use OpenCode permissions to narrow the scope. For shell commands and edits only:
+
+```jsonc
+{
+  "permissions": [
     { "action": "shell", "resource": "*", "effect": "ask" },
     { "action": "edit", "resource": "*", "effect": "ask" }
-  ],
-  "plugins": ["@mortz.prk/opencode-auto-mode"]
+  ]
 }
 ```
 
-With this setup, shell commands and edits reach the plugin. The default pipeline
-runs built-in safety checks and then OpenCode's default model. Everything else
-keeps OpenCode's normal behavior.
-
-To review every action, use:
-
-```jsonc
-{
-  "permissions": [{ "action": "*", "resource": "*", "effect": "ask" }]
-}
-```
-
-## Choose what is reviewed
-
-Use OpenCode permission rules to scope review. Put shared rules at the top level
-for every agent, or under an agent for that agent only.
-
-Review everything for every agent:
-
-```jsonc
-{
-  "permissions": [{ "action": "*", "resource": "*", "effect": "ask" }]
-}
-```
-
-Review everything for `build` only:
+For the `build` agent only:
 
 ```jsonc
 {
@@ -84,94 +64,44 @@ Review everything for `build` only:
 }
 ```
 
-Review shell commands globally, but allow routine Git inspection and block
-pushes before the plugin is consulted:
+Saved **Allow always** approvals bypass the plugin. A configured `deny` always
+wins. See [Permissions](https://opencode.ai/v2/docs/permissions).
+
+## Review with an LLM
+
+The default review uses the session model. To choose another model, configure the
+review pipeline:
 
 ```jsonc
 {
-  "permissions": [
-    { "action": "shell", "resource": "*", "effect": "ask" },
-    { "action": "shell", "resource": "git status *", "effect": "allow" },
-    { "action": "shell", "resource": "git diff *", "effect": "allow" },
-    { "action": "shell", "resource": "git push *", "effect": "deny" }
-  ]
-}
-```
-
-Saved **Allow always** approvals are durable `allow` rules, so they bypass the
-plugin. A configured `deny` always wins.
-
-See [Permissions](https://opencode.ai/v2/docs/permissions) for matching and agent
-rules.
-
-## How a review runs
-
-1. OpenCode evaluates its permission rules.
-2. `allow` and `deny` are returned unchanged.
-3. `ask` actions enter the plugin.
-4. The shell safety guard runs before configured stages.
-5. Configured stages run in order.
-6. If no stage decides, the action remains `ask`.
-
-A stage returns one of four outcomes:
-
-| Outcome | Result |
-| --- | --- |
-| `allow` | Stop and approve |
-| `deny` | Stop and reject |
-| `ask` | Stop and leave the decision to you |
-| `abstain` | Try the next stage |
-
-A low-confidence allow abstains. A low-confidence deny becomes `ask` instead of
-falling through to a possible allow. Provider errors, timeouts, refusals, and
-invalid responses abstain so another stage can try.
-
-The default pipeline is:
-
-```jsonc
-{ "classifier": { "stages": [{ "type": "static" }, { "type": "llm" }] } }
-```
-
-## Stages
-
-### Built-in checks
-
-The `static` stage adds a fast safety pass:
-
-- Denies dangerous shell patterns such as `sudo`, `rm -rf /`, `mkfs`, and
-  shutdown commands.
-- Allows a small set of read-only shell commands such as `pwd`, `ls`, and
-  `whoami`.
-- Allows safe in-project file reads and, with `allowInProjectEdits`, in-project
-  edits and writes.
-
-```jsonc
-{
-  "classifier": {
-    "stages": [
-      { "type": "static", "allowInProjectEdits": true }
-    ]
+  "options": {
+    "classifier": {
+      "stages": [
+        { "type": "static" },
+        { "type": "llm", "model": "anthropic/claude-sonnet-4-5" }
+      ]
+    }
   }
 }
 ```
 
-Unsupported shell syntax and unsafe paths continue to the next stage.
+When an `llm` entry has no `model`, the session model is used. Add more `llm`
+entries to try models in order; an entry that errors or abstains lets the next
+one run.
 
-### Typed decision models
+## Review with typed decisions
 
-A `decision` stage uses a provider/model selector and OpenCode's typed
-Evaluation contract:
+Use a decision model for a fast allow, deny, or ask:
 
 ```jsonc
 {
-  "classifier": {
-    "stages": [
-      {
-        "type": "decision",
-        "model": "typesafe-ai/jev-latest",
-        "minConfidence": 0.9
-      }
-    ]
+  "options": {
+    "classifier": {
+      "stages": [
+        { "type": "static" },
+        { "type": "decision", "model": "typesafe-ai/jev-latest" }
+      ]
+    }
   }
 }
 ```
@@ -180,88 +110,21 @@ Evaluation contract:
 | --- | --- |
 | `typesafe-ai` | Set `TYPESAFE_API_KEY`. |
 | `openai` | Set `OPENAI_API_KEY`. |
-| `laya` | Run a compatible loopback `/v1/systemone` service. Set `endpoint` when it is not `http://127.0.0.1:8000/v1/systemone`; `LAYA_API_KEY` is optional. |
+| `laya` | Run a loopback `/v1/systemone` service. `LAYA_API_KEY` is optional. |
 
-Each stage accepts `apiKeyEnv` to override the credential variable and
-`timeoutMs` to change the 10-second default timeout. `endpoint` is only valid
-for `laya`.
+Decision entries also accept `minConfidence` (default `0.9`), `timeoutMs`,
+`apiKeyEnv`, and, for `laya`, `endpoint`.
 
-### LLM reviewer
+## Without a model
 
-An `llm` stage uses OpenCode's model selector. The model is optional; without it,
-the stage uses OpenCode's default model.
-
-```jsonc
-{
-  "classifier": {
-    "stages": [
-      { "type": "llm", "model": "anthropic/claude-sonnet-4-5" }
-    ]
-  }
-}
-```
-
-The model selector supports an optional variant:
-
-```jsonc
-{ "type": "llm", "model": "openai/gpt-5.2#high" }
-```
-
-Repeat `llm` stages to try models in order. A stage that errors or abstains lets
-the next stage run:
-
-```jsonc
-{
-  "classifier": {
-    "stages": [
-      { "type": "static" },
-      { "type": "llm", "model": "anthropic/claude-sonnet-4-5" },
-      { "type": "llm", "model": "openai/gpt-5.2#high" }
-    ]
-  }
-}
-```
-
-### Combined example
-
-```jsonc
-{
-  "$schema": "https://opencode.ai/config.json",
-  "permissions": [
-    { "action": "shell", "resource": "*", "effect": "ask" },
-    { "action": "edit", "resource": "*", "effect": "ask" }
-  ],
-  "plugins": [
-    {
-      "package": "@mortz.prk/opencode-auto-mode",
-      "options": {
-        "classifier": {
-          "stages": [
-            { "type": "static" },
-            {
-              "type": "decision",
-              "model": "typesafe-ai/jev-latest",
-              "minConfidence": 0.9
-            },
-            { "type": "llm" }
-          ]
-        },
-        "auditLog": true
-      }
-    }
-  ]
-}
-```
+Use `{ "type": "static", "allowInProjectEdits": true }` as the only review entry.
+Built-in checks deny dangerous shell commands, allow common read-only commands,
+and allow safe in-project file operations. Anything else remains `ask`.
 
 ## Review policy
 
-The reviewer receives three policy lists:
-
-- `trusted`: what is inside the trusted boundary.
-- `blocks`: actions that should be denied.
-- `exceptions`: narrow cases that are acceptable despite a block.
-
-The defaults are suitable for software projects. Replace any list by setting it:
+The reviewer receives three policy lists: `trusted` (the trusted boundary),
+`blocks` (actions to deny), and `exceptions` (narrow acceptable cases).
 
 ```jsonc
 {
@@ -275,25 +138,31 @@ The defaults are suitable for software projects. Replace any list by setting it:
 
 These lists guide model review. They do not replace OpenCode permission rules.
 
-## TUI
+## How it works
 
-The plugin shows review status in the TUI and provides manual allow and deny
-commands. Override the defaults in plugin options:
+1. OpenCode evaluates its permission rules.
+2. `allow` and `deny` are returned unchanged.
+3. `ask` actions enter the plugin.
+4. The shell safety guard runs.
+5. The configured review entries run in order.
+6. If nothing decides, the action remains `ask`.
 
-```jsonc
-{
-  "options": {
-    "keybinds": {
-      "allow": "ctrl+alt+a",
-      "deny": "ctrl+alt+d"
-    }
-  }
-}
-```
+A review entry returns one of four outcomes:
 
-## Observability
+| Outcome | Result |
+| --- | --- |
+| `allow` | Stop and approve |
+| `deny` | Stop and reject |
+| `ask` | Stop and leave the decision to you |
+| `abstain` | Try the next entry |
 
-Audit logging and OTLP export are optional:
+A low-confidence decision abstains. A low-confidence deny becomes `ask`.
+Provider errors, timeouts, refusals, and invalid responses abstain so another
+entry can try. Unknown configuration options are rejected.
+
+## Logs and tracing
+
+Audit logs and OTLP export are optional:
 
 ```jsonc
 {
@@ -304,9 +173,22 @@ Audit logging and OTLP export are optional:
 }
 ```
 
-See [Observability](https://github.com/mortezaPRK/opencode-auto-mode/blob/main/docs/observability.md)
-for record fields, OTLP setup, replaying recorded sessions, and how to verify a
-release.
+`auditLog` writes one JSON line per review to
+`$XDG_STATE_HOME/opencode-auto-mode/decisions.jsonl`. `otlp` sends each decision
+to an OTLP/HTTP logs endpoint.
+
+Replay recorded tool calls through the configured review without executing
+anything:
+
+```sh
+bun scripts/replay.ts [--days 14] [--session ID] [--agent build|any] [--json]
+```
+
+## TUI
+
+The plugin shows review status in the TUI and provides manual allow and deny
+commands. Override the defaults with `keybinds.allow` and `keybinds.deny`; the
+defaults are `ctrl+alt+a` and `ctrl+alt+d`.
 
 ## Development
 
@@ -318,12 +200,9 @@ bun run typecheck
 bun run test:integration
 ```
 
-The integration suite runs against a real OpenCode service, a local OpenAI-
-compatible model server, and local typed-decision endpoints. It checks the
-rendered decisions, tool outcomes, and provider request shapes.
-
-See [Releasing](https://github.com/mortezaPRK/opencode-auto-mode/blob/main/docs/releasing.md)
-for the npm release workflow.
+The integration suite runs against a real OpenCode service and local model and
+decision endpoints. It checks decisions, tool outcomes, audit records, and OTLP
+export.
 
 ## Credit
 
