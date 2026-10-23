@@ -136,7 +136,7 @@ function providerRoute(type: string): string {
 function callName(type: string): string {
   return type === "llm" ? "llm:triage" : providerRoute(type);
 }
-async function fixture(options: AutoModeOptions = {}, permissions: unknown[] = [{ action: "*", resource: "*", effect: "ask" }]) {
+async function fixture(options: AutoModeOptions, permissions: unknown[] = [{ action: "*", resource: "*", effect: "ask" }]) {
   const directory = join(root, `case-${++caseCount}`); mkdirSync(directory);
   writeFileSync(join(directory, "opencode.json"), JSON.stringify({
     permissions,
@@ -215,8 +215,8 @@ try {
     await expectPermission(f, verdict.startsWith("ALLOW:") && !verdict.includes("\n") ? "allow" : verdict.startsWith("DENY:") ? "deny" : "ask");
     assert.deepEqual(calls, ["llm:triage", "llm:verdict"]);
   });
-  await run("default model and default pipeline", async () => {
-    const f = await fixture(); calls.length = 0;
+  await run("session model with explicit pipeline", async () => {
+    const f = await fixture({ classifier: { stages: [stage("llm")] } }); calls.length = 0;
     await expectPermission(f, "allow"); assert.deepEqual(calls, ["llm:triage"]);
   });
   await run("host deny and all-agent review", async () => {

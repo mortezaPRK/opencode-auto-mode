@@ -19,10 +19,10 @@ export type ClassifierStage =
   | DecisionStage
   | { type: "llm"; model?: ReviewerModel };
 export interface AutoModeOptions extends PolicyOptions {
+  classifier: { stages: ClassifierStage[] };
   keybinds?: { allow?: string; deny?: string };
   auditLog?: boolean | string;
   otlp?: boolean | OtlpOptions;
-  classifier?: { stages: ClassifierStage[] };
 }
 
 export function object(value: unknown): value is Record<string, unknown> {
@@ -119,13 +119,13 @@ export function parseOptions(value: unknown): AutoModeOptions {
   if (value.auditLog !== undefined && typeof value.auditLog !== "boolean" && !text(value.auditLog))
     throw new Error("Invalid audit log");
   if (value.otlp !== undefined && typeof value.otlp !== "boolean" && !otlp(value.otlp)) throw new Error("Invalid OTLP options");
-  if (value.classifier !== undefined && (!object(value.classifier) || !only(value.classifier, ["stages"]) ||
+  if (!object(value.classifier) || !only(value.classifier, ["stages"]) ||
       !Array.isArray(value.classifier.stages) || value.classifier.stages.length === 0 ||
-      value.classifier.stages.length > 16 || !value.classifier.stages.every(stage)))
-    throw new Error("Invalid classifier stages");
-  return value as AutoModeOptions;
+      value.classifier.stages.length > 16 || !value.classifier.stages.every(stage))
+    throw new Error("At least one review stage is required");
+  return value as unknown as AutoModeOptions;
 }
 
 export function stagesFor(options: AutoModeOptions): ClassifierStage[] {
-  return options.classifier?.stages ?? [{ type: "static" }, { type: "llm" }];
+  return options.classifier.stages;
 }

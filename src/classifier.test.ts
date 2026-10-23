@@ -38,7 +38,7 @@ describe("composite classifiers", () => {
     assert.match(result.reason, /no answer/);
   });
   it("rejects unknown options, stages, and malformed settings", () => {
-    for (const value of [null, { classifer: {} }, { classifier: { stages: [] } },
+    for (const value of [null, {}, { classifer: {} }, { classifier: { stages: [] } },
       { classifier: { stages: [{ type: "llm", model: { id: "x" } }] } },
       { classifier: { stages: [{ type: "llm", model: "model-only" }] } },
       { classifier: { stages: [{ type: "decision", model: "typesafe-ai/jev-latest", minConfidence: NaN }] } },
@@ -53,11 +53,12 @@ describe("composite classifiers", () => {
       { review: "all" },
       { agents: ["build"] },
       { allowInProjectEdits: true },
-      { keybinds: { allow: "a", unknown: "b" } }])
+      { classifier: { stages: [{ type: "static" }] }, keybinds: { allow: "a", unknown: "b" } }])
       assert.throws(() => parseOptions(value));
-    assert.deepEqual(stagesFor(parseOptions({})).map((stage) => stage.type), ["static", "llm"]);
-    assert.equal(parseOptions({ classifier: { stages: [{ type: "decision", model: "laya/local" }] } }).classifier?.stages[0].type, "decision");
-    assert.equal(parseOptions({ classifier: { stages: [{ type: "llm", model: "provider/model#high" }] } }).classifier?.stages[0].type, "llm");
-    assert.deepEqual(parseOptions({ keybinds: { allow: "ctrl+alt+a" } }).keybinds, { allow: "ctrl+alt+a" });
+    const stages: ClassifierStage[] = [{ type: "static" }, { type: "llm" }];
+    assert.deepEqual(stagesFor(parseOptions({ classifier: { stages } })).map((stage) => stage.type), ["static", "llm"]);
+    assert.equal(parseOptions({ classifier: { stages: [{ type: "decision", model: "laya/local" }] } }).classifier.stages[0].type, "decision");
+    assert.equal(parseOptions({ classifier: { stages: [{ type: "llm", model: "provider/model#high" }] } }).classifier.stages[0].type, "llm");
+    assert.deepEqual(parseOptions({ classifier: { stages }, keybinds: { allow: "ctrl+alt+a" } }).keybinds, { allow: "ctrl+alt+a" });
   });
 });
