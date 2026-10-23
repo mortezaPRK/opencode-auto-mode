@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { extractTranscript } from "./transcript.js";
+import { extractReviewContext, extractTranscript } from "./transcript.js";
 
 const messages = [
   { type: "user", text: "clean up old branches" },
@@ -28,6 +28,19 @@ const messages = [
   },
   { type: "user", text: "can we fix this?" },
 ];
+
+describe("review context completeness", () => {
+  it("requires manual review when user evidence cannot be represented", () => {
+    for (const field of ["files", "skills", "agents"]) {
+      const context = extractReviewContext([{ type: "user", text: "Follow attached constraints", [field]: [{ text: "Do not publish" }] }]);
+      assert.equal(context.complete, false);
+    }
+    assert.equal(extractReviewContext([{ type: "user", text: "" }]).complete, false);
+  });
+  it("accepts text-only messages and empty attachment lists", () => {
+    assert.equal(extractReviewContext([{ type: "user", text: "Create a", files: [], skills: [], agents: [] }]).complete, true);
+  });
+});
 
 describe("extractTranscript", () => {
   it("keeps user messages and tool calls", () => {

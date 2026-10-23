@@ -55,6 +55,23 @@ function formatTool(tool: ToolEntry): string {
   return detail ? `${tool.name} ${detail}` : tool.name;
 }
 
+export interface ReviewContext { transcript: string; complete: boolean }
+
+export function extractReviewContext(messages: unknown[]): ReviewContext {
+  const supported = messages.every((message) => {
+    const record = asRecord(message);
+    if (record?.type !== "user") return true;
+    // These attachments carry evidence that the text-only reviewer cannot see.
+    return userText(message) !== undefined && ["files", "skills", "agents"].every((key) =>
+      record[key] === undefined || (Array.isArray(record[key]) && record[key].length === 0));
+  });
+  const transcript = extractTranscript(messages);
+  return {
+    transcript,
+    complete: supported && transcript.startsWith("User messages") && !transcript.includes("…"),
+  };
+}
+
 export function extractTranscript(messages: unknown[]): string {
   const entries: { role: "user" | "tool"; text: string }[] = [];
   for (const message of messages) {

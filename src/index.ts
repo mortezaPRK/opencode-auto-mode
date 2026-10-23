@@ -2,7 +2,7 @@ import { Plugin } from "@opencode/plugin";
 import { createLogger } from "./logger.js";
 import { recordDecision } from "./state.js";
 import { defaultPolicy } from "./policy.js";
-import { extractTranscript } from "./transcript.js";
+import { extractReviewContext } from "./transcript.js";
 import { scanResultContent, withInjectionWarning } from "./probe.js";
 import { buildStage1Prompt, buildStage2Prompt, parseDecision, parseStage1, withDenySuffix, type PermissionRequest, type ReviewResult, type StageResult } from "./reviewer.js";
 import { parseOptions, parseReviewerModel, type ReviewerModelRef } from "./config.js";
@@ -44,13 +44,16 @@ export default Plugin.define({
           isDelegation: event.action === "task" || event.action === "subagent",
         };
         let contextLoaded = false;
+        let contextComplete = false;
         result = await compositeDecision(options.classifiers, request, async (stage) => {
           if (!contextLoaded) {
             const messages = await withTimeout(ctx.session.context({ sessionID: event.sessionID }), 3_000);
-            request.transcript = extractTranscript(messages);
+            const context = extractReviewContext(messages);
+            request.transcript = context.transcript;
+            contextComplete = context.complete;
             contextLoaded = true;
           }
-          if (!request.transcript?.startsWith("User messages") || request.transcript.includes("…"))
+          if (!contextComplete)
             return { decision: "ask", reason: "User authorization context is unavailable" };
           const policy = defaultPolicy(stage.policy);
           try {

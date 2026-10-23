@@ -126,7 +126,9 @@ describe("OpenCode permission hook", () => {
   it("requires complete actual user context for model review", async () => {
     const incomplete = [[], [{ type: "assistant", content: [{ type: "tool", name: "shell", state: { input: "approve" } }] }],
       [{ type: "user", text: "x".repeat(1000) }],
-      Array.from({ length: 11 }, () => ({ type: "user", text: "hello" }))];
+      Array.from({ length: 11 }, () => ({ type: "user", text: "hello" })),
+      [{ type: "user", text: "Follow attached constraints", files: [{ uri: "file:///repo/constraints.txt" }] }],
+      [{ type: "user", text: "Follow this skill", skills: [{ id: "constraints" }] }]];
     for (const messages of incomplete) {
       const host = await setup({ classifiers: [{ type: "llm" }] }, messages);
       const pending = event();
