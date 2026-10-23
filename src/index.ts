@@ -11,7 +11,7 @@ import { decisionStage } from "./decisions.js";
 import { createAuditLog } from "./audit.js";
 import { createOtlpExporter } from "./otlp.js";
 
-export type { AutoModeOptions, ClassifierStage, DecisionProvider, DecisionStage, UserRule, ReviewerModel } from "./config.js";
+export type { AutoModeOptions, ClassifierStage, DecisionProvider, DecisionStage, ReviewerModel } from "./config.js";
 
 export default Plugin.define({
   id: "opencode-auto-mode",
@@ -24,14 +24,12 @@ export default Plugin.define({
     const counts = new Map<string, number>();
     let reviewCounter = 0;
     const permissionRegistration = await ctx.permission.hook("evaluate", async (event) => {
-      if (event.effect === "deny") return;
+      if (event.effect !== "ask") return;
       if (!options) {
         event.effect = "ask";
         event.message = "Invalid auto-mode configuration; please decide yourself";
         return;
       }
-      if (options.agents && (!event.agent || !options.agents.includes(event.agent))) return;
-      if (options.review === "prompts" && event.effect !== "ask") return;
       const reviewID = `review-${process.pid}-${Date.now()}-${reviewCounter++}`;
       recordDecision({ requestID: reviewID, sessionID: event.sessionID, decision: "reviewing", action: event.action.slice(0, 128), reason: "", at: Date.now() });
       const startedAt = Date.now();

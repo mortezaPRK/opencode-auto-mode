@@ -80,9 +80,8 @@ const providerAddress = provider.address();
 assert.ok(providerAddress && typeof providerAddress !== "string");
 const endpoint = `http://127.0.0.1:${providerAddress.port}`;
 const globalConfig = {
-  update: "disable", share: "disabled", model: "local/reviewer", default_agent: "auto",
+  update: "disable", share: "disabled", model: "local/reviewer", default_agent: "build",
   providers: { local: { package: "@ai-sdk/openai-compatible", settings: { baseURL: `${endpoint}/v1`, apiKey: "local-test" }, models: { reviewer: { name: "Local integration model" } } } },
-  agents: { auto: { mode: "primary", description: "Automatic review" } },
 };
 writeFileSync(join(root, "config/opencode/opencode.json"), JSON.stringify(globalConfig));
 const portServer = createServer(); portServer.listen(0, "127.0.0.1"); await once(portServer, "listening");
@@ -126,10 +125,6 @@ async function until<T>(get: () => Promise<T>, ready: (value: T) => boolean) {
   throw new Error(`OpenCode readiness timed out: ${String(last)} ${logs.slice(-2000)}`);
 }
 function stage(type: string): ClassifierStage {
-  if (type === "rules") return { type, rules: [
-    { expression: 'action == "shell" && resource == "pwd"', decision: "allow" },
-    { expression: 'action == "shell" && resource == "touch denied-file"', decision: "deny" },
-  ] };
   if (type === "laya") return { type: "decision", model: "laya/local", endpoint: `${endpoint}/v1/systemone`, timeoutMs: 100 };
   if (type === "typesafe-ai") return { type: "decision", model: "typesafe-ai/jev-latest", apiKeyEnv: "AUTO_MODE_INTEGRATION_API_KEY", timeoutMs: 100 };
   if (type === "openai") return { type: "decision", model: "openai/gpt-6-luna", apiKeyEnv: "AUTO_MODE_INTEGRATION_API_KEY", timeoutMs: 100 };
@@ -145,7 +140,7 @@ async function fixture(options: AutoModeOptions = {}, permissions: unknown[] = [
   const directory = join(root, `case-${++caseCount}`); mkdirSync(directory);
   writeFileSync(join(directory, "opencode.json"), JSON.stringify({
     permissions,
-    plugins: [{ package: transport }, { package: plugin, options: { agents: ["auto"], ...options } }],
+    plugins: [{ package: transport }, { package: plugin, options }],
   }));
   const query = `?location%5Bdirectory%5D=${encodeURIComponent(directory)}`;
   await until(() => api(`/api/plugin${query}`), (value) => ["opencode-auto-mode", "auto-mode-integration-transport"].every((id) =>
@@ -154,15 +149,15 @@ async function fixture(options: AutoModeOptions = {}, permissions: unknown[] = [
   assert.equal(loaded.features.server, true);
   assert.equal(loaded.features.tui, true);
   const agents = (await api(`/api/agent${query}`)).data;
-  for (const id of ["auto", "build", "plan"]) assert.ok(agents.some((agent: { id: string; mode: string }) => agent.id === id && agent.mode === "primary"), `missing ${id}`);
-  const session = (await api("/api/session", { agent: "auto", title: "Local integration test", location: { directory }, model: { id: "reviewer", providerID: "local" } })).data;
+  for (const id of ["build", "plan"]) assert.ok(agents.some((agent: { id: string; mode: string }) => agent.id === id && agent.mode === "primary"), `missing ${id}`);
+  const session = (await api("/api/session", { agent: "build", title: "Local integration test", location: { directory }, model: { id: "reviewer", providerID: "local" } })).data;
   await api(`/api/session/${session.id}/prompt`, { text: "Create sample.txt in this project; do not change permissions or affect other directories." });
   await api(`/api/experimental/session/${session.id}/wait`, {});
   const context = (await api(`/api/session/${session.id}/context`)).data;
   assert.ok(context.some((entry: { type: string }) => entry.type === "user"));
   return { directory, sessionID: session.id, query };
 }
-async function expectPermission(f: Awaited<ReturnType<typeof fixture>>, expected: Verdict, resources = ["touch sample.txt"], agent = "auto", action = "shell") {
+async function expectPermission(f: Awaited<ReturnType<typeof fixture>>, expected: Verdict, resources = ["touch sample.txt"], agent = "build", action = "shell") {
   const response = (await api(`/api/session/${f.sessionID}/permission`, { action, resources, agent, metadata: { integration: "pending-input" } })).data;
   assert.equal(response.effect, expected);
   const pending = (await api(`/api/session/${f.sessionID}/permission`)).data;
@@ -185,9 +180,9 @@ async function run(name: string, test: () => Promise<void>) {
 try {
   const info = await until(() => api("/api/info"), (value) => value.version.startsWith("2."));
   console.log(`OpenCode ${info.version}; artifacts ${root}`);
-  const types = ["static", "rules", "typesafe-ai", "openai", "laya", "llm"];
+  const types = ["static", "typesafe-ai", "openai", "laya", "llm"];
   const combinations = new Map<string, string[]>();
-  for (let mask = 1; mask < 64; mask++) {
+  for (let mask = 1; mask < 1 << types.length; mask++) {
     const selected = types.filter((_, index) => mask & (1 << index));
     combinations.set(selected.join("+"), selected);
   }
@@ -198,11 +193,10 @@ try {
     calls.length = 0;
     await expectPermission(f, selected.includes("llm") ? "allow" : "ask");
     const reached = selected.slice(0, selected.includes("llm") ? selected.indexOf("llm") + 1 : undefined)
-      .filter((type) => type !== "static" && type !== "rules").map(callName);
+      .filter((type) => type !== "static").map(callName);
     assert.deepEqual(calls, reached, `${name} cascade`);
     calls.length = 0;
-    await expectPermission(f, selected.some((type) => ["static", "rules", "llm"].includes(type)) ? "allow" : "ask", ["pwd"]);
-    if (selected.includes("rules")) { calls.length = 0; await expectPermission(f, "deny", ["touch denied-file"]); assert.deepEqual(calls, []); }
+    await expectPermission(f, selected.some((type) => ["static", "llm"].includes(type)) ? "allow" : "ask", ["pwd"]);
     if (selected.includes("static")) { calls.length = 0; await expectPermission(f, "deny", ["sudo rm -rf /"]); assert.deepEqual(calls, []); }
   });
   for (const type of ["typesafe-ai", "openai", "laya"]) {
@@ -225,80 +219,94 @@ try {
     const f = await fixture(); calls.length = 0;
     await expectPermission(f, "allow"); assert.deepEqual(calls, ["llm:triage"]);
   });
-  await run("host deny and agent scoping", async () => {
+  await run("host deny and all-agent review", async () => {
     const f = await fixture({ classifier: { stages: [stage("llm")] } }, [
       { action: "*", resource: "*", effect: "ask" }, { action: "shell", resource: "blocked", effect: "deny" },
     ]);
     calls.length = 0; await expectPermission(f, "deny", ["blocked"]); assert.deepEqual(calls, []);
-    for (const agent of ["build", "plan"]) { await expectPermission(f, "ask", ["touch sample.txt"], agent); assert.deepEqual(calls, []); }
+    for (const agent of ["build", "plan"]) {
+      calls.length = 0;
+      await expectPermission(f, "allow", ["touch sample.txt"], agent);
+      assert.deepEqual(calls, ["llm:triage"]);
+    }
   });
   await run("invalid configuration", async () => {
     const f = await fixture({ classifier: { stages: [{ type: "invalid" }] } } as unknown as AutoModeOptions);
     calls.length = 0; await expectPermission(f, "ask", ["pwd"]); assert.deepEqual(calls, []);
   });
-  await run("all-resource rules and static file boundaries", async () => {
-    const f = await fixture({ classifier: { stages: [stage("static"), stage("rules")] } });
+  await run("static file boundaries", async () => {
+    const f = await fixture({ classifier: { stages: [stage("static")] } });
     await expectPermission(f, "ask", ["pwd", "touch sample.txt"]);
     await expectPermission(f, "deny", ["pwd", "sudo rm -rf /"]);
     writeFileSync(join(f.directory, "sample.txt"), "sample");
-    await expectPermission(f, "allow", ["sample.txt"], "auto", "read");
-    await expectPermission(f, "ask", [".env"], "auto", "read");
-    await expectPermission(f, "ask", ["sample.txt"], "auto", "edit");
+    await expectPermission(f, "allow", ["sample.txt"], "build", "read");
+    await expectPermission(f, "ask", [".env"], "build", "read");
+    await expectPermission(f, "ask", ["sample.txt"], "build", "edit");
   });
-  await run("prompt-only scope and missing credentials", async () => {
-    const f = await fixture({ review: "prompts", classifier: { stages: [stage("llm")] } }, [{ action: "*", resource: "*", effect: "allow" }]);
-    calls.length = 0; await expectPermission(f, "allow"); assert.deepEqual(calls, []);
+  await run("host allow bypasses review and missing credentials fall through", async () => {
+    const allowed = await fixture({ classifier: { stages: [stage("llm")] } }, [{ action: "*", resource: "*", effect: "allow" }]);
+    calls.length = 0; await expectPermission(allowed, "allow"); assert.deepEqual(calls, []);
     const missing = await fixture({ classifier: { stages: [{ type: "decision", model: "typesafe-ai/jev-latest", apiKeyEnv: "AUTO_MODE_MISSING_TEST_KEY" }, stage("llm")] } });
     calls.length = 0; await expectPermission(missing, "allow"); assert.deepEqual(calls, ["llm:triage"]);
   });
-  await run("CEL coverage, errors, limits, and ask precedence", async () => {
-    const covered = await fixture({ classifier: { stages: [{ type: "rules", rules: [
-      { expression: 'resource == "touch a"', decision: "allow" },
-      { expression: 'resource == "touch b"', decision: "allow" },
-    ] }] } });
-    await expectPermission(covered, "allow", ["touch a", "touch b"]);
-    await expectPermission(covered, "ask", ["touch a", "touch c"]);
-    for (const expression of ['resource', 'unknown == "pwd"', 'action ==', '[1].all(x, x > 0)']) {
-      const f = await fixture({ classifier: { stages: [{ type: "rules", rules: [{ expression, decision: "allow" }] }, stage("static"), stage("llm")] } });
-      calls.length = 0; await expectPermission(f, "ask", ["pwd"]); assert.deepEqual(calls, []);
-    }
-    const bounded = await fixture({ classifier: { stages: [{ type: "rules", rules: [{ expression: "true", decision: "allow" }] }, stage("llm")] } });
-    calls.length = 0; await expectPermission(bounded, "ask", ["x".repeat(4097)]); assert.deepEqual(calls, []);
-    const escalated = await fixture({ classifier: { stages: [stage("llm"), { type: "rules", rules: [{ expression: 'action == "shell"', decision: "ask" }] }] } });
-    calls.length = 0; await expectPermission(escalated, "ask"); assert.deepEqual(calls, []);
-    const denied = await fixture({ classifier: { stages: [{ type: "rules", rules: [
-      { expression: "resource", decision: "allow" },
-      { expression: 'resource == "pwd"', decision: "deny" },
-    ] }, stage("llm")] } });
-    calls.length = 0; await expectPermission(denied, "deny", ["pwd"]); assert.deepEqual(calls, []);
-    const mixed = await fixture({ classifier: { stages: [{ type: "rules", rules: [{
-      expression: 'resource == "pwd" ? true : unknown', decision: "deny",
-    }] }, stage("llm")] } });
-    for (const resources of [["pwd", "other"], ["other", "pwd"]]) {
-      calls.length = 0; await expectPermission(mixed, "deny", resources); assert.deepEqual(calls, []);
-    }
-  });
   await run("shell parser guard before permissive classifiers", async () => {
-    const f = await fixture({ classifier: { stages: [{ type: "rules", rules: [{ expression: 'resource.startsWith("pwd")', decision: "allow" }] }, stage("llm")] } });
+    const f = await fixture({ classifier: { stages: [stage("llm")] } });
     for (const resource of ["pwd ; sudo rm -rf", "pwd > parser-marker", "pwd $(touch parser-marker)", "pwd ; touch parser-marker", 'pwd "unclosed']) {
       calls.length = 0;
       await expectPermission(f, resource.includes("sudo") ? "deny" : "ask", [resource]);
       assert.deepEqual(calls, []);
     }
   });
+  await run("audit log and OTLP export", async () => {
+    const received: unknown[] = [];
+    const collector = createServer(async (req, res) => {
+      try {
+        const chunks: Buffer[] = [];
+        for await (const chunk of req) chunks.push(Buffer.from(chunk));
+        received.push(JSON.parse(Buffer.concat(chunks).toString()));
+      } finally { res.writeHead(200); res.end(); }
+    });
+    collector.listen(0, "127.0.0.1");
+    await once(collector, "listening");
+    const collectorAddress = collector.address();
+    assert.ok(collectorAddress && typeof collectorAddress !== "string");
+    const auditFile = join(root, "audit", "decisions.jsonl");
+    try {
+      const f = await fixture({
+        classifier: { stages: [stage("llm")] },
+        auditLog: auditFile,
+        otlp: { endpoint: `http://127.0.0.1:${collectorAddress.port}` },
+      });
+      const before = existsSync(auditFile) ? readFileSync(auditFile, "utf8").trim().split("\n").filter(Boolean).length : 0;
+      received.length = 0;
+      calls.length = 0;
+      await expectPermission(f, "allow");
+      const lines = await until(
+        () => Promise.resolve(existsSync(auditFile) ? readFileSync(auditFile, "utf8").trim().split("\n").filter(Boolean) : []),
+        (value) => value.length > before,
+      );
+      const record = JSON.parse(lines.at(-1)!) as { decision: string; stage: string; action: string };
+      assert.equal(record.action, "shell");
+      assert.equal(record.decision, "allow");
+      assert.equal(record.stage, "llm");
+      const exported = await until(() => Promise.resolve(received), (value) => value.length > 0);
+      const logs = exported.at(-1) as { resourceLogs: { scopeLogs: { logRecords: { attributes: { key: string; value: { stringValue?: string } }[] }[] }[] }[] };
+      const attributes = logs.resourceLogs[0].scopeLogs[0].logRecords[0].attributes;
+      assert.equal(attributes.find((attribute) => attribute.key === "decision")?.value.stringValue, "allow");
+      assert.equal(attributes.find((attribute) => attribute.key === "stage")?.value.stringValue, "llm");
+    } finally {
+      collector.closeAllConnections();
+      collector.close();
+    }
+  });
   const toolCases: { name: string; stages: ClassifierStage[]; expected: Verdict; profile: Profile; command?: string; reached?: string[] }[] = [
     { name: "static read-only", stages: [stage("static")], expected: "allow", profile: {}, command: "pwd" },
-    { name: "user allow", stages: [{ type: "rules", rules: [{ expression: 'action == "shell"', decision: "allow" }] }], expected: "allow", profile: {} },
-    { name: "user deny", stages: [{ type: "rules", rules: [{ expression: 'action == "shell"', decision: "deny" }] }], expected: "deny", profile: {} },
-    { name: "CEL predicate", stages: [{ type: "rules", rules: [{ expression: 'agent == "auto" && command == "touch" && args == ["tool-result.txt"]', decision: "allow" }] }], expected: "allow", profile: {} },
-    { name: "CEL invalid result", stages: [{ type: "rules", rules: [{ expression: "resource", decision: "allow" }] }, stage("llm")], expected: "ask", profile: {} },
     { name: "parsed read-only chain", stages: [stage("static")], expected: "allow", profile: {}, command: "pwd && ls" },
-    { name: "prefix chain", stages: [{ type: "rules", rules: [{ expression: 'resource.startsWith("pwd")', decision: "allow" }] }], expected: "ask", profile: {}, command: "pwd ; touch tool-result.txt" },
-    { name: "prefix redirect", stages: [{ type: "rules", rules: [{ expression: 'resource.startsWith("pwd")', decision: "allow" }] }, stage("llm")], expected: "ask", profile: {}, command: "pwd > tool-result.txt" },
-    { name: "command substitution", stages: [{ type: "rules", rules: [{ expression: "true", decision: "allow" }] }, stage("llm")], expected: "ask", profile: {}, command: "pwd $(touch tool-result.txt)" },
-    { name: "nested shell", stages: [{ type: "rules", rules: [{ expression: "true", decision: "allow" }] }, stage("llm")], expected: "ask", profile: {}, command: "sh -c 'touch tool-result.txt'" },
-    { name: "stateful alias", stages: [{ type: "rules", rules: [{ expression: "true", decision: "allow" }] }, stage("llm")], expected: "ask", profile: {}, command: "alias pwd='touch tool-result.txt'; pwd" },
-    { name: "quoted literal argument", stages: [{ type: "rules", rules: [{ expression: 'command == "touch" && args == ["tool-result.txt"]', decision: "allow" }] }], expected: "allow", profile: {}, command: "touch 'tool-result.txt'" },
+    { name: "prefix redirect", stages: [stage("llm")], expected: "ask", profile: {}, command: "pwd > tool-result.txt" },
+    { name: "command substitution", stages: [stage("llm")], expected: "ask", profile: {}, command: "pwd $(touch tool-result.txt)" },
+    { name: "nested shell", stages: [stage("llm")], expected: "ask", profile: {}, command: "sh -c 'touch tool-result.txt'" },
+    { name: "stateful alias", stages: [stage("llm")], expected: "ask", profile: {}, command: "alias pwd='touch tool-result.txt'; pwd" },
+    { name: "quoted literal argument", stages: [stage("llm")], expected: "allow", profile: {}, command: "touch 'tool-result.txt'" },
     { name: "LLM allow", stages: [stage("llm")], expected: "allow", profile: {} },
     { name: "LLM deny", stages: [stage("llm")], expected: "deny", profile: { triage: "BLOCK", verdict: "DENY: out of scope" } },
     { name: "LLM ask", stages: [stage("llm")], expected: "ask", profile: { triage: "BLOCK", verdict: "ASK: uncertain" } },

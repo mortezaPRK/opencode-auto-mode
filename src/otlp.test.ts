@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { createOtlpExporter, logsUrl, toLogRecord } from "./otlp.js";
 import { parseOptions } from "./config.js";
 
-const record = { ts: "2026-10-23T10:00:00.000Z", reviewID: "r", sessionID: "s", agent: "auto", action: "shell", resources: ["ls"], hostEffect: "ask", decision: "deny", stage: "static", reason: "no", durationMs: 4 };
+const record = { ts: "2026-10-23T10:00:00.000Z", reviewID: "r", sessionID: "s", agent: "build", action: "shell", resources: ["ls"], hostEffect: "ask", decision: "deny", stage: "static", reason: "no", durationMs: 4 };
 
 describe("OTLP exporter", () => {
   it("is off unless configured and has an endpoint", () => {

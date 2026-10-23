@@ -1,12 +1,9 @@
 import { Model } from "@opencode/schema/model";
 import type { PolicyOptions } from "./policy.js";
-import type { Decision } from "./reviewer.js";
-import { compileExpression } from "./rules.js";
 import { logsUrl, type OtlpOptions } from "./otlp.js";
 
 export type ReviewerModel = string;
 export type ReviewerModelRef = { id: string; providerID: string; variant?: string };
-export type UserRule = { expression: string; decision: Decision };
 export type DecisionProvider = {
   apiKeyEnv?: string;
   minConfidence?: number;
@@ -19,13 +16,10 @@ export type DecisionStage = {
 } & DecisionProvider;
 export type ClassifierStage =
   | { type: "static"; allowInProjectEdits?: boolean }
-  | { type: "rules"; rules: UserRule[] }
   | DecisionStage
   | { type: "llm"; model?: ReviewerModel };
 export interface AutoModeOptions extends PolicyOptions {
-  review?: "all" | "prompts";
-  agents?: string[];
-  allowInProjectEdits?: boolean;
+  keybinds?: { allow?: string; deny?: string };
   auditLog?: boolean | string;
   otlp?: boolean | OtlpOptions;
   classifier?: { stages: ClassifierStage[] };
@@ -57,10 +51,9 @@ function model(value: unknown): value is ReviewerModel {
   try { parseReviewerModel(value); return true; } catch { return false; }
 }
 
-function rule(value: unknown): value is UserRule {
-  if (!object(value) || !only(value, ["expression", "decision"]) || !text(value.expression) ||
-      typeof value.decision !== "string" || !["allow", "deny", "ask"].includes(value.decision)) return false;
-  try { compileExpression(value.expression); return true; } catch { return false; }
+function keybinds(value: unknown): value is AutoModeOptions["keybinds"] {
+  return object(value) && only(value, ["allow", "deny"]) &&
+    Object.values(value).every((keybind) => keybind === undefined || text(keybind));
 }
 
 export function localEndpoint(value: string): string {
@@ -109,8 +102,6 @@ function stage(value: unknown): value is ClassifierStage {
   if (!object(value)) return false;
   if (value.type === "static") return only(value, ["type", "allowInProjectEdits"]) &&
     (value.allowInProjectEdits === undefined || typeof value.allowInProjectEdits === "boolean");
-  if (value.type === "rules") return only(value, ["type", "rules"]) && Array.isArray(value.rules) &&
-    value.rules.length <= 256 && value.rules.every(rule);
   if (value.type === "llm") return only(value, ["type", "model"]) &&
     (value.model === undefined || model(value.model));
   return value.type === "decision" && decision(value);
@@ -118,17 +109,13 @@ function stage(value: unknown): value is ClassifierStage {
 
 export function parseOptions(value: unknown): AutoModeOptions {
   if (!object(value)) throw new Error("Invalid auto-mode options");
-  if (!only(value, ["model", "review", "agents", "allowInProjectEdits", "classifier", "trusted", "blocks", "exceptions", "keybinds", "auditLog", "otlp"]))
+  if (!only(value, ["classifier", "trusted", "blocks", "exceptions", "keybinds", "auditLog", "otlp"]))
     throw new Error("Unknown auto-mode option");
-  if (value.model !== undefined) throw new Error("Reviewer model must be set on an llm stage");
-  if (value.review !== undefined && value.review !== "all" && value.review !== "prompts")
-    throw new Error("Invalid review scope");
-  for (const key of ["trusted", "blocks", "exceptions", "agents"]) {
+  for (const key of ["trusted", "blocks", "exceptions"]) {
     if (value[key] !== undefined && (!Array.isArray(value[key]) || value[key].length > 256 || !value[key].every(text)))
       throw new Error(`Invalid ${key}`);
   }
-  if (value.allowInProjectEdits !== undefined && typeof value.allowInProjectEdits !== "boolean")
-    throw new Error("Invalid edit configuration");
+  if (value.keybinds !== undefined && !keybinds(value.keybinds)) throw new Error("Invalid keybinds");
   if (value.auditLog !== undefined && typeof value.auditLog !== "boolean" && !text(value.auditLog))
     throw new Error("Invalid audit log");
   if (value.otlp !== undefined && typeof value.otlp !== "boolean" && !otlp(value.otlp)) throw new Error("Invalid OTLP options");
@@ -140,8 +127,5 @@ export function parseOptions(value: unknown): AutoModeOptions {
 }
 
 export function stagesFor(options: AutoModeOptions): ClassifierStage[] {
-  return options.classifier?.stages ?? [
-    { type: "static", allowInProjectEdits: options.allowInProjectEdits === true },
-    { type: "llm" },
-  ];
+  return options.classifier?.stages ?? [{ type: "static" }, { type: "llm" }];
 }

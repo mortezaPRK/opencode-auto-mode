@@ -22,14 +22,9 @@ describe("shell approval guard", () => {
     assert.equal(guardShell(["touch file"]), undefined);
     assert.equal((await compositeDecision([{ type: "static" }], { action: "shell", resources: ["pwd", "ls"] }, unused)).decision, "allow");
   });
-  it("exposes executable and arguments to CEL without authorizing a prefix", async () => {
-    const stages = [{ type: "rules" as const, rules: [{ expression: 'command == "pwd" && size(args) == 0', decision: "allow" as const }] }];
-    assert.equal((await compositeDecision(stages, { action: "shell", resources: ["pwd"] }, unused)).decision, "allow");
-    assert.equal((await compositeDecision(stages, { action: "shell", resources: ["pwd --help"] }, unused)).decision, "ask");
-    assert.equal((await compositeDecision(stages, { action: "shell", resources: ["pwd", "touch marker"] }, unused)).decision, "ask");
-  });
-  it("preserves user deny rules for complex command strings", async () => {
-    const stages = [{ type: "rules" as const, rules: [{ expression: 'action == "shell"', decision: "deny" as const }] }];
-    assert.equal((await compositeDecision(stages, { action: "shell", resources: ["pwd > marker"] }, unused)).decision, "deny");
+  it("runs before decision and model reviewers", async () => {
+    const stages = [{ type: "decision" as const, model: "typesafe-ai/jev-latest" }, { type: "llm" as const }];
+    assert.equal((await compositeDecision(stages, { action: "shell", resources: ["pwd > marker"] }, unused)).decision, "ask");
+    assert.equal((await compositeDecision(stages, { action: "shell", resources: ["sudo rm -rf /"] }, unused)).decision, "deny");
   });
 });

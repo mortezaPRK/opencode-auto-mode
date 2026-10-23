@@ -15,7 +15,7 @@ const args = process.argv.slice(2);
 const flag = (name: string) => args.includes(`--${name}`);
 const opt = (name: string) => { const i = args.indexOf(`--${name}`); return i >= 0 ? args[i + 1] : undefined; };
 if (flag("help")) {
-  console.log(`Usage: bun scripts/replay.ts [--session <id>] [--days 14] [--agent auto|any] [--config <opencode.json>]
+  console.log(`Usage: bun scripts/replay.ts [--session <id>] [--days 14] [--agent build|any] [--config <opencode.json>]
                           [--db <opencode.db>] [--show 25] [--json]`);
   process.exit(0);
 }
@@ -23,7 +23,7 @@ if (flag("help")) {
 const dbPath = opt("db") ?? path.join(os.homedir(), ".local/share/opencode/opencode.db");
 const configPath = opt("config") ?? path.join(os.homedir(), ".config/opencode/opencode.json");
 const days = Number(opt("days") ?? 14);
-const agentFilter = opt("agent") ?? "auto";
+const agentFilter = opt("agent") ?? "any";
 const show = Number(opt("show") ?? 25);
 
 function stripJsonc(text: string): string {
