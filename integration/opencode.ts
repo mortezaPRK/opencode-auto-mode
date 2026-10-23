@@ -263,7 +263,7 @@ try {
       try {
         const chunks: Buffer[] = [];
         for await (const chunk of req) chunks.push(Buffer.from(chunk));
-        received.push(JSON.parse(Buffer.concat(chunks).toString()));
+        received.push({ path: req.url, body: JSON.parse(Buffer.concat(chunks).toString()) });
       } finally { res.writeHead(200); res.end(); }
     });
     collector.listen(0, "127.0.0.1");
@@ -289,9 +289,19 @@ try {
       assert.equal(record.action, "shell");
       assert.equal(record.decision, "allow");
       assert.equal(record.stage, "llm");
-      const exported = await until(() => Promise.resolve(received), (value) => value.length > 0);
-      const logs = exported.at(-1) as { resourceLogs: { scopeLogs: { logRecords: { attributes: { key: string; value: { stringValue?: string } }[] }[] }[] }[] };
-      const attributes = logs.resourceLogs[0].scopeLogs[0].logRecords[0].attributes;
+      const exported = await until(() => Promise.resolve(received as { path: string; body: unknown }[]),
+        (value) => value.some((entry) => entry.path === "/v1/logs") && value.some((entry) => entry.path === "/v1/traces"));
+      const logs = exported.find((entry) => entry.path === "/v1/logs")!.body as {
+        resourceLogs: { scopeLogs: { logRecords: { traceId: string; spanId: string; attributes: { key: string; value: { stringValue?: string } }[] }[] }[] }[] };
+      const logRecord = logs.resourceLogs[0].scopeLogs[0].logRecords[0];
+      const attributes = logRecord.attributes;
+      const traces = exported.find((entry) => entry.path === "/v1/traces")!.body as {
+        resourceSpans: { scopeSpans: { spans: { traceId: string; spanId: string; parentSpanId?: string; name: string }[] }[] }[] };
+      const spans = traces.resourceSpans[0].scopeSpans[0].spans;
+      assert.equal(spans[0].name, "auto_mode.review");
+      assert.equal(spans[0].traceId, logRecord.traceId);
+      assert.equal(spans[0].spanId, logRecord.spanId);
+      assert.equal(spans[1].parentSpanId, spans[0].spanId);
       assert.equal(attributes.find((attribute) => attribute.key === "decision")?.value.stringValue, "allow");
       assert.equal(attributes.find((attribute) => attribute.key === "stage")?.value.stringValue, "llm");
     } finally {

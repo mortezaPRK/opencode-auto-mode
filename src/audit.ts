@@ -16,6 +16,8 @@ export interface AuditRecord {
   durationMs: number;
   error?: boolean;
   errorDetail?: string;
+  traceID?: string;
+  spanID?: string;
 }
 
 export interface AuditLog { write(record: AuditRecord): void }

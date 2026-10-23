@@ -174,7 +174,8 @@ bun scripts/replay.ts [--days 14] [--session ID] [--agent build|any] [--json]
 ```
 
 To send decisions through OpenCode's OTLP telemetry, configure OTLP for OpenCode
-with its standard environment variables, then enable the plugin flag:
+with its standard environment variables, then enable the plugin flag. This sends
+correlated decision logs and review traces, including model reviewer attempts:
 
 ```jsonc
 {

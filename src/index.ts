@@ -10,6 +10,7 @@ import { compositeDecision } from "./classifier.js";
 import { decisionStage } from "./decisions.js";
 import { createAuditLog } from "./audit.js";
 import { createOtlpExporter } from "./otlp.js";
+import { createTraceExporter } from "./traces.js";
 
 export type { AutoModeOptions, ClassifierStage, DecisionProvider, DecisionStage, ReviewerModel } from "./config.js";
 
@@ -21,6 +22,7 @@ export default Plugin.define({
     try { options = parseOptions(ctx.options); }
     catch { log.log("Invalid configuration; automatic approval disabled"); }
     const sinks = [createAuditLog(options?.auditLog), createOtlpExporter(options?.otlp)].filter((sink) => sink !== undefined);
+    const traces = createTraceExporter(options?.otlp);
     const counts = new Map<string, number>();
     let reviewCounter = 0;
     const permissionRegistration = await ctx.permission.hook("evaluate", async (event) => {
@@ -33,6 +35,7 @@ export default Plugin.define({
       const reviewID = `review-${process.pid}-${Date.now()}-${reviewCounter++}`;
       recordDecision({ requestID: reviewID, sessionID: event.sessionID, decision: "reviewing", action: event.action.slice(0, 128), reason: "", at: Date.now() });
       const startedAt = Date.now();
+      const trace = traces?.begin(startedAt);
       const hostEffect = event.effect;
       let failure: string | undefined;
       let result: ReviewResult;
@@ -56,12 +59,20 @@ export default Plugin.define({
           if (!contextComplete)
             return { decision: "ask", reason: "User authorization context is unavailable" };
           const policy = defaultPolicy(stage.policy);
+          const attemptStartedAt = Date.now();
+          let outcome: StageResult;
           try {
-            return stage.type === "llm" ? await llmDecision(ctx, request, policy, stage.model, info?.model) :
+            outcome = stage.type === "llm" ? await llmDecision(ctx, request, policy, stage.model, info?.model) :
               await decisionStage(stage, request, policy);
           } catch {
-            return { decision: "abstain", reason: `${stage.type} reviewer unavailable` };
+            outcome = { decision: "abstain", reason: `${stage.type} reviewer unavailable` };
           }
+          trace?.attempts.push({
+            index: options.classifiers.indexOf(stage), type: stage.type,
+            model: stage.model ?? (info?.model ? `${info.model.providerID}/${info.model.id}` : undefined),
+            startedAt: attemptStartedAt, durationMs: Date.now() - attemptStartedAt, result: outcome,
+          });
+          return outcome;
         });
       } catch (error) {
         failure = error instanceof Error ? error.message : String(error);
@@ -80,7 +91,9 @@ export default Plugin.define({
         action: event.action, resources: [...event.resources], hostEffect,
         decision: result.decision, stage: result.stage ?? "unknown", reason: result.reason,
         durationMs: Date.now() - startedAt, ...(failure !== undefined ? { error: true, errorDetail: failure } : {}),
+        ...(trace ? { traceID: trace.traceID, spanID: trace.spanID } : {}),
       };
+      trace?.finish(auditRecord);
       for (const sink of sinks) sink.write(auditRecord);
       recordDecision({ requestID: reviewID, sessionID: event.sessionID, decision: event.effect, reason: "", at: Date.now() });
     });

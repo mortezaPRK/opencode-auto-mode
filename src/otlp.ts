@@ -29,6 +29,7 @@ export function toLogRecord(record: AuditRecord) {
   const severity = record.decision === "deny" ? { severityNumber: 13, severityText: "WARN" } : { severityNumber: 9, severityText: "INFO" };
   return {
     timeUnixNano: String(BigInt(Date.parse(record.ts)) * 1_000_000n),
+    ...(record.traceID === undefined ? {} : { traceId: record.traceID, spanId: record.spanID }),
     ...severity,
     body: { stringValue: record.reason },
     attributes: [
