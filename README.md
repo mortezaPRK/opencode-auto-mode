@@ -121,21 +121,11 @@ permissions and leave global permissions unchanged:
 }
 ```
 
-## TUI keybindings
+## TUI indicator
 
-The plugin shows review status in the TUI and provides manual allow and deny
-commands. Override the defaults in plugin options:
-
-```jsonc
-{
-  "options": {
-    "keybinds": {
-      "allow": "ctrl+alt+a",
-      "deny": "ctrl+alt+d"
-    }
-  }
-}
-```
+A passive indicator shows when the plugin is reviewing the current session.
+It is enabled by default. Set `tui: false` in plugin options to hide it.
+OpenCode's own permission dialog handles manual approvals.
 
 ## Review options
 

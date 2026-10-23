@@ -59,12 +59,12 @@ describe("composite classifiers", () => {
       { classifiers: [{ type: "static", allowInProjectEdits: "true" }] },
       { classifiers: [{ type: "unknown" }] },
       { classifiers: [{ type: "static" }], unknown: true },
-      { classifiers: [{ type: "static" }], keybinds: { allow: "a", unknown: "b" } }])
+      { classifiers: [{ type: "static" }], tui: "enabled" }])
       assert.throws(() => parseOptions(value));
     const stages: ClassifierStage[] = [{ type: "static" }, { type: "llm" }];
     assert.deepEqual(parseOptions({ classifiers: stages }).classifiers.map((stage) => stage.type), ["static", "llm"]);
     assert.equal(parseOptions({ classifiers: [{ type: "decision", model: "laya/local" }] }).classifiers[0].type, "decision");
     assert.equal(parseOptions({ classifiers: [{ type: "llm", model: "provider/model#high" }] }).classifiers[0].type, "llm");
-    assert.deepEqual(parseOptions({ classifiers: stages, keybinds: { allow: "ctrl+alt+a" } }).keybinds, { allow: "ctrl+alt+a" });
+    assert.equal(parseOptions({ classifiers: stages, tui: false }).tui, false);
   });
 });

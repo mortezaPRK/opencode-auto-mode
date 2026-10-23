@@ -24,7 +24,7 @@ export type ClassifierStage =
 
 export interface AutoModeOptions {
   classifiers: ClassifierStage[];
-  keybinds?: { allow?: string; deny?: string };
+  tui?: boolean;
   auditLog?: boolean | string;
   otlp?: boolean | OtlpOptions;
 }
@@ -58,11 +58,6 @@ function model(value: unknown): value is ReviewerModel {
 function policy(value: unknown): value is Partial<ReviewPolicy> {
   return object(value) && only(value, ["trusted", "blocks", "exceptions"]) &&
     Object.values(value).every((list) => Array.isArray(list) && list.length <= 256 && list.every(text));
-}
-
-function keybinds(value: unknown): value is AutoModeOptions["keybinds"] {
-  return object(value) && only(value, ["allow", "deny"]) &&
-    Object.values(value).every((keybind) => keybind === undefined || text(keybind));
 }
 
 export function localEndpoint(value: string): string {
@@ -120,9 +115,9 @@ function stage(value: unknown): value is ClassifierStage {
 
 export function parseOptions(value: unknown): AutoModeOptions {
   if (!object(value)) throw new Error("Invalid auto-mode options");
-  if (!only(value, ["classifiers", "keybinds", "auditLog", "otlp"]))
+  if (!only(value, ["classifiers", "tui", "auditLog", "otlp"]))
     throw new Error("Unknown auto-mode option");
-  if (value.keybinds !== undefined && !keybinds(value.keybinds)) throw new Error("Invalid keybinds");
+  if (value.tui !== undefined && typeof value.tui !== "boolean") throw new Error("Invalid TUI setting");
   if (value.auditLog !== undefined && typeof value.auditLog !== "boolean" && !text(value.auditLog))
     throw new Error("Invalid audit log");
   if (value.otlp !== undefined && typeof value.otlp !== "boolean" && !otlp(value.otlp)) throw new Error("Invalid OTLP options");
