@@ -16,6 +16,46 @@ Add the plugin to your global `~/.config/opencode/opencode.jsonc` using an examp
 opencode service restart
 ```
 
+## Choosing a review mode (read this first)
+
+`review` decides which actions the plugin sees:
+
+| Mode | The plugin reviews | Caveat |
+| --- | --- | --- |
+| `"all"` | Every eligible action, even ones OpenCode would allow | An **Always** approval does not persist (see below) |
+| `"prompts"` | Only actions OpenCode already marks `ask` | **Anything OpenCode allows is never reviewed** |
+
+OpenCode V2's default policy allows everything (`{ "action": "*", "resource": "*", "effect": "allow" }`). With `"prompts"` and no permission rules, nothing is ever `ask`, so the plugin is never consulted and dangerous commands such as `sudo` run unreviewed. Pick one of these setups:
+
+**Option 1: `review: "all"`.** The plugin judges everything, regardless of OpenCode's rules.
+
+```json
+{ "package": "@mortz.prk/opencode-auto-mode", "options": { "review": "all", "agents": ["auto"] } }
+```
+
+**Option 2: `review: "prompts"` plus a V2 `permissions` array.** Make OpenCode ask, so every action reaches the plugin, and keep OpenCode's normal prompts as the fallback. Scope the rule to the Auto agent so other agents keep their behaviour:
+
+```jsonc
+{
+  "agents": {
+    "auto": {
+      "mode": "primary",
+      "description": "Build with automatic permission review",
+      "permissions": [{ "action": "*", "resource": "*", "effect": "ask" }]
+    }
+  },
+  "plugins": [
+    { "package": "@mortz.prk/opencode-auto-mode", "options": { "review": "prompts", "agents": ["auto"] } }
+  ]
+}
+```
+
+Notes:
+
+- Use the V2 shape. V1's `"permission": { "*": "ask" }` is not valid in V2 and can stop OpenCode from starting; V2 uses `permissions` with `action`, `resource` and `effect`. See the [OpenCode permissions docs](https://opencode.ai/v2/docs/permissions).
+- With option 2, saved **Always** approvals are durable `allow` rules, so those actions skip review under `"prompts"`. Review broad ones (for example `edit *` or `shell *`) and remove what you no longer want.
+- Configure a reviewer model that exists (`options.model`). If the model is unavailable, reviews fail and fall back to `ask`.
+
 ## Configuration examples
 
 ### Built-in checks followed by an LLM
