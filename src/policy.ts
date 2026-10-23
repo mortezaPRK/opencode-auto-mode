@@ -4,12 +4,6 @@ export interface ReviewPolicy {
   exceptions: string[];
 }
 
-export interface PolicyOptions {
-  trusted?: string[];
-  blocks?: string[];
-  exceptions?: string[];
-}
-
 const DEFAULT_TRUSTED = [
   "the git repo in the session's working directory (reviewable via version control)",
 ];
@@ -33,10 +27,10 @@ const DEFAULT_EXCEPTIONS = [
   "Read-only inspection (listing, diffing, dry runs) before a guarded action.",
 ];
 
-export function defaultPolicy(options?: PolicyOptions): ReviewPolicy {
+export function defaultPolicy(options?: Partial<ReviewPolicy>): ReviewPolicy {
   return {
-    trusted: options?.trusted?.length ? options.trusted : [...DEFAULT_TRUSTED],
-    blocks: options?.blocks?.length ? options.blocks : [...DEFAULT_BLOCKS],
-    exceptions: options?.exceptions?.length ? options.exceptions : [...DEFAULT_EXCEPTIONS],
+    trusted: [...(options?.trusted ?? DEFAULT_TRUSTED)],
+    blocks: [...(options?.blocks ?? DEFAULT_BLOCKS)],
+    exceptions: [...(options?.exceptions ?? DEFAULT_EXCEPTIONS)],
   };
 }

@@ -24,7 +24,7 @@ describe("audit log", () => {
     const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "audit-")), "d.jsonl");
     let evaluate!: (event: unknown) => Promise<void>;
     const ctx = {
-      options: { auditLog: file, classifier: { stages: [{ type: "static" }] } },
+      options: { auditLog: file, classifiers: [{ type: "static" }] },
       permission: { hook: async (_: string, handler: typeof evaluate) => { evaluate = handler; return { dispose: async () => {} }; } },
       tool: { hook: async () => ({ dispose: async () => {} }) },
       session: { get: async () => ({ location: { directory: "/repo" } }), context: async () => [] },

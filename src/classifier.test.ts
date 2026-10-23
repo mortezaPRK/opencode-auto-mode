@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { compositeDecision } from "./classifier.js";
-import { parseOptions, stagesFor, type ClassifierStage } from "./config.js";
+import { parseOptions, type ClassifierStage } from "./config.js";
 
 const request = { action: "shell", resources: ["touch a", "touch b"] };
 const unused = async () => { throw new Error("unexpected reviewer call"); };
@@ -37,28 +37,34 @@ describe("composite classifiers", () => {
     assert.equal(result.stage, "none");
     assert.match(result.reason, /no answer/);
   });
+  it("validates policy only on model-based classifiers", () => {
+    for (const type of ["llm", "decision"] as const) {
+      const model = type === "decision" ? "laya/local" : "provider/model";
+      assert.doesNotThrow(() => parseOptions({ classifiers: [{ type, model, policy: { blocks: [], trusted: ["repository"] } }] }));
+      for (const policy of [null, [], { unknown: [] }, { blocks: "deny" }, { trusted: [""] }, { exceptions: [1] }])
+        assert.throws(() => parseOptions({ classifiers: [{ type, model, policy }] }));
+    }
+    assert.throws(() => parseOptions({ classifiers: [{ type: "static", policy: { blocks: [] } }] }));
+  });
   it("rejects unknown options, stages, and malformed settings", () => {
-    for (const value of [null, {}, { classifer: {} }, { classifier: { stages: [] } },
-      { classifier: { stages: [{ type: "llm", model: { id: "x" } }] } },
-      { classifier: { stages: [{ type: "llm", model: "model-only" }] } },
-      { classifier: { stages: [{ type: "decision", model: "typesafe-ai/jev-latest", minConfidence: NaN }] } },
-      { classifier: { stages: [{ type: "decision", model: "typesafe-ai/jev-latest", endpoint: "http://127.0.0.1/v1/systemone" }] } },
-      { classifier: { stages: [{ type: "decision", model: "unknown/decision" }] } },
-      { classifier: { stages: [{ type: "decision", model: "laya/local#high" }] } },
-      { classifier: { stages: [{ type: "decision", model: "laya/local", endpoint: "http://example.com/v1/systemone" }] } },
-      { classifier: { stages: [{ type: "decision", model: "laya/local", endpoint: "http://127.0.0.1/v1/systemone?x=y" }] } },
-      { classifier: { stages: [{ type: "static", allowInProjectEdits: "true" }] } },
-      { classifier: { stages: [{ type: "rules", rules: [] }] } },
-      { model: "provider/model" },
-      { review: "all" },
-      { agents: ["build"] },
-      { allowInProjectEdits: true },
-      { classifier: { stages: [{ type: "static" }] }, keybinds: { allow: "a", unknown: "b" } }])
+    for (const value of [null, {}, { classifer: {} }, { classifiers: [] },
+      { classifiers: [{ type: "llm", model: { id: "x" } }] },
+      { classifiers: [{ type: "llm", model: "model-only" }] },
+      { classifiers: [{ type: "decision", model: "typesafe-ai/jev-latest", minConfidence: NaN }] },
+      { classifiers: [{ type: "decision", model: "typesafe-ai/jev-latest", endpoint: "http://127.0.0.1/v1/systemone" }] },
+      { classifiers: [{ type: "decision", model: "unknown/decision" }] },
+      { classifiers: [{ type: "decision", model: "laya/local#high" }] },
+      { classifiers: [{ type: "decision", model: "laya/local", endpoint: "http://example.com/v1/systemone" }] },
+      { classifiers: [{ type: "decision", model: "laya/local", endpoint: "http://127.0.0.1/v1/systemone?x=y" }] },
+      { classifiers: [{ type: "static", allowInProjectEdits: "true" }] },
+      { classifiers: [{ type: "unknown" }] },
+      { classifiers: [{ type: "static" }], unknown: true },
+      { classifiers: [{ type: "static" }], keybinds: { allow: "a", unknown: "b" } }])
       assert.throws(() => parseOptions(value));
     const stages: ClassifierStage[] = [{ type: "static" }, { type: "llm" }];
-    assert.deepEqual(stagesFor(parseOptions({ classifier: { stages } })).map((stage) => stage.type), ["static", "llm"]);
-    assert.equal(parseOptions({ classifier: { stages: [{ type: "decision", model: "laya/local" }] } }).classifier.stages[0].type, "decision");
-    assert.equal(parseOptions({ classifier: { stages: [{ type: "llm", model: "provider/model#high" }] } }).classifier.stages[0].type, "llm");
-    assert.deepEqual(parseOptions({ classifier: { stages }, keybinds: { allow: "ctrl+alt+a" } }).keybinds, { allow: "ctrl+alt+a" });
+    assert.deepEqual(parseOptions({ classifiers: stages }).classifiers.map((stage) => stage.type), ["static", "llm"]);
+    assert.equal(parseOptions({ classifiers: [{ type: "decision", model: "laya/local" }] }).classifiers[0].type, "decision");
+    assert.equal(parseOptions({ classifiers: [{ type: "llm", model: "provider/model#high" }] }).classifiers[0].type, "llm");
+    assert.deepEqual(parseOptions({ classifiers: stages, keybinds: { allow: "ctrl+alt+a" } }).keybinds, { allow: "ctrl+alt+a" });
   });
 });

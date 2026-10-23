@@ -7,7 +7,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { parse as shellParse } from "shell-quote";
-import { parseOptions, stagesFor, type AutoModeOptions } from "../src/config.js";
+import { parseOptions, type AutoModeOptions } from "../src/config.js";
 import { compositeDecision } from "../src/classifier.js";
 import type { PermissionRequest, ReviewResult } from "../src/reviewer.js";
 
@@ -83,7 +83,7 @@ function toRequest(call: Call): PermissionRequest {
 }
 
 const options = loadOptions();
-const stages = stagesFor(options);
+const stages = options.classifiers;
 const db = new Database(dbPath, { readonly: true });
 const cutoff = Date.now() - days * 86_400_000;
 const sessionID = opt("session");

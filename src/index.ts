@@ -5,7 +5,7 @@ import { defaultPolicy } from "./policy.js";
 import { extractTranscript } from "./transcript.js";
 import { scanResultContent, withInjectionWarning } from "./probe.js";
 import { buildStage1Prompt, buildStage2Prompt, parseDecision, parseStage1, withDenySuffix, type PermissionRequest, type ReviewResult, type StageResult } from "./reviewer.js";
-import { parseOptions, parseReviewerModel, stagesFor, type ReviewerModelRef } from "./config.js";
+import { parseOptions, parseReviewerModel, type ReviewerModelRef } from "./config.js";
 import { compositeDecision } from "./classifier.js";
 import { decisionStage } from "./decisions.js";
 import { createAuditLog } from "./audit.js";
@@ -44,7 +44,7 @@ export default Plugin.define({
           isDelegation: event.action === "task" || event.action === "subagent",
         };
         let contextLoaded = false;
-        result = await compositeDecision(stagesFor(options), request, async (stage) => {
+        result = await compositeDecision(options.classifiers, request, async (stage) => {
           if (!contextLoaded) {
             const messages = await withTimeout(ctx.session.context({ sessionID: event.sessionID }), 3_000);
             request.transcript = extractTranscript(messages);
@@ -52,7 +52,7 @@ export default Plugin.define({
           }
           if (!request.transcript?.startsWith("User messages") || request.transcript.includes("…"))
             return { decision: "ask", reason: "User authorization context is unavailable" };
-          const policy = defaultPolicy(options);
+          const policy = defaultPolicy(stage.policy);
           try {
             return stage.type === "llm" ? await llmDecision(ctx, request, policy, stage.model, info?.model) :
               await decisionStage(stage, request, policy);

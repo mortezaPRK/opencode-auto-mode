@@ -19,6 +19,17 @@ describe("defaultPolicy", () => {
     });
     assert.deepEqual(policy.trusted, ["my org"]);
     assert.deepEqual(policy.blocks, ["no deploys on fridays"]);
+    assert.deepEqual(policy.exceptions, []);
+  });
+  it("defaults omitted lists independently and copies arrays", () => {
+    const overrides = { blocks: [] as string[] };
+    const policy = defaultPolicy(overrides);
+    assert.deepEqual(policy.blocks, []);
+    assert.ok(policy.trusted.length > 0);
     assert.ok(policy.exceptions.length > 0);
+    const blocks: string[] = policy.blocks;
+    blocks.push("local change");
+    assert.deepEqual(overrides.blocks, []);
+    assert.notDeepEqual(defaultPolicy().blocks, policy.blocks);
   });
 });

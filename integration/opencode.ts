@@ -189,7 +189,7 @@ try {
   for (const first of types) for (const second of types)
     if (first !== second) combinations.set(`${first}+${second}`, [first, second]);
   for (const [name, selected] of combinations) await run(name, async () => {
-    const f = await fixture({ classifier: { stages: selected.map(stage) } });
+    const f = await fixture({ classifiers: selected.map(stage) });
     calls.length = 0;
     await expectPermission(f, selected.includes("llm") ? "allow" : "ask");
     const reached = selected.slice(0, selected.includes("llm") ? selected.indexOf("llm") + 1 : undefined)
@@ -201,7 +201,7 @@ try {
   });
   for (const type of ["typesafe-ai", "openai", "laya"]) {
     for (const mode of ["allow", "deny", "ask", "malformed", "failure", "timeout"] as Mode[]) await run(`${type}:${mode}`, async () => {
-      const f = await fixture({ classifier: { stages: [stage(type), stage("llm")] } });
+      const f = await fixture({ classifiers: [stage(type), stage("llm")] });
       const route = providerRoute(type);
       profile = { modes: { [route]: mode } }; calls.length = 0;
       const terminal = mode === "allow" || mode === "deny" || mode === "ask";
@@ -210,17 +210,17 @@ try {
     });
   }
   for (const verdict of ["ALLOW: authorized", "DENY: out of scope", "ASK: uncertain", "allowance unavailable", "ALLOW: yes\nDENY: no"]) await run(`llm:${verdict}`, async () => {
-    const f = await fixture({ classifier: { stages: [stage("llm")] } });
+    const f = await fixture({ classifiers: [stage("llm")] });
     profile = { triage: "BLOCK", verdict }; calls.length = 0;
     await expectPermission(f, verdict.startsWith("ALLOW:") && !verdict.includes("\n") ? "allow" : verdict.startsWith("DENY:") ? "deny" : "ask");
     assert.deepEqual(calls, ["llm:triage", "llm:verdict"]);
   });
   await run("session model with explicit pipeline", async () => {
-    const f = await fixture({ classifier: { stages: [stage("llm")] } }); calls.length = 0;
+    const f = await fixture({ classifiers: [stage("llm")] }); calls.length = 0;
     await expectPermission(f, "allow"); assert.deepEqual(calls, ["llm:triage"]);
   });
   await run("host deny and all-agent review", async () => {
-    const f = await fixture({ classifier: { stages: [stage("llm")] } }, [
+    const f = await fixture({ classifiers: [stage("llm")] }, [
       { action: "*", resource: "*", effect: "ask" }, { action: "shell", resource: "blocked", effect: "deny" },
     ]);
     calls.length = 0; await expectPermission(f, "deny", ["blocked"]); assert.deepEqual(calls, []);
@@ -231,11 +231,11 @@ try {
     }
   });
   await run("invalid configuration", async () => {
-    const f = await fixture({ classifier: { stages: [{ type: "invalid" }] } } as unknown as AutoModeOptions);
+    const f = await fixture({ classifiers: [{ type: "invalid" }] } as unknown as AutoModeOptions);
     calls.length = 0; await expectPermission(f, "ask", ["pwd"]); assert.deepEqual(calls, []);
   });
   await run("static file boundaries", async () => {
-    const f = await fixture({ classifier: { stages: [stage("static")] } });
+    const f = await fixture({ classifiers: [stage("static")] });
     await expectPermission(f, "ask", ["pwd", "touch sample.txt"]);
     await expectPermission(f, "deny", ["pwd", "sudo rm -rf /"]);
     writeFileSync(join(f.directory, "sample.txt"), "sample");
@@ -244,13 +244,13 @@ try {
     await expectPermission(f, "ask", ["sample.txt"], "build", "edit");
   });
   await run("host allow bypasses review and missing credentials fall through", async () => {
-    const allowed = await fixture({ classifier: { stages: [stage("llm")] } }, [{ action: "*", resource: "*", effect: "allow" }]);
+    const allowed = await fixture({ classifiers: [stage("llm")] }, [{ action: "*", resource: "*", effect: "allow" }]);
     calls.length = 0; await expectPermission(allowed, "allow"); assert.deepEqual(calls, []);
-    const missing = await fixture({ classifier: { stages: [{ type: "decision", model: "typesafe-ai/jev-latest", apiKeyEnv: "AUTO_MODE_MISSING_TEST_KEY" }, stage("llm")] } });
+    const missing = await fixture({ classifiers: [{ type: "decision", model: "typesafe-ai/jev-latest", apiKeyEnv: "AUTO_MODE_MISSING_TEST_KEY" }, stage("llm")] });
     calls.length = 0; await expectPermission(missing, "allow"); assert.deepEqual(calls, ["llm:triage"]);
   });
   await run("shell parser guard before permissive classifiers", async () => {
-    const f = await fixture({ classifier: { stages: [stage("llm")] } });
+    const f = await fixture({ classifiers: [stage("llm")] });
     for (const resource of ["pwd ; sudo rm -rf", "pwd > parser-marker", "pwd $(touch parser-marker)", "pwd ; touch parser-marker", 'pwd "unclosed']) {
       calls.length = 0;
       await expectPermission(f, resource.includes("sudo") ? "deny" : "ask", [resource]);
@@ -273,7 +273,7 @@ try {
     const auditFile = join(root, "audit", "decisions.jsonl");
     try {
       const f = await fixture({
-        classifier: { stages: [stage("llm")] },
+        classifiers: [stage("llm")],
         auditLog: auditFile,
         otlp: { endpoint: `http://127.0.0.1:${collectorAddress.port}` },
       });
@@ -315,7 +315,7 @@ try {
       ({ name: `${type} ${expected}`, stages: [stage(type)], expected, profile: { modes: { [providerRoute(type)]: expected } } }))),
   ];
   for (const test of toolCases) await run(`real shell: ${test.name}`, async () => {
-    const f = await fixture({ classifier: { stages: test.stages } });
+    const f = await fixture({ classifiers: test.stages });
     profile = { ...test.profile, tool: test.command ?? "touch tool-result.txt" };
     calls.length = 0;
     await api(`/api/session/${f.sessionID}/prompt`, { text: "Run the requested local integration shell command once." });

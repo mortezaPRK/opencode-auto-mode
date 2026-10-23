@@ -40,9 +40,9 @@ describe("OTLP exporter", () => {
     assert.deepEqual(attrs.find((a) => a.key === "stage")?.value, { stringValue: "static" });
   });
   it("validates options", () => {
-    const classifier = { stages: [{ type: "static" as const }] };
-    assert.doesNotThrow(() => parseOptions({ classifier, otlp: { endpoint: "http://c:4318", headers: { authorization: "x" }, timeoutMs: 500 }, auditLog: "/tmp/a.jsonl" }));
-    assert.throws(() => parseOptions({ classifier, otlp: { endpoint: "ftp://c" } }));
-    assert.throws(() => parseOptions({ classifier, otlp: { bogus: 1 } }));
+    const classifiers = [{ type: "static" as const }];
+    assert.doesNotThrow(() => parseOptions({ classifiers, otlp: { endpoint: "http://c:4318", headers: { authorization: "x" }, timeoutMs: 500 }, auditLog: "/tmp/a.jsonl" }));
+    assert.throws(() => parseOptions({ classifiers, otlp: { endpoint: "ftp://c" } }));
+    assert.throws(() => parseOptions({ classifiers, otlp: { bogus: 1 } }));
   });
 });

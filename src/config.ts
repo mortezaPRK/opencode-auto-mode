@@ -1,5 +1,5 @@
 import { Model } from "@opencode/schema/model";
-import type { PolicyOptions } from "./policy.js";
+import type { ReviewPolicy } from "./policy.js";
 import { logsUrl, type OtlpOptions } from "./otlp.js";
 
 export type ReviewerModel = string;
@@ -9,17 +9,21 @@ export type DecisionProvider = {
   minConfidence?: number;
   timeoutMs?: number;
 };
+
 export type DecisionStage = {
   type: "decision";
   model: string;
   endpoint?: string;
+  policy?: Partial<ReviewPolicy>;
 } & DecisionProvider;
+
 export type ClassifierStage =
   | { type: "static"; allowInProjectEdits?: boolean }
   | DecisionStage
-  | { type: "llm"; model?: ReviewerModel };
-export interface AutoModeOptions extends PolicyOptions {
-  classifier: { stages: ClassifierStage[] };
+  | { type: "llm"; model?: ReviewerModel; policy?: Partial<ReviewPolicy> };
+
+export interface AutoModeOptions {
+  classifiers: ClassifierStage[];
   keybinds?: { allow?: string; deny?: string };
   auditLog?: boolean | string;
   otlp?: boolean | OtlpOptions;
@@ -51,6 +55,11 @@ function model(value: unknown): value is ReviewerModel {
   try { parseReviewerModel(value); return true; } catch { return false; }
 }
 
+function policy(value: unknown): value is Partial<ReviewPolicy> {
+  return object(value) && only(value, ["trusted", "blocks", "exceptions"]) &&
+    Object.values(value).every((list) => Array.isArray(list) && list.length <= 256 && list.every(text));
+}
+
 function keybinds(value: unknown): value is AutoModeOptions["keybinds"] {
   return object(value) && only(value, ["allow", "deny"]) &&
     Object.values(value).every((keybind) => keybind === undefined || text(keybind));
@@ -79,7 +88,8 @@ function otlp(value: unknown): value is OtlpOptions {
 export const DECISION_PROVIDERS = ["typesafe-ai", "laya", "openai"] as const;
 
 function decision(value: Record<string, unknown>): value is DecisionStage {
-  if (!only(value, ["type", "model", "apiKeyEnv", "minConfidence", "timeoutMs", "endpoint"])) return false;
+  if (!only(value, ["type", "model", "apiKeyEnv", "minConfidence", "timeoutMs", "endpoint", "policy"])) return false;
+  if (value.policy !== undefined && !policy(value.policy)) return false;
   if (!model(value.model)) return false;
   const ref = parseReviewerModel(value.model);
   if (ref.variant !== undefined || !(DECISION_PROVIDERS as readonly string[]).includes(ref.providerID)) return false;
@@ -102,30 +112,22 @@ function stage(value: unknown): value is ClassifierStage {
   if (!object(value)) return false;
   if (value.type === "static") return only(value, ["type", "allowInProjectEdits"]) &&
     (value.allowInProjectEdits === undefined || typeof value.allowInProjectEdits === "boolean");
-  if (value.type === "llm") return only(value, ["type", "model"]) &&
-    (value.model === undefined || model(value.model));
+  if (value.type === "llm") return only(value, ["type", "model", "policy"]) &&
+    (value.model === undefined || model(value.model)) &&
+    (value.policy === undefined || policy(value.policy));
   return value.type === "decision" && decision(value);
 }
 
 export function parseOptions(value: unknown): AutoModeOptions {
   if (!object(value)) throw new Error("Invalid auto-mode options");
-  if (!only(value, ["classifier", "trusted", "blocks", "exceptions", "keybinds", "auditLog", "otlp"]))
+  if (!only(value, ["classifiers", "keybinds", "auditLog", "otlp"]))
     throw new Error("Unknown auto-mode option");
-  for (const key of ["trusted", "blocks", "exceptions"]) {
-    if (value[key] !== undefined && (!Array.isArray(value[key]) || value[key].length > 256 || !value[key].every(text)))
-      throw new Error(`Invalid ${key}`);
-  }
   if (value.keybinds !== undefined && !keybinds(value.keybinds)) throw new Error("Invalid keybinds");
   if (value.auditLog !== undefined && typeof value.auditLog !== "boolean" && !text(value.auditLog))
     throw new Error("Invalid audit log");
   if (value.otlp !== undefined && typeof value.otlp !== "boolean" && !otlp(value.otlp)) throw new Error("Invalid OTLP options");
-  if (!object(value.classifier) || !only(value.classifier, ["stages"]) ||
-      !Array.isArray(value.classifier.stages) || value.classifier.stages.length === 0 ||
-      value.classifier.stages.length > 16 || !value.classifier.stages.every(stage))
-    throw new Error("At least one review stage is required");
+  if (!Array.isArray(value.classifiers) || value.classifiers.length === 0 ||
+      value.classifiers.length > 16 || !value.classifiers.every(stage))
+    throw new Error("A valid nonempty classifiers array is required");
   return value as unknown as AutoModeOptions;
-}
-
-export function stagesFor(options: AutoModeOptions): ClassifierStage[] {
-  return options.classifier.stages;
 }
