@@ -19,9 +19,9 @@ needed:
     {
       "package": "@mortz.prk/opencode-auto-mode",
       "options": {
-        "classifier": {
-          "stages": [{ "type": "static" }]
-        }
+        "classifiers": [
+          { "type": "static" }
+        ]
       }
     }
   ]
@@ -38,17 +38,18 @@ There is no default review pipeline, and empty options are invalid. Add at least
 one review entry. Built-in checks deny dangerous shell commands, allow common
 read-only commands, and leave everything else as `ask`.
 
+The snippets below change parts of that configuration; keep your `classifiers`
+list when adding other options.
+
 ## Add a typed decision model
 
 ```jsonc
 {
   "options": {
-    "classifier": {
-      "stages": [
-        { "type": "static" },
-        { "type": "decision", "model": "typesafe-ai/jev-latest" }
-      ]
-    }
+    "classifiers": [
+      { "type": "static" },
+      { "type": "decision", "model": "typesafe-ai/jev-latest" }
+    ]
   }
 }
 ```
@@ -69,12 +70,10 @@ Add an `llm` entry after the built-in checks:
 ```jsonc
 {
   "options": {
-    "classifier": {
-      "stages": [
-        { "type": "static" },
-        { "type": "llm" }
-      ]
-    }
+    "classifiers": [
+      { "type": "static" },
+      { "type": "llm" }
+    ]
   }
 }
 ```
@@ -93,13 +92,11 @@ Entries run in order. Add as many as you need:
 ```jsonc
 {
   "options": {
-    "classifier": {
-      "stages": [
-        { "type": "static" },
-        { "type": "decision", "model": "typesafe-ai/jev-latest" },
-        { "type": "llm" }
-      ]
-    }
+    "classifiers": [
+      { "type": "static" },
+      { "type": "decision", "model": "typesafe-ai/jev-latest" },
+      { "type": "llm" }
+    ]
   }
 }
 ```
@@ -116,7 +113,9 @@ permissions and leave global permissions unchanged:
 {
   "agents": {
     "build": {
-      "permissions": [{ "action": "*", "resource": "*", "effect": "ask" }]
+      "permissions": [
+        { "action": "*", "resource": "*", "effect": "ask" }
+      ]
     }
   }
 }
@@ -140,28 +139,40 @@ commands. Override the defaults in plugin options:
 
 ## Review options
 
-These lists guide model review:
+Each LLM or typed decision reviewer can have its own policy:
 
 ```jsonc
 {
   "options": {
-    "trusted": ["the repository and its CI configuration"],
-    "blocks": ["publish packages", "change production infrastructure"],
-    "exceptions": ["run the repository's test and lint scripts"]
+    "classifiers": [
+      {
+        "type": "llm",
+        "policy": {
+          "trusted": ["the repository and its CI configuration"],
+          "blocks": ["publish packages", "change production infrastructure"],
+          "exceptions": ["run the repository's test and lint scripts"]
+        }
+      }
+    ]
   }
 }
 ```
 
 `trusted` describes the trusted boundary, `blocks` describes actions to deny, and
-`exceptions` describes narrow acceptable cases. They do not replace OpenCode
-permission rules.
+`exceptions` describes narrow acceptable cases. Omitted lists use the built-in
+policy; an empty list clears that list. Policies are independent between
+reviewers and do not apply to static checks or replace OpenCode permissions.
 
 ## Auditing
 
 Enable the audit log in plugin options:
 
 ```jsonc
-{ "options": { "auditLog": true } }
+{
+  "options": {
+    "auditLog": true
+  }
+}
 ```
 
 Decisions are appended as JSON lines to
@@ -176,7 +187,11 @@ To send decisions through OpenCode's OTLP telemetry, configure OTLP for OpenCode
 with its standard environment variables, then enable the plugin flag:
 
 ```jsonc
-{ "options": { "otlp": true } }
+{
+  "options": {
+    "otlp": true
+  }
+}
 ```
 
 ## Development
