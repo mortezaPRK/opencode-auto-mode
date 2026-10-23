@@ -52,7 +52,6 @@ OpenCode V2's default policy allows everything (`{ "action": "*", "resource": "*
 
 Notes:
 
-- Use the V2 shape. V1's `"permission": { "*": "ask" }` is not valid in V2 and can stop OpenCode from starting; V2 uses `permissions` with `action`, `resource` and `effect`. See the [OpenCode permissions docs](https://opencode.ai/v2/docs/permissions).
 - With option 2, saved **Always** approvals are durable `allow` rules, so those actions skip review under `"prompts"`. Review broad ones (for example `edit *` or `shell *`) and remove what you no longer want.
 - Configure a reviewer model that exists (`options.model`). If the model is unavailable, reviews fail and fall back to `ask`.
 
