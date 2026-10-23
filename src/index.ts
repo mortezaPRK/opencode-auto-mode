@@ -54,7 +54,7 @@ export default Plugin.define({
             return { decision: "ask", reason: "User authorization context is unavailable" };
           const policy = defaultPolicy(options);
           try {
-            return stage.type === "llm" ? await llmDecision(ctx, request, policy, stage.model) :
+            return stage.type === "llm" ? await llmDecision(ctx, request, policy, stage.model, info?.model) :
               await decisionStage(stage, request, policy);
           } catch {
             return { decision: "abstain", reason: `${stage.type} reviewer unavailable` };
@@ -104,8 +104,9 @@ interface ReviewerContext {
   generate: { text(input: { prompt: string; model?: ReviewerModelRef | null }): Promise<{ text: string }> };
 }
 
-async function llmDecision(ctx: ReviewerContext, request: PermissionRequest, policy: ReturnType<typeof defaultPolicy>, model?: string): Promise<StageResult> {
-  const ref = model ? parseReviewerModel(model) : null;
+async function llmDecision(ctx: ReviewerContext, request: PermissionRequest, policy: ReturnType<typeof defaultPolicy>, model?: string, sessionModel?: ReviewerModelRef): Promise<StageResult> {
+  const ref = model ? parseReviewerModel(model) : sessionModel;
+  if (!ref) return { decision: "abstain", reason: "Session model is unavailable; configure a reviewer model" };
   const prompt = buildStage1Prompt(request, policy);
   if (Buffer.byteLength(prompt) > 65_536) return { decision: "ask", reason: "Request too large for automatic review" };
   const triage = await withTimeout(ctx.generate.text({ prompt, model: ref }), 30_000);

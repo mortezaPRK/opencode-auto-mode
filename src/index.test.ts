@@ -16,7 +16,7 @@ async function setup(options: unknown = {}, messages: unknown[] = [{ type: "user
     options,
     permission: { hook: async (_: string, handler: typeof evaluate) => { evaluate = handler; return { dispose: async () => { disposed++; } }; } },
     tool: { hook: async () => ({ dispose: async () => { disposed++; } }) },
-    session: { get: async () => ({ location: { directory: "/repo" } }), context: async () => messages },
+    session: { get: async () => ({ location: { directory: "/repo" }, model: { providerID: "session-provider", id: "session-model", variant: "high" } }), context: async () => messages },
     generate: { text: async ({ prompt, model }: { prompt: string; model?: { id: string; providerID: string; variant?: string } | null }) => { prompts.push(prompt); models.push(model); return { text: answers.shift() ?? "ASK: unclear" }; } },
   };
   const cleanup = await plugin.setup(ctx as unknown as Parameters<typeof plugin.setup>[0]);
@@ -73,6 +73,14 @@ describe("OpenCode permission hook", () => {
     await host.evaluate(pending);
     assert.equal(pending.effect, "allow");
     assert.equal(calls, 2);
+    await host.cleanup();
+  });
+  it("uses the session model for both LLM calls when no reviewer model is set", async () => {
+    const host = await setup({ classifier: { stages: [{ type: "llm" }] } });
+    await host.evaluate(event());
+    assert.equal(host.models.length, 2);
+    const expected = { providerID: "session-provider", id: "session-model", variant: "high" };
+    assert.deepEqual(host.models, [expected, expected]);
     await host.cleanup();
   });
   it("passes a provider/model stage selection to generation", async () => {
