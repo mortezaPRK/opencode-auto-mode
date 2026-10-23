@@ -3,26 +3,11 @@
 Reviews OpenCode permission prompts automatically. OpenCode decides what needs
 approval; the plugin reviews only `ask` actions.
 
-## Install
+## Install and configure
 
-Add the plugin to `~/.config/opencode/opencode.jsonc`, then restart OpenCode:
-
-```jsonc
-{
-  "$schema": "https://opencode.ai/config.json",
-  "plugins": ["@mortz.prk/opencode-auto-mode"]
-}
-```
-
-```sh
-opencode service restart
-```
-
-## Quick start
-
-The easiest setup is to ask OpenCode for permission on every action, then give
-the plugin a review pipeline. This example uses built-in checks only and needs no
-model:
+Add this to `~/.config/opencode/opencode.jsonc`. It asks for permission on every
+action and reviews those requests using built-in checks. No model or API key is
+needed:
 
 ```jsonc
 {
@@ -41,6 +26,12 @@ model:
     }
   ]
 }
+```
+
+Restart OpenCode after saving:
+
+```sh
+opencode service restart
 ```
 
 There is no default review pipeline, and empty options are invalid. Add at least
