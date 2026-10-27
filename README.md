@@ -184,6 +184,10 @@ entry to open the panel.
 The GUI only reads state. Every permission decision still comes from the server
 part, so disabling the GUI never disables automatic review.
 
+The GUI is loaded from the desktop app's own background server and reads that
+server's auto-mode state. If you connect the app to another server, that server's
+reviews do not appear in the panel.
+
 The desktop app reads plugins only from the **global** `opencode.json(c)`. If
 your TUI configuration lives in `cli.json`, add the package to the global file as
 well:
@@ -251,17 +255,23 @@ of each tool input). Nothing else about the session is sent.
 * A model reviewer receives that material through OpenCode's own session model or
   the `model` you configure.
 * A typed decision reviewer receives it at the configured provider endpoint.
-* Audit records keep the action, up to 16 resources, a short reason, and, on
-  failure, a short error detail. Audit and OTLP log records share one sanitizer,
-  which bounds the free-form fields — 128 characters for the action and agent, 64
-  for the stage, 512 for each resource, reason, and error detail — but does
-  **not** redact text.
-* Action, resource, reason, and error-detail fields are copied from the review.
-  They can contain secrets or inline file contents, for example a shell command
-  with an `Authorization` header or a heredoc payload. Audit JSONL and OTLP logs
-  keep that text, so enable `auditLog` or `otlp` only if you are comfortable
-  storing or exporting it. OTLP review traces are built separately and carry the
-  action, decision, stage, and each reviewer attempt's model and outcome.
+* Audit records and OTLP log records keep the action, agent, up to 16 resources,
+  a short reason, and, on failure, a short error detail. Both pass the record
+  through one sanitizer, which bounds these fields — 128 characters for the
+  action and agent, 64 for the stage, 512 for each resource, reason, and error
+  detail — but does **not** redact text.
+* OTLP exports logs and traces as separate streams (`/v1/logs` and `/v1/traces`).
+  Trace root attributes use the same sanitizer, so their action, agent, and stage
+  are bounded like the log fields. Each reviewer attempt adds a child span with
+  its model and outcome; the `model` attribute is not clipped. Traces do not
+  include resources, reasons, or error-detail text.
+* Text in every stream is unredacted, including the action and agent. Traces
+  carry the action and agent; logs carry those plus resources, reasons, and
+  error details. These fields may be sensitive, and resources or reasons can
+  contain inline file contents or shell commands, including credentials such as
+  an `Authorization` header. Audit JSONL keeps the same unredacted fields as OTLP
+  logs. Enable `auditLog` or `otlp` only if you are comfortable storing or
+  exporting that material.
 * Records do not include the reviewer prompt, the session transcript, or API keys
   configured for providers.
 
