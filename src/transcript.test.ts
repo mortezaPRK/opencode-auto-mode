@@ -40,13 +40,22 @@ describe("review context completeness", () => {
     }
     const empty = extractReviewContext([{ type: "user", text: "" }]);
     assert.equal(empty.complete, false);
-    assert.match(empty.reason!, /no text/);
+    assert.match(empty.reason!, /No user authorization message/);
     assert.match(extractReviewContext([]).reason!, /No user authorization message/);
   });
-  it("requires approval when a later user message has no text", () => {
+  it("ignores empty user turns instead of failing the whole session", () => {
     const context = extractReviewContext([{ type: "user", text: "Make the changes" }, { type: "user", text: "" }]);
+    assert.equal(context.complete, true);
+    assert.match(context.transcript, /Make the changes/);
+    assert.equal(extractReviewContext([{ type: "user", text: "" }, { type: "user", text: " " }]).complete, false);
+  });
+  it("treats model-facing skill messages as unreviewable evidence", () => {
+    const context = extractReviewContext([
+      { type: "user", text: "Follow the release skill" },
+      { type: "skill", skill: "release", name: "Release", text: "Publish to production" },
+    ]);
     assert.equal(context.complete, false);
-    assert.match(context.reason!, /no text/);
+    assert.match(context.reason!, /attachments/);
   });
   it("accepts text-only messages and empty attachment lists", () => {
     assert.equal(extractReviewContext([{ type: "user", text: "Create a", files: [], skills: [], agents: [] }]).complete, true);
@@ -66,6 +75,17 @@ describe("review context completeness", () => {
     const capped = extractReviewContext([{ type: "user", text: "go" }, ...manyTools]);
     assert.equal(capped.complete, true);
     assert.match(capped.transcript, /partial session history/);
+  });
+  it("keeps the tail of a long tool input so written payloads stay reviewable", () => {
+    const context = extractReviewContext([
+      { type: "user", text: "write the file" },
+      { type: "assistant", content: [{ type: "tool", name: "write", state: {
+        input: { content: `${"a".repeat(900)}TAIL_CONSTRAINT` },
+      } }] },
+    ]);
+    assert.equal(context.complete, true);
+    assert.match(context.transcript, /TAIL_CONSTRAINT/);
+    assert.match(context.transcript, /some tool details truncated/);
   });
   it("keeps the latest user restriction when tool history exceeds the budget", () => {
     const context = extractReviewContext([
