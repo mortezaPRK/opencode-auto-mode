@@ -1,4 +1,4 @@
-import { basename } from "node:path";
+import { basename, posix } from "node:path";
 import { parse } from "shell-quote";
 
 /**
@@ -60,8 +60,18 @@ export function resolveExecutable(words: readonly string[]): { name: string; ind
   return index < words.length ? { name: basename(words[index]), index } : undefined;
 }
 
+/**
+ * True when an argument names one of the given long options, including the
+ * abbreviations GNU option parsing accepts (`sort --out=/tmp/out` means
+ * `--output`). Abbreviations fail closed: any prefix that could name a dangerous
+ * option requires review rather than approval.
+ */
 function hasLongOption(args: readonly string[], names: readonly string[]): boolean {
-  return args.some((arg) => names.some((name) => arg === name || arg.startsWith(`${name}=`)));
+  return args.some((arg) => {
+    const option = arg.split("=", 1)[0];
+    if (!option.startsWith("--") || option.length === 2) return false;
+    return names.some((name) => name.startsWith(option));
+  });
 }
 
 function hasShortOption(args: readonly string[], letters: string): boolean {
@@ -72,6 +82,30 @@ function hasShortOption(args: readonly string[], letters: string): boolean {
 function isWorldWritableMode(arg: string): boolean {
   const mode = arg.replace(/^[-+]+/, "");
   return mode === "777" || mode === "0777";
+}
+
+/** chmod options, including the BSD flags, that never consume the mode operand. */
+const CHMOD_FLAGS = /^-[RcfvHhLP]+$/;
+
+/** The mode operand chmod applies, ignoring options and earlier operands. */
+function chmodMode(args: readonly string[]): string | undefined {
+  let end = false;
+  for (const arg of args) {
+    if (end) return arg;
+    if (arg === "--") { end = true; continue; }
+    // `--reference` copies a mode from another file, so there is no mode operand.
+    if (arg === "--reference" || arg.startsWith("--reference=")) return undefined;
+    if (arg.startsWith("--") || CHMOD_FLAGS.test(arg)) continue;
+    return arg;
+  }
+  return undefined;
+}
+
+/** True when a path names the filesystem root rather than a directory below it. */
+function isFilesystemRoot(target: string): boolean {
+  if (!target.startsWith("/")) return false;
+  const trimmed = target.replace(/\/+$/, "").replace(/\/\*+$/, "");
+  return trimmed === "" || posix.normalize(trimmed) === "/";
 }
 
 /** True when `rm` is invoked recursively and forcibly against the filesystem root. */
@@ -94,10 +128,7 @@ function isRootWipe(args: readonly string[]): boolean {
     targets.push(arg);
   }
   if (!recursive || !force || targets.length === 0) return false;
-  return targets.every((target) => {
-    const trimmed = target.replace(/[/]+$/, "").replace(/\/\*+$/, "");
-    return trimmed === "" || trimmed === "/";
-  });
+  return targets.some(isFilesystemRoot);
 }
 
 /** The script a shell or `eval` would run, when invoked non-interactively. */
@@ -132,11 +163,14 @@ function invocations(command: string): string[][] {
         skipNext = false;
         continue;
       }
-      if (CONTROL_OPERATORS.has(token.op) || REDIRECT_OPERATORS.has(token.op)) {
+      if (CONTROL_OPERATORS.has(token.op)) {
         if (words.length) result.push(words);
         words = [];
-        skipNext = REDIRECT_OPERATORS.has(token.op);
+        skipNext = false;
+        continue;
       }
+      // A redirection does not end a simple command; only its target is dropped.
+      if (REDIRECT_OPERATORS.has(token.op)) skipNext = true;
     }
   }
   if (words.length) result.push(words);
@@ -163,7 +197,7 @@ export function denyInvocation(words: readonly string[], depth = 0): string | un
   const args = words.slice(executable.index + 1);
   if (executable.name.startsWith("mkfs")) return DANGEROUS;
   if (DENY_EXECUTABLES.has(executable.name)) return DANGEROUS;
-  if (executable.name === "chmod" && args.some(isWorldWritableMode)) return DANGEROUS;
+  if (executable.name === "chmod" && isWorldWritableMode(chmodMode(args) ?? "")) return DANGEROUS;
   if (executable.name === "rm" && isRootWipe(args)) return DANGEROUS;
   if (executable.name === "dd" && args.some((arg) => /^of=\/(?:dev|sd|nvme|hd)/.test(arg))) return DANGEROUS;
   if (SHELLS.has(executable.name) || executable.name === "eval") {
@@ -171,6 +205,18 @@ export function denyInvocation(words: readonly string[], depth = 0): string | un
     if (script !== undefined) return denyScript(script, depth + 1);
   }
   return undefined;
+}
+
+/** Counts operands, honouring `--` and keeping a lone `-` as an operand. */
+function operandCount(args: readonly string[]): number {
+  let count = 0;
+  let endOfOptions = false;
+  for (const arg of args) {
+    if (endOfOptions) count++;
+    else if (arg === "--") endOfOptions = true;
+    else if (arg === "-" || !arg.startsWith("-")) count++;
+  }
+  return count;
 }
 
 const POLICIES: Record<string, (args: readonly string[]) => boolean> = {
@@ -182,8 +228,8 @@ const POLICIES: Record<string, (args: readonly string[]) => boolean> = {
   tree: (args) => !hasLongOption(args, ["--output"]) && !hasShortOption(args, "o"),
   file: (args) => !hasLongOption(args, ["--compile"]) && !hasShortOption(args, "C"),
   bat: (args) => !hasLongOption(args, ["--pager", "--config-file", "--config-dir"]),
-  // `uniq INPUT OUTPUT` writes OUTPUT; only a single positional argument is read-only.
-  uniq: (args) => args.filter((arg) => !arg.startsWith("-")).length <= 1,
+  // `uniq INPUT OUTPUT` writes OUTPUT; only a single operand is read-only.
+  uniq: (args) => operandCount(args) <= 1,
   // A bare argument sets the host name.
   hostname: (args) => args.every((arg) => arg.startsWith("-")) &&
     !hasLongOption(args, ["--file", "--boot"]) && !hasShortOption(args, "F"),
@@ -233,8 +279,8 @@ function isReadOnlyGh(args: readonly string[]): boolean {
 export function isReadOnlyInvocation(words: readonly string[]): boolean {
   const command = basename(words[0] ?? "");
   const args = words.slice(1);
-  const policy = POLICIES[command];
-  if (policy !== undefined) return policy(args);
+  // Own properties only: `./constructor` must not resolve to `Object`.
+  if (Object.hasOwn(POLICIES, command)) return POLICIES[command](args);
   if (READ_ONLY.has(command)) return true;
   if (command === "git") return isReadOnlyGit(args);
   if (command === "find") return !args.some((arg) => /^-(?:fprint|fprint0|fprintf|fls)$/.test(arg));

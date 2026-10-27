@@ -100,16 +100,13 @@ function analyzeSegment(segment: Segment): Verdict {
   return { decision: "review" };
 }
 
-function analyzeLine(command: string): Verdict {
-  if (!command.trim()) return { decision: "allow" };
-  if (!BALANCED_QUOTES.test(command)) return { decision: "ask" };
-  if (FORK_BOMB.test(command)) return { decision: "deny", reason: "dangerous shell operation" };
+/** Token shapes this module consumes; `parse` returns a wider union. */
+type Token = string | { comment: string } | { op: string; pattern?: string };
 
-  let tokens;
-  try { tokens = parse(command); }
-  catch { return { decision: "ask" }; }
-  if (DYNAMIC_SYNTAX.test(command)) return { decision: "ask" };
+interface ParsedLine { segments: Segment[]; complete: boolean }
 
+/** Splits parsed tokens into simple commands, tracking whether the whole line parsed. */
+function lineSegments(tokens: readonly Token[]): ParsedLine {
   const segments: Segment[] = [{ words: [], write: false }];
   let current = segments[0];
   let redirect: { write: boolean } | undefined;
@@ -124,8 +121,17 @@ function analyzeLine(command: string): Verdict {
       continue;
     }
     if ("comment" in token) continue;
-    if (token.op === "glob") { current.words.push(token.pattern); continue; }
+    if (token.op === "glob" && token.pattern !== undefined) {
+      if (redirect) {
+        // A glob is still a redirection target, so it never becomes a command word.
+        if (redirect.write) current.write = true;
+        redirect = undefined;
+      } else current.words.push(token.pattern);
+      continue;
+    }
     if (CONTROL_OPERATORS.has(token.op)) {
+      // A control operator before the redirection target is invalid syntax.
+      if (redirect) return { segments, complete: false };
       current = { words: [], write: false };
       segments.push(current);
       continue;
@@ -135,9 +141,28 @@ function analyzeLine(command: string): Verdict {
       redirect = { write: WRITE_OPERATORS.has(token.op) };
       continue;
     }
-    return { decision: "ask" };
+    return { segments, complete: false };
   }
-  if (redirect) return { decision: "ask" };
+  return { segments, complete: redirect === undefined };
+}
+
+function analyzeLine(command: string): Verdict {
+  if (!command.trim()) return { decision: "allow" };
+  if (!BALANCED_QUOTES.test(command)) return { decision: "ask" };
+  if (FORK_BOMB.test(command)) return { decision: "deny", reason: "dangerous shell operation" };
+
+  let tokens;
+  try { tokens = parse(command); }
+  catch { return { decision: "ask" }; }
+
+  const { segments, complete } = lineSegments(tokens);
+  // Deny rules that are already visible must win even when later arguments are
+  // dynamic (`sudo id $(...)`) and even when the line only parses partially.
+  for (const segment of segments) {
+    const blocked = denyInvocation(segment.words);
+    if (blocked !== undefined) return { decision: "deny", reason: blocked };
+  }
+  if (!complete || DYNAMIC_SYNTAX.test(command)) return { decision: "ask" };
 
   let ask = false;
   let review = false;

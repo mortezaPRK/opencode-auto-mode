@@ -163,3 +163,62 @@ describe("shell approval guard", () => {
     assert.equal(reviewed.decision, "allow");
   });
 });
+
+describe("shell policy edge cases", () => {
+  it("reviews abbreviated long options that can write or execute", () => {
+    for (const command of ["sort --out=/tmp/out file", "sort --out /tmp/out file", "tree --out=/tmp/out",
+      "date --se=2030-01-01"])
+      assert.equal(guardShell([command]), undefined, command);
+    assert.equal(guardShell(["sort --output=/tmp/out file"]), undefined);
+    assert.equal(guardShell(["sort -u file"])?.decision, "allow");
+  });
+
+  it("counts every uniq operand after a lone dash or --", () => {
+    for (const command of ["uniq - /tmp/out", "uniq -- input.txt -output.txt", "uniq -- -c -d"])
+      assert.equal(guardShell([command]), undefined, command);
+    for (const command of ["uniq -c file", "uniq -- file", "uniq -"])
+      assert.equal(guardShell([command])?.decision, "allow", command);
+  });
+
+  it("ignores inherited properties when looking up a command policy", async () => {
+    for (const command of ["./constructor", "./__proto__", "./toString", "constructor"]) {
+      assert.equal(guardShell([command]), undefined, command);
+      const result = await compositeDecision([{ type: "static" }], { action: "shell", resources: [command] }, unused);
+      assert.equal(result.decision, "ask", command);
+    }
+  });
+
+  it("denies rm when any target is the filesystem root", () => {
+    for (const command of ["rm -rf / /tmp/scratch --no-preserve-root", "rm -rf /tmp/scratch /",
+      "rm -rf /* /tmp/scratch", "rm -rf /. /tmp"])
+      assert.equal(guardShell([command])?.decision, "deny", command);
+    for (const command of ["rm -rf /tmp/scratch", "rm -rf ./build", "rm -rf /tmp/*"])
+      assert.notEqual(guardShell([command])?.decision, "deny", command);
+  });
+
+  it("denies chmod only when the mode operand is world-writable", () => {
+    for (const command of ["chmod 777 secret", "chmod -R 777 dir", "chmod --changes 0777 file"])
+      assert.equal(guardShell([command])?.decision, "deny", command);
+    for (const command of ["chmod 600 777", "chmod u+w 777", "chmod --reference=secret 777"])
+      assert.notEqual(guardShell([command])?.decision, "deny", command);
+  });
+
+  it("keeps a redirection inside the simple command it belongs to", () => {
+    assert.equal(guardShell(["bash -c 'rm >/dev/null -rf /'"])?.decision, "deny");
+    assert.equal(guardShell(["sh -c 'sudo id > /tmp/log'"])?.decision, "deny");
+    assert.equal(guardShell(["sh -c 'echo hi > /tmp/log; rm -rf /'"])?.decision, "deny");
+    assert.equal(guardShell(["bash -c 'echo >/dev/null sudo'"])?.decision, "ask");
+  });
+
+  it("denies identifiable commands before asking about dynamic arguments", () => {
+    assert.equal(guardShell(["sudo id $(printf ignored)"])?.decision, "deny");
+    assert.equal(guardShell(["sudo shutdown `date`"])?.decision, "deny");
+    assert.equal(guardShell(["pwd $(sudo id)"])?.decision, "ask");
+    assert.equal(guardShell(["echo $(sudo id)"])?.decision, "ask");
+  });
+
+  it("treats a glob redirection target as a write", () => {
+    for (const command of ["pwd > *.txt", "pwd > *.txt file"])
+      assert.equal(guardShell([command]), undefined, command);
+  });
+});
