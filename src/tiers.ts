@@ -5,7 +5,9 @@ export type Tier = "auto-allow" | "auto-deny" | "review" | "unknown";
 export interface Classification { tier: Tier; reason: string }
 export interface ClassifyOptions { projectDir?: string; allowInProjectEdits?: boolean }
 
-const READ_ONLY_COMMANDS = new Set(["pwd", "whoami", "hostname", "uname", "id", "groups", "ls", "ls -a", "ls -l", "ls -la", "ls -al", "ls -A"]);
+const READ_ONLY_COMMANDS = new Set(["pwd", "whoami", "hostname", "uname", "id", "groups", "ls", "ls -a", "ls -l", "ls -la", "ls -al", "ls -A",
+  "git status", "git status --short", "git diff", "git log", "git show", "git branch --show-current",
+  "date", "date +%s", "cat", "head", "tail", "rg", "grep", "wc", "bun test", "bun run lint", "bun run typecheck"]);
 const BLOCKED_SHELL = [
   /\brm\s+-rf?\s+\/(\s|$|\*)/,
   /\bsudo\b/,

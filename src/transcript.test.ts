@@ -40,6 +40,39 @@ describe("review context completeness", () => {
   it("accepts text-only messages and empty attachment lists", () => {
     assert.equal(extractReviewContext([{ type: "user", text: "Create a", files: [], skills: [], agents: [] }]).complete, true);
   });
+  it("does not treat tool truncation as missing user evidence", () => {
+    const longTool = {
+      type: "assistant",
+      content: [{ type: "tool", name: "write", state: { input: { content: "x".repeat(501) } } }],
+    };
+    const context = extractReviewContext([{ type: "user", text: "please make the change" }, longTool]);
+    assert.equal(context.complete, true);
+    assert.match(context.transcript, /some tool details truncated/);
+    const manyTools = Array.from({ length: 21 }, () => ({
+      type: "assistant",
+      content: [{ type: "tool", name: "shell", state: { input: "pwd" } }],
+    }));
+    const capped = extractReviewContext([{ type: "user", text: "go" }, ...manyTools]);
+    assert.equal(capped.complete, true);
+    assert.match(capped.transcript, /incomplete session context/);
+  });
+  it("keeps the latest user restriction when tool history exceeds the transcript budget", () => {
+    const context = extractReviewContext([
+      { type: "user", text: "Please make the changes" },
+      ...Array.from({ length: 12 }, () => ({
+        type: "assistant",
+        content: [{ type: "tool", name: "write", state: { input: "x".repeat(500) } }],
+      })),
+      { type: "user", text: "DO NOT PUBLISH" },
+    ]);
+    assert.equal(context.complete, true);
+    assert.match(context.transcript, /DO NOT PUBLISH/);
+    assert.ok(context.transcript.length <= 6000);
+  });
+  it("still requires untruncated user evidence", () => {
+    assert.equal(extractReviewContext([{ type: "user", text: "x".repeat(501) }]).complete, false);
+    assert.equal(extractReviewContext(Array.from({ length: 11 }, (_, index) => ({ type: "user", text: `message ${index}` }))).complete, false);
+  });
 });
 
 describe("extractTranscript", () => {
