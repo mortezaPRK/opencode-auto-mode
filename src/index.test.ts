@@ -747,19 +747,27 @@ describe("OpenCode permission hook", () => {
       await host.evaluate(pending); assert.equal(pending.effect, "deny");
     }
     await host.cleanup();
-    host.ctx.tool.hook = async () => { throw new Error("setup failed"); };
+    host.ctx.tool.hook = () => { throw new Error("setup failed"); };
     await assert.rejects(Promise.resolve(plugin.setup(host.ctx as unknown as Parameters<typeof plugin.setup>[0])), /setup failed/);
     // The failed attempt registered the RPC and followed events before the tool
-    // hook failed; disposing the permission hook must not leave either behind.
+    // hook threw; disposing the permission hook must not leave either behind.
     assert.equal(host.disposed(), 5);
     assert.equal(host.subscriptions[1]?.aborted, true);
   });
-  it("disposes the RPC and event stream when the permission hook fails", async () => {
+  it("disposes the RPC and event stream when the permission hook throws", async () => {
     const host = await setup({ classifiers: [{ type: "static" }] });
     await host.cleanup();
-    host.ctx.permission.hook = async () => { throw new Error("permission setup failed"); };
+    host.ctx.permission.hook = () => { throw new Error("permission setup failed"); };
     await assert.rejects(Promise.resolve(plugin.setup(host.ctx as unknown as Parameters<typeof plugin.setup>[0])), /permission setup failed/);
     assert.equal(host.disposed(), 4);
+    assert.equal(host.subscriptions[1]?.aborted, true);
+  });
+  it("disposes partial setup when a hook registration rejects", async () => {
+    const host = await setup({ classifiers: [{ type: "static" }] });
+    await host.cleanup();
+    host.ctx.tool.hook = async () => { throw new Error("tool setup failed"); };
+    await assert.rejects(Promise.resolve(plugin.setup(host.ctx as unknown as Parameters<typeof plugin.setup>[0])), /tool setup failed/);
+    assert.equal(host.disposed(), 5);
     assert.equal(host.subscriptions[1]?.aborted, true);
   });
 });

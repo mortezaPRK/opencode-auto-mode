@@ -1,7 +1,13 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { createStatusGuard, createStatusLoader, pillLabel } from "./gui-state.js";
+import { createStatusGuard, createStatusLoader, pillLabel, statusTarget, type StatusTarget } from "./gui-state.js";
 import type { AutoModeDecision, AutoModeStatus } from "./rpc.js";
+
+const OWN = "sidecar";
+
+function target(sessionID: string, server = OWN, ownServer = server === OWN): StatusTarget {
+  return { key: `${server}\n${sessionID}`, sessionID, ownServer };
+}
 
 function decision(name: string, overrides: Partial<AutoModeDecision> = {}): AutoModeDecision {
   return {
@@ -66,8 +72,8 @@ describe("status loader", () => {
       return request.promise;
     }, (next) => applied.push(next));
 
-    const first = refresh("a");
-    const second = refresh("b");
+    const first = refresh(target("a"));
+    const second = refresh(target("b"));
     requests.get("b")!.resolve(status({ recent: [decision("deny")] }));
     await second;
     // The abandoned request settles last and must not overwrite B.
@@ -75,6 +81,38 @@ describe("status loader", () => {
     await first;
 
     assert.deepEqual(shown(applied), ["cleared", "cleared", "deny"]);
+  });
+  it("keys the same session id on two servers apart", async () => {
+    const requests: Deferred<AutoModeStatus | undefined>[] = [];
+    const applied: (AutoModeStatus | undefined)[] = [];
+    const refresh = createStatusLoader(() => {
+      const request = deferred<AutoModeStatus | undefined>();
+      requests.push(request);
+      return request.promise;
+    }, (next) => applied.push(next));
+
+    const first = refresh(target("shared", "server-a", true));
+    const second = refresh(target("shared", "server-b", true));
+    requests[1]!.resolve(status({ recent: [decision("deny")] }));
+    await second;
+    requests[0]!.resolve(status({ recent: [decision("allow")] }));
+    await first;
+
+    assert.deepEqual(shown(applied), ["cleared", "cleared", "deny"]);
+  });
+  it("does not read this server's status for a session on another server", async () => {
+    const calls: string[] = [];
+    const applied: (AutoModeStatus | undefined)[] = [];
+    const refresh = createStatusLoader(async (sessionID) => {
+      calls.push(sessionID);
+      return status({ recent: [decision("allow")] });
+    }, (next) => applied.push(next));
+
+    await refresh(target("a"));
+    await refresh(target("a", "https://other"));
+
+    assert.deepEqual(calls, ["a"]);
+    assert.deepEqual(shown(applied), ["cleared", "allow", "cleared"]);
   });
   it("drops an older poll that settles after a newer one", async () => {
     const requests: Deferred<AutoModeStatus | undefined>[] = [];
@@ -85,8 +123,8 @@ describe("status loader", () => {
       return request.promise;
     }, (next) => applied.push(next));
 
-    const first = refresh("a");
-    const second = refresh("a");
+    const first = refresh(target("a"));
+    const second = refresh(target("a"));
     requests[1]!.resolve(status({ recent: [decision("deny")] }));
     await second;
     requests[0]!.resolve(status({ recent: [decision("allow")] }));
@@ -103,10 +141,10 @@ describe("status loader", () => {
       return request.promise;
     }, (next) => applied.push(next));
 
-    const first = refresh("a");
+    const first = refresh(target("a"));
     requests[0]!.resolve(status({ recent: [decision("allow")] }));
     await first;
-    const second = refresh("b");
+    const second = refresh(target("b"));
     assert.equal(applied.at(-1), undefined);
     requests[1]!.reject(new Error("server restarting"));
     await second;
@@ -122,10 +160,10 @@ describe("status loader", () => {
       return request.promise;
     }, (next) => applied.push(next));
 
-    const first = refresh("a");
+    const first = refresh(target("a"));
     requests[0]!.resolve(status({ recent: [decision("allow")] }));
     await first;
-    const second = refresh("a");
+    const second = refresh(target("a"));
     requests[1]!.reject(new Error("server restarting"));
     await second;
 
@@ -135,10 +173,24 @@ describe("status loader", () => {
     const applied: (AutoModeStatus | undefined)[] = [];
     const refresh = createStatusLoader(async () => status({ recent: [decision("allow")] }), (next) => applied.push(next));
 
-    await refresh("a");
+    await refresh(target("a"));
     await refresh(undefined);
 
     assert.deepEqual(shown(applied), ["cleared", "allow", "cleared"]);
+  });
+});
+
+describe("status target", () => {
+  it("keys the selection by server and session, not by session id", () => {
+    assert.deepEqual(
+      statusTarget({ key: "sidecar\nshared", id: "shared", server: { builtin: true } }),
+      { key: "sidecar\nshared", sessionID: "shared", ownServer: true },
+    );
+    assert.deepEqual(
+      statusTarget({ key: "https://other\nshared", id: "shared", server: { builtin: false } }),
+      { key: "https://other\nshared", sessionID: "shared", ownServer: false },
+    );
+    assert.equal(statusTarget(undefined), undefined);
   });
 });
 

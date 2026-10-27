@@ -1,8 +1,8 @@
 /** @jsxImportSource solid-js */
-import { createSignal, For } from "solid-js";
+import { createSignal, For, onCleanup } from "solid-js";
 import { Command, ComposerPill, Panel, Plugin, createKeyed, type PanelTab } from "@opencode/plugin/gui";
 import { AutoMode, type AutoModeStatus } from "./rpc.js";
-import { createStatusLoader, latest, pillLabel } from "./gui-state.js";
+import { createStatusLoader, latest, pillLabel, statusTarget } from "./gui-state.js";
 
 const POLL_MS = 3_000;
 const NOTICE_MS = 30_000;
@@ -30,11 +30,15 @@ export default Plugin.define({
       (sessionID) => ctx.client.rpc(AutoMode).status({ sessionID }) as Promise<AutoModeStatus | undefined>,
       setStatus,
     );
+    // `ctx.client` reads the app's own server, so a session on another server
+    // has no status here; `session.key` keeps the same session id on two
+    // servers apart.
+    const target = () => statusTarget(ctx.sessions.current());
+    const poll = () => { void refresh(target()); };
 
-    createKeyed(() => ctx.sessions.current()?.id, (sessionID) => { void refresh(sessionID); }, {
-      otherwise: () => { void refresh(undefined); },
-    });
-    const timer = setInterval(() => { void refresh(ctx.sessions.current()?.id); }, POLL_MS);
+    createKeyed(() => target()?.key, poll, { otherwise: poll });
+    const timer = setInterval(poll, POLL_MS);
+    onCleanup(() => clearInterval(timer));
 
     const tab: PanelTab = {
       id: "decisions",
@@ -112,7 +116,5 @@ export default Plugin.define({
         };
       },
     });
-
-    return () => clearInterval(timer);
   },
 });
