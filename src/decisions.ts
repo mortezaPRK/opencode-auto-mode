@@ -12,6 +12,7 @@ import { AIError, InvalidProviderOutputError, ModelID } from "@opencode/ai";
 import { localEndpoint, parseReviewerModel, type DecisionStage } from "./config.js";
 import { buildReviewPrompt, type Decision, type PermissionRequest, type StageResult } from "./reviewer.js";
 import type { ReviewPolicy } from "./policy.js";
+import { errorKindOf } from "./errors.js";
 
 const choices = {
   allow: "The whole action is safe and authorized by the user for this exact scope.",
@@ -28,7 +29,13 @@ const API_KEY_ENV = {
   openai: "OPENAI_API_KEY",
 } as const;
 
-type RuntimeDecisionStage = DecisionStage & { readonly apiKey?: string };
+type RuntimeDecisionStage = DecisionStage & { readonly apiKey?: string; readonly signal?: AbortSignal };
+
+/** Per-request abort signal: the stage timeout bound by the overall review deadline. */
+function abortSignal(stage: RuntimeDecisionStage): AbortSignal {
+  const timeout = AbortSignal.timeout(stage.timeoutMs ?? 10_000);
+  return stage.signal === undefined ? timeout : AbortSignal.any([timeout, stage.signal]);
+}
 
 function probability(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1;
@@ -107,7 +114,7 @@ function systemOneRoute(stage: RuntimeDecisionStage, modelID: string, url: strin
         const payload = JSON.stringify({ model: modelID, state: request.state, questions: request.questions });
         if (Buffer.byteLength(payload) > MAX_BYTES) throw new Error("Decision request too large");
         const response = await fetcher(url, {
-          method: "POST", redirect: "error", signal: AbortSignal.timeout(stage.timeoutMs ?? 10_000),
+          method: "POST", redirect: "error", signal: abortSignal(stage),
           headers: { "Content-Type": "application/json", ...(stage.apiKey === undefined ? {} : { Authorization: `Bearer ${stage.apiKey}` }) },
           body: payload,
         });
@@ -172,7 +179,7 @@ async function openAIDecision(
   const payload = JSON.stringify(body);
   if (Buffer.byteLength(payload) > MAX_BYTES) throw new Error("Decision request too large");
   const response = await fetcher(OPENAI_URL, {
-    method: "POST", redirect: "error", signal: AbortSignal.timeout(stage.timeoutMs ?? 10_000),
+    method: "POST", redirect: "error", signal: abortSignal(stage),
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${stage.apiKey}` },
     body: payload,
   });
@@ -197,6 +204,7 @@ export async function decisionStage(
   request: PermissionRequest,
   policy: ReviewPolicy,
   fetcher: typeof fetch = fetch,
+  signal?: AbortSignal,
 ): Promise<StageResult> {
   try {
     const ref = parseReviewerModel(input.model);
@@ -204,10 +212,15 @@ export async function decisionStage(
     const stage: RuntimeDecisionStage = {
       ...input,
       apiKey: process.env[input.apiKeyEnv ?? API_KEY_ENV[ref.providerID as keyof typeof API_KEY_ENV]],
+      signal,
     };
     return ref.providerID === "openai" ? await openAIDecision(stage, request, policy, fetcher) :
       await systemOneDecision(stage, request, policy, fetcher);
-  } catch {
-    return { decision: "abstain", reason: `${input.model} unavailable or returned an invalid decision` };
+  } catch (error) {
+    return {
+      decision: "abstain",
+      reason: `${input.model} unavailable or returned an invalid decision`,
+      errorKind: errorKindOf(error),
+    };
   }
 }

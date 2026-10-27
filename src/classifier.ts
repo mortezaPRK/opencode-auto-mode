@@ -2,6 +2,7 @@ import { classify } from "./tiers.js";
 import type { ClassifierStage } from "./config.js";
 import type { PermissionRequest, ReviewResult, StageResult } from "./reviewer.js";
 import { guardShell } from "./shell.js";
+import type { ReviewErrorKind } from "./errors.js";
 
 export async function compositeDecision(
   stages: ClassifierStage[],
@@ -22,6 +23,7 @@ export async function compositeDecision(
       return { ...shellResult, stage: shellResult.decision === "allow" ? "static" : "shell-guard" };
   }
   let abstained: string | undefined;
+  let abstainedKind: ReviewErrorKind | undefined;
   for (const stage of stages) {
     if (stage.type === "static") {
       const result = classify(request.action, request.resources, {
@@ -30,7 +32,11 @@ export async function compositeDecision(
       if (result.tier === "auto-allow") return { decision: "allow", reason: result.reason, stage: "static" };
     } else {
       const result = await review(stage);
-      if (result.decision === "abstain") { abstained = result.reason; continue; }
+      if (result.decision === "abstain") {
+        abstained = result.reason;
+        abstainedKind ??= result.errorKind;
+        continue;
+      }
       return { decision: result.decision, reason: result.reason, stage: result.stage ?? stage.type };
     }
   }
@@ -38,5 +44,6 @@ export async function compositeDecision(
     decision: "ask",
     reason: abstained ? `No classifier made a decision (${abstained})` : "No classifier made a decision",
     stage: "none",
+    ...(abstainedKind === undefined ? {} : { errorKind: abstainedKind }),
   };
 }

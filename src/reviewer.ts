@@ -1,4 +1,5 @@
 import type { ReviewPolicy } from "./policy.js";
+import type { ReviewErrorKind } from "./errors.js";
 
 interface PermissionRequest {
   action: string;
@@ -18,12 +19,14 @@ export interface StageResult {
   decision: StageDecision;
   reason: string;
   stage?: string;
+  errorKind?: ReviewErrorKind;
 }
 
 export interface ReviewResult {
   decision: Decision;
   reason: string;
   stage?: string;
+  errorKind?: ReviewErrorKind;
 }
 
 export const DENY_SUFFIX = "Find a safer path and do not try to route around this block.";
@@ -98,6 +101,8 @@ export function parseStage1(text: string): "block" | "allow" {
   return /^ALLOW$/i.test(text.trim()) ? "allow" : "block";
 }
 
+export const UNCLEAR_RESPONSE = "Reviewer response unclear";
+
 export function parseDecision(text: string): ReviewResult {
   const trimmed = text.trim();
   const match = trimmed.match(/^(ALLOW|DENY|ASK):[ \t]*([^\r\n]+)$/i);
@@ -107,7 +112,7 @@ export function parseDecision(text: string): ReviewResult {
 
   return {
     decision: "ask",
-    reason: "Reviewer response unclear",
+    reason: UNCLEAR_RESPONSE,
   };
 }
 
