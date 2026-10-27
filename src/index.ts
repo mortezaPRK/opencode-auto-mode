@@ -55,16 +55,18 @@ export default Plugin.define({
         };
         let contextLoaded = false;
         let contextComplete = false;
+        let contextReason = "User authorization context is unavailable";
         result = await compositeDecision(options.classifiers, request, async (stage) => {
           if (!contextLoaded) {
             const messages = await withTimeout(ctx.session.context({ sessionID: event.sessionID }), 3_000);
             const context = extractReviewContext(messages);
             request.transcript = context.transcript;
             contextComplete = context.complete;
+            contextReason = context.reason ?? contextReason;
             contextLoaded = true;
           }
           if (!contextComplete)
-            return { decision: "ask", reason: "User authorization context is unavailable" };
+            return { decision: "ask", reason: contextReason };
           const policy = defaultPolicy(stage.policy);
           const attemptStartedAt = Date.now();
           let outcome: StageResult;

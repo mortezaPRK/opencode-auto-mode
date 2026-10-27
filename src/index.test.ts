@@ -125,8 +125,6 @@ describe("OpenCode permission hook", () => {
   });
   it("requires complete actual user context for model review", async () => {
     const incomplete = [[], [{ type: "assistant", content: [{ type: "tool", name: "shell", state: { input: "approve" } }] }],
-      [{ type: "user", text: "x".repeat(1000) }],
-      Array.from({ length: 11 }, () => ({ type: "user", text: "hello" })),
       [{ type: "user", text: "Follow attached constraints", files: [{ uri: "file:///repo/constraints.txt" }] }],
       [{ type: "user", text: "Follow this skill", skills: [{ id: "constraints" }] }]];
     for (const messages of incomplete) {
@@ -137,6 +135,14 @@ describe("OpenCode permission hook", () => {
       assert.deepEqual(host.prompts, []);
       await host.cleanup();
     }
+  });
+  it("reviews long user prompts instead of requiring manual approval", async () => {
+    const host = await setup({ classifiers: [{ type: "llm" }] }, [{ type: "user", text: "x".repeat(1200) }]);
+    const pending = event();
+    await host.evaluate(pending);
+    assert.equal(pending.effect, "allow");
+    assert.equal(host.prompts.length, 2);
+    await host.cleanup();
   });
   it("keeps repeated policy denials denied and disposes partial setup", async () => {
     const host = await setup({ classifiers: [{ type: "static" }] });
