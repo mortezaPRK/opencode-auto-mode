@@ -281,7 +281,7 @@ describe("OpenCode permission hook", () => {
     assert.equal(signals[0]!.aborted, true);
     await host.cleanup();
   });
-  it("turns an interrupted denial into a user decision", async () => {
+  it("does not deny an interrupted request", async () => {
     const host = await setup({ classifiers: [{ type: "static" }] });
     let release!: () => void;
     host.ctx.session.get = () => new Promise((resolve) => {

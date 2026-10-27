@@ -20,11 +20,11 @@ export function withTimeout<T>(promise: Promise<T>, ms: number, signal?: AbortSi
     };
     const onAbort = () => finish(() => reject(new ReviewFailure("cancelled", "Review cancelled")));
     const timer = setTimeout(() => finish(() => reject(new ReviewFailure("timeout", "Review timed out"))), ms);
-    signal?.addEventListener("abort", onAbort, { once: true });
-    if (signal?.aborted) {
-      onAbort();
-      return;
-    }
+    // Observe the provider promise before any early return: a promise that is
+    // already rejected must not become an unhandled rejection just because the
+    // signal was aborted before this wrapper was created.
     promise.then((value) => finish(() => resolve(value)), (error) => finish(() => reject(error)));
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) onAbort();
   });
 }

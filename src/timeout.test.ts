@@ -40,4 +40,19 @@ describe("bounded provider calls", () => {
     await assert.rejects(withTimeout(never(), 30_000, AbortSignal.abort()), isCancelled);
     assert.ok(Date.now() - startedAt < 250);
   });
+  it("consumes an already-rejected provider promise when the signal is aborted", async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      await assert.rejects(
+        withTimeout(Promise.reject(new Error("provider failure")), 30_000, AbortSignal.abort()),
+        isCancelled,
+      );
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      assert.deepEqual(unhandled, []);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+  });
 });
