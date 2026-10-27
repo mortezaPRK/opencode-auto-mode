@@ -77,10 +77,21 @@ function renderTranscript(entries: Entry[], toolTruncated: boolean): string {
   let tools = 0;
   const recent = entries.slice().reverse().filter((entry) => entry.role === "user" ? ++users <= MAX_USERS : ++tools <= MAX_TOOLS).reverse();
   const notes: string[] = [];
-  if (recent.length < entries.length) notes.push("incomplete session context");
+  if (recent.length < entries.length) notes.push("older messages omitted");
   if (toolTruncated) notes.push("some tool details truncated");
-  const note = notes.length ? `\n… ${notes.join("; ")}` : "";
-  return truncate(`User messages and prior tool calls (chronological):\n${JSON.stringify(recent)}${note}`, MAX_TRANSCRIPT_CHARS);
+  const render = () => `User messages and prior tool calls (chronological):\n${JSON.stringify(recent)}` +
+    (notes.length ? `\n… incomplete session context (${notes.join("; ")})` : "");
+  let transcript = render();
+  while (transcript.length > MAX_TRANSCRIPT_CHARS && recent.length > 1) {
+    // Keep at least the latest user message.
+    const onlyOneUser = recent.filter((entry) => entry.role === "user").length <= 1;
+    const index = onlyOneUser && recent[0].role === "user" ? recent.findIndex((entry) => entry.role === "tool") : 0;
+    if (index < 0) break;
+    recent.splice(index, 1);
+    if (!notes.includes("older messages omitted")) notes.push("older messages omitted");
+    transcript = render();
+  }
+  return transcript;
 }
 
 function buildTranscript(messages: unknown[]): TranscriptData {

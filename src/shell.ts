@@ -7,7 +7,7 @@ const MAX_COMMAND_CHARS = 4096;
 const MAX_COMMAND_BYTES = 65_536;
 const BALANCED_QUOTES = /^(?:[^'"\\]|\\[^\r\n]|'[^']*'|"(?:[^"\\]|\\[^\r\n])*")*$/;
 const CONTROL_OPERATORS = new Set([";", "&&", "||", "|", "|&", "&"]);
-const REDIRECT_OPERATORS = new Set([">", ">>", ">&", "<&", "<", "<<", "<<<", "<>", ">|", "&>", "&>>"]);
+const REDIRECT_OPERATORS = new Set([">", ">>", ">&", "<&", "<", "<<", "<<-", "<<<", "<>", ">|", "&>", "&>>"]);
 const WRITE_OPERATORS = new Set([">", ">>", ">|", "&>", "&>>", "<>"]);
 const SHELLS = new Set(["sh", "bash", "dash", "zsh", "ksh", "fish", "pwsh", "powershell", "cmd"]);
 const SCRIPT_HOSTS = new Set(["python", "python3", "node", "perl", "ruby", "php", "awk", "gawk", "lua"]);
@@ -15,13 +15,11 @@ const STATEFUL = new Set(["alias", "unalias", "export", "unset", "set", "shopt",
   "readonly", "declare", "typeset", "local", "function"]);
 const DYNAMIC = new Set(["eval", "source", ".", "exec", "xargs"]);
 const DYNAMIC_SYNTAX = /\$\(|`|\$\(\s*\(|[<>]\(/;
-
-function blockedCommand(command: string): string | undefined {
-  const normalized = shellWords(command);
-  const result = classify("shell", [command, ...(normalized ? [normalized.join(" ")] : [])]);
-  return result.tier === "auto-deny" ? result.reason : undefined;
-}
-
+const ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/;
+const WRAPPERS = new Set(["env", "command", "builtin", "exec", "time", "!", "nohup", "setsid", "nice",
+  "ionice", "stdbuf", "timeout"]);
+const VALUE_OPTIONS = new Set(["-u", "--unset", "-C", "--chdir", "-S", "--split-string", "-a", "--argv0",
+  "-n", "--adjustment", "-s", "--signal", "-k", "--kill-after"]);
 const READ_ONLY = new Set(["pwd", "whoami", "hostname", "uname", "id", "groups", "ls", "cat", "head", "tail",
   "wc", "date", "echo", "printf", "true", ":", "rg", "grep", "sort", "uniq", "cut", "tr", "jq", "stat", "file",
   "du", "df", "tree", "bat", "which", "type", "sleep", "test", "basename", "dirname", "realpath", "diff"]);
@@ -37,6 +35,12 @@ export function shellWords(command: string): string[] | undefined {
 
 interface Segment { words: string[]; write: boolean }
 type Verdict = { decision: "deny"; reason: string } | { decision: "allow" | "review" | "ask" };
+
+function blockedCommand(command: string): string | undefined {
+  const normalized = shellWords(command);
+  const result = classify("shell", [command, ...(normalized ? [normalized.join(" ")] : [])]);
+  return result.tier === "auto-deny" ? result.reason : undefined;
+}
 
 /** True when the command contains a heredoc marker outside quotes. Heredoc bodies are data. */
 function hasHeredoc(command: string): boolean {
@@ -56,21 +60,82 @@ function hasHeredoc(command: string): boolean {
   return false;
 }
 
-/** True when any word can execute another shell or builtin dynamically. */
-function dynamicExecution(words: string[]): boolean {
-  for (let index = 0; index < words.length; index++) {
-    const name = basename(words[index]);
-    const previous = index > 0 ? basename(words[index - 1]) : undefined;
-    const wrapped = index === 0 || previous === "env" || previous === "command" || previous === "time" ||
-      previous === "builtin" || previous === "!";
-    if (SHELLS.has(name) && (wrapped || words[index + 1] === "-c" || words[index + 1] === "--command")) return true;
-    if (DYNAMIC.has(name) && wrapped) return true;
-    if (STATEFUL.has(name) && (index === 0 || previous === "builtin" || previous === "command" || previous === "!"))
-      return true;
-    if (name === "find" && words.slice(1).some((word) => /^-(?:exec|execdir|ok|okdir|delete)$/.test(word)))
-      return true;
+interface HeredocMarker { delimiter: string; quoted: boolean; stripTabs: boolean }
+
+/** Reads heredoc markers on one line, ignoring markers inside quoted strings and comments. */
+function heredocMarkers(line: string): HeredocMarker[] {
+  const markers: HeredocMarker[] = [];
+  let quote: "'" | '"' | undefined;
+  for (let index = 0; index < line.length; index++) {
+    const character = line[index];
+    if (quote === "'") { if (character === "'") quote = undefined; continue; }
+    if (quote === '"') {
+      if (character === "\\") { index++; continue; }
+      if (character === '"') quote = undefined;
+      continue;
+    }
+    if (character === "'" || character === '"') { quote = character; continue; }
+    if (character === "\\") { index++; continue; }
+    if (character === "#" && (index === 0 || /\s/.test(line[index - 1] ?? ""))) break;
+    if (character !== "<" || line[index + 1] !== "<" || line[index + 2] === "<") continue;
+    let cursor = index + 2;
+    const stripTabs = line[cursor] === "-";
+    if (stripTabs) cursor++;
+    while (line[cursor] === " " || line[cursor] === "\t") cursor++;
+    let delimiter = "";
+    let quoted = false;
+    if (line[cursor] === "'" || line[cursor] === '"') {
+      const closing = line[cursor];
+      quoted = true;
+      cursor++;
+      while (cursor < line.length && line[cursor] !== closing) delimiter += line[cursor++];
+    } else {
+      while (cursor < line.length && /[A-Za-z0-9_]/.test(line[cursor])) delimiter += line[cursor++];
+    }
+    if (delimiter) markers.push({ delimiter, quoted, stripTabs });
+    index = cursor - 1;
   }
-  return false;
+  return markers;
+}
+
+/** Resolves leading assignments and wrapper options to the effective executable. */
+function resolveExecutable(words: string[]): { name: string; index: number } | undefined {
+  let index = 0;
+  while (index < words.length && ASSIGNMENT.test(words[index])) index++;
+  while (index < words.length) {
+    const name = basename(words[index]);
+    if (!WRAPPERS.has(name)) break;
+    index++;
+    if (name === "timeout") {
+      while (index < words.length && words[index].startsWith("-") && words[index] !== "-") {
+        const option = words[index].split("=", 1)[0];
+        index += VALUE_OPTIONS.has(option) && !words[index].includes("=") ? 2 : 1;
+      }
+      if (index < words.length) index++;
+      continue;
+    }
+    while (index < words.length) {
+      const word = words[index];
+      if (word === "--") { index++; break; }
+      if (word.startsWith("-") && word !== "-") {
+        const option = word.split("=", 1)[0];
+        index += VALUE_OPTIONS.has(option) && !word.includes("=") ? 2 : 1;
+        continue;
+      }
+      if (ASSIGNMENT.test(word)) { index++; continue; }
+      break;
+    }
+  }
+  return index < words.length ? { name: basename(words[index]), index } : undefined;
+}
+
+/** True when the effective executable is a shell, a dynamic builtin, or a stateful builtin. */
+function dynamicExecution(words: string[]): boolean {
+  const executable = resolveExecutable(words);
+  if (executable === undefined) return true;
+  if (SHELLS.has(executable.name) || DYNAMIC.has(executable.name) || STATEFUL.has(executable.name)) return true;
+  return executable.name === "find" && words.slice(executable.index + 1)
+    .some((word) => /^-(?:exec|execdir|ok|okdir|delete)$/.test(word));
 }
 
 function isReadOnlyGit(args: string[]): boolean {
@@ -121,11 +186,12 @@ function isReadOnly(words: string[]): boolean {
 }
 
 function analyzeSegment(segment: Segment): Verdict {
-  if (!segment.words.length) return { decision: "allow" };
+  if (!segment.words.length) return segment.write ? { decision: "review" } : { decision: "allow" };
   const command = segment.words[0];
   if (!command || command.includes("$")) return { decision: "ask" };
-  const name = basename(command);
-  if (DYNAMIC.has(name) || dynamicExecution(segment.words)) return { decision: "ask" };
+  const blocked = blockedCommand(segment.words.join(" "));
+  if (blocked !== undefined) return { decision: "deny", reason: blocked };
+  if (dynamicExecution(segment.words)) return { decision: "ask" };
   if (!segment.write && isReadOnly(segment.words)) return { decision: "allow" };
   return { decision: "review" };
 }
@@ -135,11 +201,13 @@ function analyzeLine(command: string): Verdict {
   if (!BALANCED_QUOTES.test(command)) return { decision: "ask" };
   const blocked = blockedCommand(command);
   if (blocked !== undefined) return { decision: "deny", reason: blocked };
-  if (DYNAMIC_SYNTAX.test(command)) return { decision: "ask" };
 
   let tokens;
   try { tokens = parse(command); }
   catch { return { decision: "ask" }; }
+  const blockedTokens = blockedCommand(tokens.filter((token): token is string => typeof token === "string").join(" "));
+  if (blockedTokens !== undefined) return { decision: "deny", reason: blockedTokens };
+  if (DYNAMIC_SYNTAX.test(command)) return { decision: "ask" };
 
   const segments: Segment[] = [{ words: [], write: false }];
   let current = segments[0];
@@ -170,37 +238,77 @@ function analyzeLine(command: string): Verdict {
   }
   if (redirect) return { decision: "ask" };
 
+  let ask = false;
   let review = false;
   for (const segment of segments) {
     const verdict = analyzeSegment(segment);
-    if (verdict.decision === "deny" || verdict.decision === "ask") return verdict;
-    if (verdict.decision === "review") review = true;
+    if (verdict.decision === "deny") return verdict;
+    if (verdict.decision === "ask") ask = true;
+    else if (verdict.decision === "review") review = true;
   }
+  if (ask) return { decision: "ask" };
+  return { decision: review ? "review" : "allow" };
+}
+
+function analyzeHeredoc(command: string): Verdict {
+  const lines = command.split("\n");
+  const firstLine = lines[0] ?? "";
+  const markers = heredocMarkers(firstLine);
+  if (!markers.length) return { decision: "ask" };
+  let index = 1;
+  const bodies: { lines: string[]; quoted: boolean }[] = [];
+  for (const marker of markers) {
+    const body: string[] = [];
+    let closed = false;
+    while (index < lines.length) {
+      const candidate = marker.stripTabs ? lines[index].replace(/^\t+/, "") : lines[index];
+      index++;
+      if (candidate === marker.delimiter) { closed = true; break; }
+      body.push(candidate);
+    }
+    if (!closed) return { decision: "ask" };
+    bodies.push({ lines: body, quoted: marker.quoted });
+  }
+
+  let ask = false;
+  let review = false;
+  for (const line of [firstLine, ...lines.slice(index)]) {
+    if (!line.trim()) continue;
+    const verdict = analyzeLine(line);
+    if (verdict.decision === "deny") return verdict;
+    if (verdict.decision === "ask") ask = true;
+    else if (verdict.decision === "review") review = true;
+  }
+  for (const body of bodies) {
+    // Unquoted heredoc bodies undergo command and parameter expansion.
+    if (!body.quoted && DYNAMIC_SYNTAX.test(body.lines.join("\n"))) return { decision: "ask" };
+  }
+  try {
+    const words = parse(firstLine).filter((token): token is string => typeof token === "string");
+    const executable = resolveExecutable(words);
+    if (executable === undefined || SHELLS.has(executable.name) || SCRIPT_HOSTS.has(executable.name) ||
+        DYNAMIC.has(executable.name) || STATEFUL.has(executable.name)) return { decision: "ask" };
+  } catch { return { decision: "ask" }; }
+  if (ask) return { decision: "ask" };
   return { decision: review ? "review" : "allow" };
 }
 
 function analyze(command: string): Verdict {
-  if (hasHeredoc(command)) {
-    const firstLine = command.split("\n", 1)[0];
-    const blocked = blockedCommand(firstLine);
-    if (blocked !== undefined) return { decision: "deny", reason: blocked };
-    if (DYNAMIC_SYNTAX.test(firstLine)) return { decision: "ask" };
-    try {
-      const words = parse(firstLine).filter((token): token is string => typeof token === "string");
-      if (dynamicExecution(words) || (words[0] !== undefined && SCRIPT_HOSTS.has(basename(words[0]))))
-        return { decision: "ask" };
-    } catch { return { decision: "ask" }; }
-    return { decision: "review" };
-  }
+  if (hasHeredoc(command)) return analyzeHeredoc(command);
+  const blocked = blockedCommand(command);
+  if (blocked !== undefined) return { decision: "deny", reason: blocked };
   if (command.includes("\n")) {
+    let ask = false;
     let review = false;
     for (const line of command.split("\n")) {
       const trimmed = line.trim();
       if (!trimmed || trimmed.startsWith("#")) continue;
       const verdict = analyzeLine(trimmed);
-      if (verdict.decision === "deny" || verdict.decision === "ask") return verdict;
-      if (verdict.decision === "review") review = true;
+      if (verdict.decision === "deny") return verdict;
+      if (verdict.decision === "ask") ask = true;
+      else if (verdict.decision === "review") review = true;
     }
+    if (ask) return { decision: "ask" };
     return { decision: review ? "review" : "allow" };
   }
   return analyzeLine(command);
@@ -211,10 +319,14 @@ export function guardShell(resources: readonly string[]): ReviewResult | undefin
   if (!resources.length || resources.length > 256 || resources.some((resource) => resource.length > MAX_COMMAND_CHARS) ||
       resources.reduce((sum, resource) => sum + Buffer.byteLength(resource), 0) > MAX_COMMAND_BYTES)
     return { decision: "ask", reason: "Shell command exceeds parsing limits" };
+  let ask = false;
+  let review = false;
   for (const resource of resources) {
     const verdict = analyze(resource);
     if (verdict.decision === "deny") return { decision: "deny", reason: verdict.reason };
-    if (verdict.decision === "ask") return { decision: "ask", reason: "Shell syntax requires manual approval" };
+    if (verdict.decision === "ask") ask = true;
+    else if (verdict.decision === "review") review = true;
   }
-  return undefined;
+  if (ask) return { decision: "ask", reason: "Shell syntax requires manual approval" };
+  return review ? undefined : { decision: "allow", reason: "read-only command" };
 }

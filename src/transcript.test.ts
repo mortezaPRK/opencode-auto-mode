@@ -56,6 +56,19 @@ describe("review context completeness", () => {
     assert.equal(capped.complete, true);
     assert.match(capped.transcript, /incomplete session context/);
   });
+  it("keeps the latest user restriction when tool history exceeds the transcript budget", () => {
+    const context = extractReviewContext([
+      { type: "user", text: "Please make the changes" },
+      ...Array.from({ length: 12 }, () => ({
+        type: "assistant",
+        content: [{ type: "tool", name: "write", state: { input: "x".repeat(500) } }],
+      })),
+      { type: "user", text: "DO NOT PUBLISH" },
+    ]);
+    assert.equal(context.complete, true);
+    assert.match(context.transcript, /DO NOT PUBLISH/);
+    assert.ok(context.transcript.length <= 6000);
+  });
   it("still requires untruncated user evidence", () => {
     assert.equal(extractReviewContext([{ type: "user", text: "x".repeat(501) }]).complete, false);
     assert.equal(extractReviewContext(Array.from({ length: 11 }, (_, index) => ({ type: "user", text: `message ${index}` }))).complete, false);

@@ -15,7 +15,12 @@ export async function compositeDecision(
     const result = classify(request.action, request.resources);
     if (result.tier === "auto-deny") return { decision: "deny", reason: result.reason, stage: "static" };
   }
-  if (shellResult) return { ...shellResult, stage: "shell-guard" };
+  if (shellResult) {
+    // Parsed read-only results feed the static stage, but never bypass a model-only pipeline.
+    const hasStatic = stages.some((stage) => stage.type === "static");
+    if (shellResult.decision !== "allow" || hasStatic)
+      return { ...shellResult, stage: shellResult.decision === "allow" ? "static" : "shell-guard" };
+  }
   let abstained: string | undefined;
   for (const stage of stages) {
     if (stage.type === "static") {
