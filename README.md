@@ -28,11 +28,9 @@ needed:
 }
 ```
 
-Restart OpenCode after saving:
-
-```sh
-opencode service restart
-```
+OpenCode watches configuration files and reloads plugins after a save, so no
+restart is needed. If a change does not take effect, run `/reload` in the TUI to
+force a full reload.
 
 There is no default review pipeline, and empty options are invalid. Add at least
 one review entry. Built-in checks deny dangerous shell commands, allow common
@@ -56,8 +54,11 @@ write files or run programs (`rg --pre`, `sort -o`, `tree -o`, `file -C`,
 instead of being auto-approved.
 
 A shell result is final when it is `deny` or `ask`: `ask` means manual approval,
-even if a model reviewer is configured. Only commands the guard considers
-read-only can be auto-approved.
+even if a model reviewer is configured. Read-only auto-approval is narrower than
+the pipeline: for shell actions, the static stage auto-approves only commands the
+guard recognizes as read-only. Every other parsed command that is not denied —
+including a write such as `pwd > marker` — goes to the configured reviewers, and a
+model reviewer may allow it. With no reviewer configured, it stays `ask`.
 
 ## Add a typed decision model
 
@@ -119,8 +120,8 @@ Entries run in order. Add as many as you need:
 }
 ```
 
-An entry can allow, deny, or ask, which stops the pipeline. If it abstains or
-fails, the next entry runs. If nothing decides, the action remains `ask`.
+An entry can allow, deny, or ask, which stops the pipeline. An entry that abstains
+hands the action to the next entry. If nothing decides, the action remains `ask`.
 
 ## Time limit and failures
 
@@ -138,8 +139,12 @@ review, so a stopped turn cannot later receive an automatic approval.
 
 Failures are reported with a bounded cause — `deadline`, `timeout`, `cancelled`,
 `provider`, `invalid-output`, or `context` — in the audit log and in OTLP
-(`error.kind`), while the user-facing message stays generic. A reviewer that
-returns an unparseable answer abstains and the next entry runs.
+(`error.kind`), while the user-facing message stays generic.
+
+A typed decision reviewer that is unavailable or returns a malformed response
+abstains, so the next entry runs. An `llm` entry behaves differently: a timeout
+or provider error abstains, but an unparseable final answer is an `ask` (manual
+approval) with `invalid-output`, and the pipeline stops there.
 
 ## Use it for specific agents
 
@@ -162,8 +167,9 @@ permissions and leave global permissions unchanged:
 
 A passive indicator shows when the plugin is reviewing the current session.
 It is enabled by default. Set `tui: false` in plugin options to hide it.
-Invalid options show `auto-mode: invalid config` in the same place and an error
-toast at startup. OpenCode's own permission dialog handles manual approvals.
+Invalid options show `auto-mode: invalid config` in the same place and raise an
+error toast when the configuration is loaded. OpenCode's own permission dialog
+handles manual approvals.
 
 The indicator window is longer than the maximum review deadline, so a slow
 review stays visible until it resolves.
@@ -230,25 +236,34 @@ reviewers and do not apply to static checks or replace OpenCode permissions.
 
 Static entries accept `allowInProjectEdits`. Decision entries accept
 `minConfidence`, `timeoutMs`, `apiKeyEnv`, and `endpoint` (loopback `laya` only;
-defaults to `http://127.0.0.1:8000/v1/systemone`). Reload the service after
-changing options; invalid options disable automatic approval and are reported in
-the TUI and over the status RPC.
+defaults to `http://127.0.0.1:8000/v1/systemone`). OpenCode reloads the plugin
+when you save, so option changes apply without a restart; run `/reload` in the
+TUI if a change does not take effect. Invalid options disable automatic approval
+and are reported in the TUI and over the status RPC.
 
 ## Data that leaves the machine
 
-Reviewers see the proposed action, its parsed resources, the session directory,
-the requesting agent, the pending permission `metadata` and `source`, and a
-bounded transcript of recent user messages and tool inputs (12 KB, with the head
-and tail of each tool input). Nothing else about the session is sent.
+Reviewers see the proposed action, its resources, the session directory, the
+requesting agent, the pending permission `metadata` and `source`, and a bounded
+transcript of recent user messages and tool inputs (12 KB, with the head and tail
+of each tool input). Nothing else about the session is sent.
 
 * A model reviewer receives that material through OpenCode's own session model or
   the `model` you configure.
 * A typed decision reviewer receives it at the configured provider endpoint.
-* Audit records keep the action, up to 16 resources and a short reason. Local
-  audit and OTLP share one sanitizer, so the same fields are clipped the same way.
-* Audit and OTLP never include prompts, file contents, API keys, or raw provider
-  errors. Set `auditLog`/`otlp` only if you are comfortable keeping or exporting
-  the reviewed commands.
+* Audit records keep the action, up to 16 resources, a short reason, and, on
+  failure, a short error detail. Audit and OTLP log records share one sanitizer,
+  which bounds the free-form fields — 128 characters for the action and agent, 64
+  for the stage, 512 for each resource, reason, and error detail — but does
+  **not** redact text.
+* Action, resource, reason, and error-detail fields are copied from the review.
+  They can contain secrets or inline file contents, for example a shell command
+  with an `Authorization` header or a heredoc payload. Audit JSONL and OTLP logs
+  keep that text, so enable `auditLog` or `otlp` only if you are comfortable
+  storing or exporting it. OTLP review traces are built separately and carry the
+  action, decision, stage, and each reviewer attempt's model and outcome.
+* Records do not include the reviewer prompt, the session transcript, or API keys
+  configured for providers.
 
 ## Platform limits
 
