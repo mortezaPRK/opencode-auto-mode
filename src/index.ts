@@ -13,6 +13,8 @@ import { createOtlpExporter } from "./otlp.js";
 import { createTraceExporter, type ClassifierAttempt } from "./traces.js";
 import { errorKindOf, ReviewFailure, type ReviewErrorKind } from "./errors.js";
 import { withTimeout } from "./timeout.js";
+import { AutoMode, type AutoModeDecision } from "./rpc.js";
+import { createStatusTracker } from "./status.js";
 
 export type { AutoModeOptions, ClassifierStage, DecisionProvider, DecisionStage, ReviewerModel } from "./config.js";
 
@@ -21,12 +23,14 @@ export default Plugin.define({
   setup: async (ctx) => {
     const log = createLogger("events.log");
     const directory = ctx.location?.directory;
+    let configError: string | undefined;
     let options: ReturnType<typeof parseOptions> | undefined;
     try {
       options = parseOptions(ctx.options);
       if (directory !== undefined) clearConfigError(directory);
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
+      configError = detail;
       log.log(`Invalid configuration; automatic approval disabled: ${detail}`);
       if (directory !== undefined) recordConfigError(directory, detail);
     }
@@ -38,7 +42,27 @@ export default Plugin.define({
     // controller so an interruption aborts all of them, not only the newest.
     const running = new Map<string, Set<AbortController>>();
     const subscriptions = new AbortController();
+    const status = createStatusTracker();
     let reviewCounter = 0;
+    let rpc: Awaited<ReturnType<typeof ctx.rpc.register<typeof AutoMode>>> | undefined;
+    try {
+      rpc = await ctx.rpc.register(AutoMode, {
+        status: async (input) => {
+          const { sessionID } = input as { sessionID?: string };
+          return status.snapshot({
+            enabled: options !== undefined,
+            ...(configError === undefined ? {} : { configError }),
+            classifiers: options?.classifiers.map((stage) => stage.type) ?? [],
+            reviewTimeoutMs,
+            ...(sessionID === undefined ? {} : { sessionID }),
+          });
+        },
+        decisions: async (input) => {
+          const { limit, sessionID } = input as { limit?: number; sessionID?: string };
+          return status.recent(Number.isFinite(limit) ? Math.min(Math.max(Math.trunc(limit!), 1), 50) : 20, sessionID);
+        },
+      });
+    } catch { log.log("Status RPC is unavailable"); }
 
     const abortSession = (sessionID: string) => {
       const controllers = running.get(sessionID);
@@ -80,6 +104,7 @@ export default Plugin.define({
       }
       const reviewID = `review-${process.pid}-${Date.now()}-${reviewCounter++}`;
       recordDecision({ requestID: reviewID, sessionID: event.sessionID, decision: "reviewing", action: event.action.slice(0, 128), reason: "", at: Date.now() });
+      status.start(event.sessionID, reviewID, Date.now());
       const startedAt = Date.now();
       const trace = traces?.begin(startedAt);
       const hostEffect = event.effect;
@@ -253,6 +278,19 @@ export default Plugin.define({
       trace?.finish(auditRecord);
       for (const sink of sinks) sink.write(auditRecord);
       recordDecision({ requestID: reviewID, sessionID: event.sessionID, decision: event.effect, reason: "", at: Date.now() });
+      const tracked: AutoModeDecision = status.finish({
+        reviewID, sessionID: event.sessionID, action: auditRecord.action, decision,
+        stage: auditRecord.stage, reason, durationMs: auditRecord.durationMs, at: Date.now(),
+        ...(errorKind === undefined ? {} : { errorKind }),
+      });
+      // Clients also poll `status`; a missed event only costs freshness.
+      const payload: Record<string, unknown> = {
+        reviewID: tracked.reviewID, sessionID: tracked.sessionID, action: tracked.action,
+        decision: tracked.decision, stage: tracked.stage, reason: tracked.reason,
+        durationMs: tracked.durationMs, at: tracked.at,
+      };
+      if (tracked.errorKind !== undefined) payload.errorKind = tracked.errorKind;
+      try { await rpc?.events.emit("decision", payload); } catch { /* status delivery is best effort */ }
     }).catch((error) => {
       abandonSetup();
       throw error;
@@ -273,7 +311,12 @@ export default Plugin.define({
     return async () => {
       abandonSetup();
       try { await permissionRegistration.dispose(); }
-      finally { await toolRegistration.dispose(); counts.clear(); log.log("Auto-mode unloaded"); }
+      finally {
+        await toolRegistration.dispose();
+        await rpc?.dispose().catch(() => {});
+        counts.clear();
+        log.log("Auto-mode unloaded");
+      }
     };
   },
 });

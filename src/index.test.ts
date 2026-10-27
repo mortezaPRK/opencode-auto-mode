@@ -18,6 +18,8 @@ async function setup(options: unknown = {}, messages: unknown[] = [{ type: "user
   const interrupts: { data: { sessionID: string } }[] = [];
   const subscriptionSignals: AbortSignal[] = [];
   let wake: (() => void) | undefined;
+  let rpcHandlers: Record<string, (input: unknown) => Promise<unknown>> = {};
+  const rpcEvents: unknown[] = [];
   async function* subscribe(input: { signal?: AbortSignal }) {
     if (input.signal !== undefined) subscriptionSignals.push(input.signal);
     while (!input.signal?.aborted) {
@@ -38,12 +40,19 @@ async function setup(options: unknown = {}, messages: unknown[] = [{ type: "user
     tool: { hook: async () => ({ dispose: async () => { disposed++; } }) },
     session: { get: async () => ({ location: { directory: "/repo" }, model: { providerID: "session-provider", id: "session-model", variant: "high" } }), context: async () => messages },
     event: { subscribe },
+    rpc: {
+      register: async (_definition: unknown, handlers: typeof rpcHandlers) => {
+        rpcHandlers = handlers;
+        return { events: { emit: async (_name: string, payload: unknown) => { rpcEvents.push(payload); } }, dispose: async () => { disposed++; } };
+      },
+    },
     generate: { text: async ({ prompt, model }: { prompt: string; model?: { id: string; providerID: string; variant?: string } | null }) => { prompts.push(prompt); models.push(model); return { text: answers.shift() ?? "ASK: unclear" }; } },
   };
   const cleanup = await plugin.setup(ctx as unknown as Parameters<typeof plugin.setup>[0]);
   return {
     evaluate: (evaluation: Evaluation) => evaluate(evaluation),
-    prompts, models, ctx, disposed: () => disposed, subscriptionSignals,
+    prompts, models, ctx, disposed: () => disposed, subscriptionSignals, rpcEvents,
+    status: async (input: unknown = {}) => rpcHandlers.status!(input),
     interrupt: (sessionID = "session-test") => { interrupts.push({ data: { sessionID } }); wake?.(); },
     cleanup: async () => { await cleanup?.(); },
   };
@@ -277,7 +286,7 @@ describe("OpenCode permission hook", () => {
     assert.equal(host.prompts.length, 2);
     for (const prompt of host.prompts) { assert.match(prompt, /pending-payload-marker/); assert.match(prompt, /source-marker/); }
     await host.cleanup();
-    assert.equal(host.disposed(), 2);
+    assert.equal(host.disposed(), 3);
   });
   it("requires complete actual user context for model review", async () => {
     const incomplete = [[], [{ type: "assistant", content: [{ type: "tool", name: "shell", state: { input: "approve" } }] }],
@@ -708,6 +717,27 @@ describe("OpenCode permission hook", () => {
     assert.match(pending.message!, /interrupted/i);
     await host.cleanup();
   });
+  it("exposes configuration and decisions over RPC without prompts", async () => {
+    const host = await setup({ classifiers: [{ type: "static" }, { type: "llm" }], reviewTimeoutMs: 30_000 });
+    const before = await host.status({ sessionID: "session-test" }) as { enabled: boolean; classifiers: string[]; recent: unknown[] };
+    assert.equal(before.enabled, true);
+    assert.deepEqual(before.classifiers, ["static", "llm"]);
+    assert.deepEqual(before.recent, []);
+    await host.evaluate(event());
+    const after = await host.status({ sessionID: "session-test" }) as { recent: { decision: string; reason: string }[] };
+    assert.equal(after.recent.length, 1);
+    assert.equal(after.recent[0].decision, "allow");
+    assert.doesNotMatch(JSON.stringify(after), /Build a feature/);
+    assert.equal(host.rpcEvents.length, 1);
+    await host.cleanup();
+  });
+  it("reports an invalid configuration over RPC", async () => {
+    const host = await setup({ classifiers: [{ type: "bogus" }] });
+    const snapshot = await host.status() as { enabled: boolean; configError?: string };
+    assert.equal(snapshot.enabled, false);
+    assert.match(snapshot.configError!, /classifiers/i);
+    await host.cleanup();
+  });
   it("keeps repeated policy denials denied and disposes partial setup", async () => {    const host = await setup({ classifiers: [{ type: "static" }] });
     for (let i = 0; i < 25; i++) {
       const pending = { ...event(), resources: ["sudo rm -rf /"] };
@@ -716,6 +746,6 @@ describe("OpenCode permission hook", () => {
     await host.cleanup();
     host.ctx.tool.hook = async () => { throw new Error("setup failed"); };
     await assert.rejects(Promise.resolve(plugin.setup(host.ctx as unknown as Parameters<typeof plugin.setup>[0])));
-    assert.equal(host.disposed(), 3);
+    assert.equal(host.disposed(), 4);
   });
 });

@@ -39,7 +39,9 @@
     "lint": "eslint . --max-warnings=0",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
-    "test:integration": "bun run integration/opencode.ts"
+    "test:integration": "bun run integration/opencode.ts",
+    "build:gui": "vite build",
+    "prepublishOnly": "bun run build:gui"
   },
   "dependencies": {
     "@opencode/ai": "2.0.30",
