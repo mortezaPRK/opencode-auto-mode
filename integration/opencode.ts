@@ -251,10 +251,15 @@ try {
   });
   await run("shell parser guard before permissive classifiers", async () => {
     const f = await fixture({ classifiers: [stage("llm")] });
-    for (const resource of ["pwd ; sudo rm -rf", "pwd > parser-marker", "pwd $(touch parser-marker)", "pwd ; touch parser-marker", 'pwd "unclosed']) {
+    for (const resource of ["pwd ; sudo rm -rf", "pwd $(touch parser-marker)", 'pwd "unclosed']) {
       calls.length = 0;
       await expectPermission(f, resource.includes("sudo") ? "deny" : "ask", [resource]);
       assert.deepEqual(calls, []);
+    }
+    for (const resource of ["pwd > parser-marker", "pwd ; touch parser-marker"]) {
+      calls.length = 0;
+      await expectPermission(f, "allow", [resource]);
+      assert.deepEqual(calls, ["llm:triage"]);
     }
   });
   await run("audit log and OTLP export", async () => {
@@ -312,7 +317,7 @@ try {
   const toolCases: { name: string; stages: ClassifierStage[]; expected: Verdict; profile: Profile; command?: string; reached?: string[] }[] = [
     { name: "static read-only", stages: [stage("static")], expected: "allow", profile: {}, command: "pwd" },
     { name: "parsed read-only chain", stages: [stage("static")], expected: "allow", profile: {}, command: "pwd && ls" },
-    { name: "prefix redirect", stages: [stage("llm")], expected: "ask", profile: {}, command: "pwd > tool-result.txt" },
+    { name: "prefix redirect", stages: [stage("llm")], expected: "allow", profile: {}, command: "pwd > tool-result.txt" },
     { name: "command substitution", stages: [stage("llm")], expected: "ask", profile: {}, command: "pwd $(touch tool-result.txt)" },
     { name: "nested shell", stages: [stage("llm")], expected: "ask", profile: {}, command: "sh -c 'touch tool-result.txt'" },
     { name: "stateful alias", stages: [stage("llm")], expected: "ask", profile: {}, command: "alias pwd='touch tool-result.txt'; pwd" },

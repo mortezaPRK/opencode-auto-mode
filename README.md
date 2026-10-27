@@ -36,7 +36,9 @@ opencode service restart
 
 There is no default review pipeline, and empty options are invalid. Add at least
 one review entry. Built-in checks deny dangerous shell commands, allow common
-read-only commands, and leave everything else as `ask`.
+read-only commands, and send other parsed commands to the configured reviewers.
+Dynamic syntax such as command substitution, nested shells, and stateful builtins
+still requires manual approval.
 
 The snippets below change parts of that configuration; keep your `classifiers`
 list when adding other options.

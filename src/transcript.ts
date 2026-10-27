@@ -8,6 +8,11 @@ interface ToolEntry {
   input: unknown;
 }
 
+interface Entry {
+  role: "user" | "tool";
+  text: string;
+}
+
 function truncate(value: string, max: number): string {
   return value.length > max ? `${value.slice(0, max - 1)}…` : value;
 }
@@ -42,17 +47,63 @@ function assistantTools(message: unknown): ToolEntry[] {
   return tools;
 }
 
-function formatTool(tool: ToolEntry): string {
+function formatTool(tool: ToolEntry): { text: string; truncated: boolean } {
   let detail = "";
+  let truncated = false;
   try {
     const state = asRecord(tool.input);
     const input = state?.["input"] ?? tool.input;
     const raw = typeof input === "string" ? input : JSON.stringify(input);
-    if (raw) detail = truncate(raw, MAX_ENTRY_CHARS);
+    if (raw) {
+      truncated = raw.length > MAX_ENTRY_CHARS;
+      detail = truncate(raw, MAX_ENTRY_CHARS);
+    }
   } catch {
     detail = "";
   }
-  return detail ? `${tool.name} ${detail}` : tool.name;
+  return { text: detail ? `${tool.name} ${detail}` : tool.name, truncated };
+}
+
+interface TranscriptData {
+  transcript: string;
+  users: number;
+  userEvidence: boolean;
+  userTruncated: boolean;
+}
+
+function renderTranscript(entries: Entry[], toolTruncated: boolean): string {
+  if (!entries.some((entry) => entry.role === "user")) return "(no prior user messages in this session)";
+  let users = 0;
+  let tools = 0;
+  const recent = entries.slice().reverse().filter((entry) => entry.role === "user" ? ++users <= MAX_USERS : ++tools <= MAX_TOOLS).reverse();
+  const notes: string[] = [];
+  if (recent.length < entries.length) notes.push("incomplete session context");
+  if (toolTruncated) notes.push("some tool details truncated");
+  const note = notes.length ? `\n… ${notes.join("; ")}` : "";
+  return truncate(`User messages and prior tool calls (chronological):\n${JSON.stringify(recent)}${note}`, MAX_TRANSCRIPT_CHARS);
+}
+
+function buildTranscript(messages: unknown[]): TranscriptData {
+  const entries: Entry[] = [];
+  let users = 0;
+  let userEvidence = false;
+  let userTruncated = false;
+  let toolTruncated = false;
+  for (const message of messages) {
+    const text = userText(message);
+    if (text !== undefined) {
+      users++;
+      userEvidence = true;
+      if (text.length > MAX_ENTRY_CHARS) userTruncated = true;
+      entries.push({ role: "user", text: truncate(text, MAX_ENTRY_CHARS) });
+    }
+    for (const tool of assistantTools(message)) {
+      const formatted = formatTool(tool);
+      if (formatted.truncated) toolTruncated = true;
+      entries.push({ role: "tool", text: formatted.text });
+    }
+  }
+  return { transcript: renderTranscript(entries, toolTruncated), users, userEvidence, userTruncated };
 }
 
 export interface ReviewContext { transcript: string; complete: boolean }
@@ -65,24 +116,14 @@ export function extractReviewContext(messages: unknown[]): ReviewContext {
     return userText(message) !== undefined && ["files", "skills", "agents"].every((key) =>
       record[key] === undefined || (Array.isArray(record[key]) && record[key].length === 0));
   });
-  const transcript = extractTranscript(messages);
+  const data = buildTranscript(messages);
   return {
-    transcript,
-    complete: supported && transcript.startsWith("User messages") && !transcript.includes("…"),
+    transcript: data.transcript,
+    // Tool detail and tool-count truncation are noted in the transcript but do not hide user evidence.
+    complete: supported && data.userEvidence && !data.userTruncated && data.users <= MAX_USERS,
   };
 }
 
 export function extractTranscript(messages: unknown[]): string {
-  const entries: { role: "user" | "tool"; text: string }[] = [];
-  for (const message of messages) {
-    const text = userText(message);
-    if (text !== undefined) entries.push({ role: "user", text: truncate(text, MAX_ENTRY_CHARS) });
-    for (const tool of assistantTools(message)) entries.push({ role: "tool", text: formatTool(tool) });
-  }
-  if (!entries.some((entry) => entry.role === "user")) return "(no prior user messages in this session)";
-  let users = 0;
-  let tools = 0;
-  const recent = entries.slice().reverse().filter((entry) => entry.role === "user" ? ++users <= MAX_USERS : ++tools <= MAX_TOOLS).reverse();
-  const incomplete = recent.length < entries.length ? "\n… incomplete session context" : "";
-  return truncate(`User messages and prior tool calls (chronological):\n${JSON.stringify(recent)}${incomplete}`, MAX_TRANSCRIPT_CHARS);
+  return buildTranscript(messages).transcript;
 }
