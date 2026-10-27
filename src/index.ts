@@ -11,7 +11,7 @@ import { decisionStage } from "./decisions.js";
 import { createAuditLog } from "./audit.js";
 import { createOtlpExporter } from "./otlp.js";
 import { createTraceExporter } from "./traces.js";
-import { errorKindOf, type ReviewErrorKind } from "./errors.js";
+import { errorKindOf, ReviewFailure, type ReviewErrorKind } from "./errors.js";
 import { withTimeout } from "./timeout.js";
 
 export type { AutoModeOptions, ClassifierStage, DecisionProvider, DecisionStage, ReviewerModel } from "./config.js";
@@ -86,7 +86,12 @@ export default Plugin.define({
       const review = (async (): Promise<ReviewResult> => {
         try {
           const signal = controller.signal;
+          // A cancelled review must not start host or provider work at all.
+          throwIfAborted(signal);
           const info = await withTimeout(ctx.session.get({ sessionID: event.sessionID }, { signal }), 3_000, signal).catch(() => undefined);
+          // The session lookup swallow keeps a deadline or interruption from
+          // failing the review, but an interrupted lookup must stop here.
+          throwIfAborted(signal);
           const request: PermissionRequest = {
             action: event.action, resources: [...event.resources], agent: event.agent,
             projectDir: info?.location?.directory, metadata: event.metadata, source: event.source,
@@ -96,8 +101,12 @@ export default Plugin.define({
           let contextComplete = false;
           let contextReason = "User authorization context is unavailable";
           return await compositeDecision(options.classifiers, request, async (stage) => {
+            // Fallback stages can be entered after an earlier provider failed
+            // and the review was interrupted; never invoke the provider then.
+            throwIfAborted(signal);
             if (!contextLoaded) {
               const messages = await withTimeout(ctx.session.context({ sessionID: event.sessionID }, { signal }), 3_000, signal);
+              throwIfAborted(signal);
               const context = extractReviewContext(messages);
               request.transcript = context.transcript;
               contextComplete = context.complete;
@@ -108,6 +117,7 @@ export default Plugin.define({
               errorKind ??= "context";
               return { decision: "ask", reason: contextReason, errorKind: "context" };
             }
+            throwIfAborted(signal);
             const policy = defaultPolicy(stage.policy);
             const attemptStartedAt = Date.now();
             let outcome: StageResult;
@@ -160,11 +170,12 @@ export default Plugin.define({
       let decision = result.decision;
       let reason = result.reason;
       // A cancelled review may resolve from a provider that ignored the abort,
-      // but it must never approve or deny: only the user can decide now.
+      // but it must never approve or deny: only the user can decide now. A
+      // cancellation is the termination cause even if a provider failed first.
       if (controller.signal.aborted && !expired) {
         decision = "ask";
         reason = "Auto-mode review was interrupted; please decide yourself";
-        errorKind ??= "cancelled";
+        errorKind = "cancelled";
       }
       event.effect = decision;
       event.message = decision === "deny" ? withDenySuffix(reason) : reason;
@@ -215,13 +226,20 @@ interface ReviewerContext {
   generate: { text(input: { prompt: string; model?: ReviewerModelRef | null }, request?: { signal?: AbortSignal }): Promise<{ text: string }> };
 }
 
+function throwIfAborted(signal: AbortSignal): void {
+  if (signal.aborted) throw new ReviewFailure("cancelled", "Review cancelled");
+}
+
 async function llmDecision(ctx: ReviewerContext, request: PermissionRequest, policy: ReturnType<typeof defaultPolicy>, signal: AbortSignal, model?: string, sessionModel?: ReviewerModelRef): Promise<StageResult> {
   const ref = model ? parseReviewerModel(model) : sessionModel;
   if (!ref) return { decision: "abstain", reason: "Session model is unavailable; configure a reviewer model" };
   const prompt = buildStage1Prompt(request, policy);
   if (Buffer.byteLength(prompt) > 65_536) return { decision: "ask", reason: "Request too large for automatic review" };
+  throwIfAborted(signal);
   const triage = await withTimeout(ctx.generate.text({ prompt, model: ref }, { signal }), 30_000, signal);
   if (parseStage1(triage.text) === "allow") return { decision: "allow", reason: "LLM triage approved" };
+  // The triage call may settle after an interruption; do not start stage two.
+  throwIfAborted(signal);
   const response = await withTimeout(ctx.generate.text({ prompt: buildStage2Prompt(request, policy), model: ref }, { signal }), 30_000, signal);
   const decision = parseDecision(response.text);
   return decision.reason === UNCLEAR_RESPONSE ? { ...decision, errorKind: "invalid-output" } : decision;

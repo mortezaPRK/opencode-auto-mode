@@ -261,7 +261,7 @@ describe("OpenCode permission hook", () => {
       assert.match(pending.message!, /interrupted/i);
     }
   });
-  it("reviews nothing further with an already-aborted fallback signal", async () => {
+  it("stops before starting a fallback provider with an already-aborted signal", async () => {
     const host = await setup({ classifiers: [{ type: "llm" }, { type: "llm" }], reviewTimeoutMs: 5_000 });
     const signals: AbortSignal[] = [];
     host.ctx.generate.text = ((_input: { prompt: string }, request?: { signal?: AbortSignal }) => {
@@ -277,8 +277,8 @@ describe("OpenCode permission hook", () => {
     assert.equal(pending.effect, "ask");
     assert.match(pending.message!, /interrupted/i);
     assert.ok(Date.now() - startedAt < 2_000, "an aborted fallback must not wait for its own timeout");
-    assert.equal(signals.length, 2);
-    assert.equal(signals[1]!.aborted, true);
+    assert.equal(signals.length, 1, "the fallback provider must never start after cancellation");
+    assert.equal(signals[0]!.aborted, true);
     await host.cleanup();
   });
   it("turns an interrupted denial into a user decision", async () => {
@@ -296,6 +296,51 @@ describe("OpenCode permission hook", () => {
     assert.equal(pending.effect, "ask");
     assert.match(pending.message!, /interrupted/i);
     await host.cleanup();
+  });
+  it("does not load context or start a reviewer after an interrupted session lookup", async () => {
+    const host = await setup({ classifiers: [{ type: "llm" }] });
+    let release!: () => void;
+    let contextCalls = 0;
+    let generateCalls = 0;
+    host.ctx.session.get = () => new Promise((resolve) => {
+      release = () => resolve({ location: { directory: "/repo" }, model: { providerID: "session-provider", id: "session-model", variant: "high" } });
+    });
+    host.ctx.session.context = async () => { contextCalls++; return [{ type: "user", text: "Create a file named a" }]; };
+    host.ctx.generate.text = async () => { generateCalls++; return { text: "ALLOW" }; };
+    const pending = event();
+    const evaluation = host.evaluate(pending);
+    await waitFor(() => release !== undefined);
+    host.interrupt();
+    await evaluation;
+    release();
+    assert.equal(pending.effect, "ask");
+    assert.match(pending.message!, /interrupted/i);
+    assert.equal(contextCalls, 0);
+    assert.equal(generateCalls, 0);
+    await host.cleanup();
+  });
+  it("reports cancellation over an earlier provider failure", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "automode-cancelled-"));
+    try {
+      const file = join(directory, "audit.jsonl");
+      const host = await setup({ classifiers: [{ type: "llm" }, { type: "llm" }], auditLog: file });
+      let calls = 0;
+      host.ctx.generate.text = () => {
+        calls++;
+        return calls === 1 ? Promise.reject(new Error("provider rejected")) : new Promise(() => {});
+      };
+      const pending = event();
+      const evaluation = host.evaluate(pending);
+      await waitFor(() => calls === 2);
+      host.interrupt();
+      await evaluation;
+      assert.equal(pending.effect, "ask");
+      assert.match(pending.message!, /interrupted/i);
+      const record = lastRecord(file);
+      assert.equal(record.error, true);
+      assert.equal(record.errorKind, "cancelled");
+      await host.cleanup();
+    } finally { rmSync(directory, { recursive: true, force: true }); }
   });
   it("reports incomplete authorization context as a terminal error", async () => {
     const directory = mkdtempSync(join(tmpdir(), "automode-context-"));
