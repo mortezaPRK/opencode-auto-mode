@@ -15,6 +15,36 @@ describe("status tracker", () => {
     assert.deepEqual(snapshot.reviewing, []);
     assert.equal(snapshot.recent[0].decision, "deny");
   });
+  it("keeps overlapping reviews in one session until each finishes", () => {
+    const status = createStatusTracker();
+    status.start("session-a", "review-1", 1000);
+    status.start("session-a", "review-2", 1002);
+    status.start("session-b", "review-3", 1004);
+    assert.deepEqual(
+      status.snapshot({ ...base, sessionID: "session-a" }).reviewing.map((entry) => entry.reviewID),
+      ["review-1", "review-2"],
+    );
+    status.finish({ reviewID: "review-1", sessionID: "session-a", action: "shell", decision: "allow",
+      stage: "static", reason: "safe", durationMs: 2, at: 1002 });
+    assert.deepEqual(
+      status.snapshot({ ...base, sessionID: "session-a" }).reviewing.map((entry) => entry.reviewID),
+      ["review-2"],
+    );
+    assert.deepEqual(
+      status.snapshot({ ...base, sessionID: "session-b" }).reviewing.map((entry) => entry.reviewID),
+      ["review-3"],
+    );
+    status.finish({ reviewID: "review-2", sessionID: "session-a", action: "shell", decision: "deny",
+      stage: "static", reason: "unsafe", durationMs: 2, at: 1004 });
+    assert.deepEqual(status.snapshot({ ...base, sessionID: "session-a" }).reviewing, []);
+  });
+  it("bounds pending reviews", () => {
+    const status = createStatusTracker();
+    for (let index = 0; index < 300; index++) status.start("session-a", `review-${index}`, index);
+    const pending = status.snapshot(base).reviewing;
+    assert.equal(pending.length, 256);
+    assert.equal(pending.at(-1)!.reviewID, "review-299");
+  });
   it("keeps sessions and entries apart and bounded", () => {
     const status = createStatusTracker();
     status.start("session-a", "review-a", 1000);

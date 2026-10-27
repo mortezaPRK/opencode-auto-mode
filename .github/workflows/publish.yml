@@ -38,6 +38,8 @@ jobs:
       - run: npm exec --yes --package=bun@1.4.3 -- bun test
       - run: npm run lint
       - run: npm run typecheck
+      - name: Build GUI bundle
+        run: npm run build:gui
       - name: Bump version
         id: version
         env:
@@ -45,7 +47,10 @@ jobs:
         run: |
           TAG=$(npm version "$BUMP" --no-git-tag-version --ignore-scripts)
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-      - run: npm pack --dry-run --ignore-scripts
+      - name: Verify the GUI bundle is packaged
+        run: |
+          npm pack --ignore-scripts --pack-destination "$RUNNER_TEMP"
+          tar -tzf "$RUNNER_TEMP"/*.tgz | grep -qx 'package/dist/gui-experimental.cjs'
       - name: Commit and tag
         env:
           TAG: ${{ steps.version.outputs.tag }}

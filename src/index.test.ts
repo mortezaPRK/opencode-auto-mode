@@ -16,23 +16,25 @@ async function setup(options: unknown = {}, messages: unknown[] = [{ type: "user
   const prompts: string[] = [];
   const models: ({ id: string; providerID: string; variant?: string } | null | undefined)[] = [];
   const interrupts: { data: { sessionID: string } }[] = [];
-  const subscriptionSignals: AbortSignal[] = [];
+  const subscriptions: AbortSignal[] = [];
   let wake: (() => void) | undefined;
   let rpcHandlers: Record<string, (input: unknown) => Promise<unknown>> = {};
   const rpcEvents: unknown[] = [];
-  async function* subscribe(input: { signal?: AbortSignal }) {
-    if (input.signal !== undefined) subscriptionSignals.push(input.signal);
-    while (!input.signal?.aborted) {
-      if (!interrupts.length) {
-        await new Promise<void>((resolve) => {
-          wake = resolve;
-          input.signal?.addEventListener("abort", () => resolve(), { once: true });
-        });
-        continue;
+  function subscribe(input: { signal?: AbortSignal }) {
+    if (input.signal !== undefined) subscriptions.push(input.signal);
+    return (async function* () {
+      while (!input.signal?.aborted) {
+        if (!interrupts.length) {
+          await new Promise<void>((resolve) => {
+            wake = resolve;
+            input.signal?.addEventListener("abort", () => resolve(), { once: true });
+          });
+          continue;
+        }
+        const next = interrupts.shift();
+        if (next !== undefined) yield next;
       }
-      const next = interrupts.shift();
-      if (next !== undefined) yield next;
-    }
+    })();
   }
   const ctx = {
     options,
@@ -51,7 +53,7 @@ async function setup(options: unknown = {}, messages: unknown[] = [{ type: "user
   const cleanup = await plugin.setup(ctx as unknown as Parameters<typeof plugin.setup>[0]);
   return {
     evaluate: (evaluation: Evaluation) => evaluate(evaluation),
-    prompts, models, ctx, disposed: () => disposed, subscriptionSignals, rpcEvents,
+    prompts, models, ctx, disposed: () => disposed, rpcEvents, subscriptions,
     status: async (input: unknown = {}) => rpcHandlers.status!(input),
     interrupt: (sessionID = "session-test") => { interrupts.push({ data: { sessionID } }); wake?.(); },
     cleanup: async () => { await cleanup?.(); },
@@ -684,8 +686,8 @@ describe("OpenCode permission hook", () => {
     const host = await setup({ classifiers: [{ type: "static" }] });
     host.ctx.permission.hook = async () => { throw new Error("permission registration failed"); };
     await assert.rejects(Promise.resolve(plugin.setup(host.ctx as unknown as Parameters<typeof plugin.setup>[0])));
-    assert.equal(host.subscriptionSignals.length, 2);
-    assert.equal(host.subscriptionSignals[1]!.aborted, true);
+    assert.equal(host.subscriptions.length, 2);
+    assert.equal(host.subscriptions[1]!.aborted, true);
     await host.cleanup();
   });
   it("aborts the subscription and active reviews when tool hook registration fails", async () => {
@@ -699,7 +701,7 @@ describe("OpenCode permission hook", () => {
     }) as typeof host.ctx.tool.hook;
     const setupRun = plugin.setup(host.ctx as unknown as Parameters<typeof plugin.setup>[0]);
     await toolRegistration;
-    assert.equal(host.subscriptionSignals.length, 2);
+    assert.equal(host.subscriptions.length, 2);
     let providerSignal: AbortSignal | undefined;
     host.ctx.generate.text = ((_input: { prompt: string }, request?: { signal?: AbortSignal }) => {
       providerSignal = request?.signal;
@@ -710,7 +712,7 @@ describe("OpenCode permission hook", () => {
     await waitFor(() => providerSignal !== undefined);
     rejectTool(new Error("tool registration failed"));
     await assert.rejects(Promise.resolve(setupRun));
-    assert.equal(host.subscriptionSignals[1]!.aborted, true);
+    assert.equal(host.subscriptions[1]!.aborted, true);
     await waitFor(() => providerSignal!.aborted);
     await reviewRun;
     assert.equal(pending.effect, "ask");
@@ -738,14 +740,26 @@ describe("OpenCode permission hook", () => {
     assert.match(snapshot.configError!, /classifiers/i);
     await host.cleanup();
   });
-  it("keeps repeated policy denials denied and disposes partial setup", async () => {    const host = await setup({ classifiers: [{ type: "static" }] });
+  it("keeps repeated policy denials denied and disposes partial setup", async () => {
+    const host = await setup({ classifiers: [{ type: "static" }] });
     for (let i = 0; i < 25; i++) {
       const pending = { ...event(), resources: ["sudo rm -rf /"] };
       await host.evaluate(pending); assert.equal(pending.effect, "deny");
     }
     await host.cleanup();
     host.ctx.tool.hook = async () => { throw new Error("setup failed"); };
-    await assert.rejects(Promise.resolve(plugin.setup(host.ctx as unknown as Parameters<typeof plugin.setup>[0])));
+    await assert.rejects(Promise.resolve(plugin.setup(host.ctx as unknown as Parameters<typeof plugin.setup>[0])), /setup failed/);
+    // The failed attempt registered the RPC and followed events before the tool
+    // hook failed; disposing the permission hook must not leave either behind.
+    assert.equal(host.disposed(), 5);
+    assert.equal(host.subscriptions[1]?.aborted, true);
+  });
+  it("disposes the RPC and event stream when the permission hook fails", async () => {
+    const host = await setup({ classifiers: [{ type: "static" }] });
+    await host.cleanup();
+    host.ctx.permission.hook = async () => { throw new Error("permission setup failed"); };
+    await assert.rejects(Promise.resolve(plugin.setup(host.ctx as unknown as Parameters<typeof plugin.setup>[0])), /permission setup failed/);
     assert.equal(host.disposed(), 4);
+    assert.equal(host.subscriptions[1]?.aborted, true);
   });
 });

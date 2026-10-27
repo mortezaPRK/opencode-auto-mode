@@ -1,7 +1,8 @@
 /** @jsxImportSource solid-js */
 import { createSignal, For } from "solid-js";
 import { Command, ComposerPill, Panel, Plugin, createKeyed, type PanelTab } from "@opencode/plugin/gui";
-import { AutoMode, type AutoModeDecision, type AutoModeStatus } from "./rpc.js";
+import { AutoMode, type AutoModeStatus } from "./rpc.js";
+import { createStatusLoader, latest, pillLabel } from "./gui-state.js";
 
 const POLL_MS = 3_000;
 const NOTICE_MS = 30_000;
@@ -11,19 +12,6 @@ const TONE: Record<string, "success" | "warning" | "danger" | undefined> = {
   ask: "warning",
   deny: "danger",
 };
-
-function latest(status: AutoModeStatus | undefined): AutoModeDecision | undefined {
-  return status?.recent.at(-1);
-}
-
-function pillLabel(status: AutoModeStatus | undefined): string | undefined {
-  if (status === undefined) return undefined;
-  if (status.reviewing.length > 0) return "auto-mode reviewing…";
-  const last = latest(status);
-  if (last === undefined) return undefined;
-  if (last.errorKind !== undefined) return `auto-mode ${last.decision}: ${last.errorKind}`;
-  return `auto-mode ${last.decision}`;
-}
 
 export default Plugin.define({
   i18n: {
@@ -38,23 +26,15 @@ export default Plugin.define({
   },
   setup(ctx) {
     const [status, setStatus] = createSignal<AutoModeStatus | undefined>(undefined);
-    let loaded = false;
+    const refresh = createStatusLoader(
+      (sessionID) => ctx.client.rpc(AutoMode).status({ sessionID }) as Promise<AutoModeStatus | undefined>,
+      setStatus,
+    );
 
-    const refresh = async () => {
-      const session = ctx.sessions.current();
-      if (!session) return;
-      try {
-        const client = ctx.client.rpc(AutoMode);
-        setStatus((await client.status({ sessionID: session.id })) as AutoModeStatus | undefined);
-        loaded = true;
-      } catch {
-        // The server may be restarting; keep the last snapshot rather than flashing.
-        if (!loaded) setStatus(undefined);
-      }
-    };
-
-    createKeyed(() => ctx.sessions.current()?.id, () => { void refresh(); });
-    const timer = setInterval(() => { void refresh(); }, POLL_MS);
+    createKeyed(() => ctx.sessions.current()?.id, (sessionID) => { void refresh(sessionID); }, {
+      otherwise: () => { void refresh(undefined); },
+    });
+    const timer = setInterval(() => { void refresh(ctx.sessions.current()?.id); }, POLL_MS);
 
     const tab: PanelTab = {
       id: "decisions",

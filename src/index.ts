@@ -86,13 +86,15 @@ export default Plugin.define({
       })();
     }
 
-    // A failed hook registration must not leave the event reader or reviews alive.
-    const abandonSetup = () => {
+    // A failed hook registration must not leave the event reader, active
+    // reviews, or the status RPC alive.
+    const abandonSetup = async () => {
       subscriptions.abort();
       for (const controllers of running.values()) {
         for (const controller of controllers) controller.abort();
       }
       running.clear();
+      await rpc?.dispose().catch(() => {});
     };
 
     const permissionRegistration = await ctx.permission.hook("evaluate", async (event) => {
@@ -291,8 +293,8 @@ export default Plugin.define({
       };
       if (tracked.errorKind !== undefined) payload.errorKind = tracked.errorKind;
       try { await rpc?.events.emit("decision", payload); } catch { /* status delivery is best effort */ }
-    }).catch((error) => {
-      abandonSetup();
+    }).catch(async (error) => {
+      await abandonSetup();
       throw error;
     });
     const toolRegistration = await ctx.tool.hook("execute.after", (event) => {
@@ -303,17 +305,16 @@ export default Plugin.define({
           result.content = withInjectionWarning(result.content as string | ReadonlyArray<{ type: string; text?: string }>);
       } catch { log.log("Output screening failed"); }
     }).catch(async (error) => {
-      abandonSetup();
-      await permissionRegistration.dispose();
+      await permissionRegistration.dispose().catch(() => {});
+      await abandonSetup();
       throw error;
     });
     log.log("Auto-mode loaded");
     return async () => {
-      abandonSetup();
+      await abandonSetup();
       try { await permissionRegistration.dispose(); }
       finally {
         await toolRegistration.dispose();
-        await rpc?.dispose().catch(() => {});
         counts.clear();
         log.log("Auto-mode unloaded");
       }

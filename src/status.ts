@@ -2,7 +2,7 @@ import type { AutoModeDecision, AutoModeStatus } from "./rpc.js";
 
 const MAX_RECENT = 100;
 const MAX_REASON_CHARS = 200;
-const MAX_SESSIONS = 256;
+const MAX_REVIEWING = 256;
 
 function clip(value: string, max = MAX_REASON_CHARS): string {
   return value.length > max ? `${value.slice(0, max - 1)}…` : value;
@@ -21,19 +21,21 @@ export interface StatusTracker {
  * limit; durable history stays in the audit log.
  */
 export function createStatusTracker(): StatusTracker {
-  const reviewing = new Map<string, { reviewID: string; startedAt: number }>();
+  // Keyed by review rather than session: a session can ask about several
+  // actions at once, and finishing one must not hide the others.
+  const reviewing = new Map<string, { sessionID: string; startedAt: number }>();
   let recent: AutoModeDecision[] = [];
 
   return {
     start(sessionID, reviewID, at) {
-      if (reviewing.size >= MAX_SESSIONS && !reviewing.has(sessionID)) {
+      if (reviewing.size >= MAX_REVIEWING && !reviewing.has(reviewID)) {
         const oldest = reviewing.keys().next().value;
         if (oldest !== undefined) reviewing.delete(oldest);
       }
-      reviewing.set(sessionID, { reviewID, startedAt: at });
+      reviewing.set(reviewID, { sessionID, startedAt: at });
     },
     finish(decision) {
-      reviewing.delete(decision.sessionID);
+      reviewing.delete(decision.reviewID);
       const entry: AutoModeDecision = { ...decision, reason: clip(decision.reason) };
       recent = [...recent, entry].slice(-MAX_RECENT);
       return entry;
@@ -45,8 +47,8 @@ export function createStatusTracker(): StatusTracker {
         classifiers: input.classifiers,
         reviewTimeoutMs: input.reviewTimeoutMs,
         reviewing: [...reviewing.entries()]
-          .filter(([sessionID]) => input.sessionID === undefined || sessionID === input.sessionID)
-          .map(([sessionID, entry]) => ({ sessionID, reviewID: entry.reviewID, startedAt: entry.startedAt })),
+          .filter(([, entry]) => input.sessionID === undefined || entry.sessionID === input.sessionID)
+          .map(([reviewID, entry]) => ({ sessionID: entry.sessionID, reviewID, startedAt: entry.startedAt })),
         recent: input.sessionID === undefined ? recent.slice(-20) : recent.filter((entry) => entry.sessionID === input.sessionID).slice(-20),
       };
     },

@@ -1,0 +1,154 @@
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
+import { createStatusGuard, createStatusLoader, pillLabel } from "./gui-state.js";
+import type { AutoModeDecision, AutoModeStatus } from "./rpc.js";
+
+function decision(name: string, overrides: Partial<AutoModeDecision> = {}): AutoModeDecision {
+  return {
+    reviewID: `review-${name}`, sessionID: "a", action: "shell", decision: name,
+    stage: "static", reason: "because", durationMs: 1, at: 1, ...overrides,
+  };
+}
+
+function status(overrides: Partial<AutoModeStatus> = {}): AutoModeStatus {
+  return { enabled: true, classifiers: [], reviewTimeoutMs: 60_000, reviewing: [], recent: [], ...overrides };
+}
+
+interface Deferred<T> {
+  readonly promise: Promise<T>;
+  resolve(value: T): void;
+  reject(error: unknown): void;
+}
+
+function deferred<T>(): Deferred<T> {
+  let resolve!: (value: T) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((settle, fail) => { resolve = settle; reject = fail; });
+  return { promise, resolve, reject };
+}
+
+/** Decisions applied to the panel, with `"cleared"` standing for an undefined snapshot. */
+function shown(applied: (AutoModeStatus | undefined)[]): string[] {
+  return applied.map((snapshot) => snapshot?.recent.at(-1)?.decision ?? "cleared");
+}
+
+describe("status guard", () => {
+  it("tracks selection changes and ignores requests for other sessions", () => {
+    const guard = createStatusGuard();
+    assert.equal(guard.select(undefined), false);
+    assert.equal(guard.select("a"), true);
+    assert.equal(guard.select("a"), false);
+    assert.equal(guard.begin("b"), undefined);
+    const request = guard.begin("a");
+    assert.notEqual(request, undefined);
+    assert.equal(guard.accept(request!), true);
+    assert.equal(guard.select("b"), true);
+    assert.equal(guard.accept(request!), false);
+    assert.equal(guard.begin("a"), undefined);
+  });
+  it("ignores a session that is routed away and back", () => {
+    const guard = createStatusGuard();
+    guard.select("a");
+    const request = guard.begin("a");
+    guard.select("b");
+    guard.select("a");
+    assert.equal(guard.accept(request!), false);
+  });
+});
+
+describe("status loader", () => {
+  it("drops a response for a session the user routed away from", async () => {
+    const requests = new Map<string, Deferred<AutoModeStatus | undefined>>();
+    const applied: (AutoModeStatus | undefined)[] = [];
+    const refresh = createStatusLoader((sessionID) => {
+      const request = deferred<AutoModeStatus | undefined>();
+      requests.set(sessionID, request);
+      return request.promise;
+    }, (next) => applied.push(next));
+
+    const first = refresh("a");
+    const second = refresh("b");
+    requests.get("b")!.resolve(status({ recent: [decision("deny")] }));
+    await second;
+    // The abandoned request settles last and must not overwrite B.
+    requests.get("a")!.resolve(status({ recent: [decision("allow")] }));
+    await first;
+
+    assert.deepEqual(shown(applied), ["cleared", "cleared", "deny"]);
+  });
+  it("drops an older poll that settles after a newer one", async () => {
+    const requests: Deferred<AutoModeStatus | undefined>[] = [];
+    const applied: (AutoModeStatus | undefined)[] = [];
+    const refresh = createStatusLoader(() => {
+      const request = deferred<AutoModeStatus | undefined>();
+      requests.push(request);
+      return request.promise;
+    }, (next) => applied.push(next));
+
+    const first = refresh("a");
+    const second = refresh("a");
+    requests[1]!.resolve(status({ recent: [decision("deny")] }));
+    await second;
+    requests[0]!.resolve(status({ recent: [decision("allow")] }));
+    await first;
+
+    assert.deepEqual(shown(applied), ["cleared", "deny"]);
+  });
+  it("clears the previous session before the next request fails", async () => {
+    const requests: Deferred<AutoModeStatus | undefined>[] = [];
+    const applied: (AutoModeStatus | undefined)[] = [];
+    const refresh = createStatusLoader(() => {
+      const request = deferred<AutoModeStatus | undefined>();
+      requests.push(request);
+      return request.promise;
+    }, (next) => applied.push(next));
+
+    const first = refresh("a");
+    requests[0]!.resolve(status({ recent: [decision("allow")] }));
+    await first;
+    const second = refresh("b");
+    assert.equal(applied.at(-1), undefined);
+    requests[1]!.reject(new Error("server restarting"));
+    await second;
+
+    assert.deepEqual(shown(applied), ["cleared", "allow", "cleared"]);
+  });
+  it("keeps the snapshot when a request for the same session fails", async () => {
+    const requests: Deferred<AutoModeStatus | undefined>[] = [];
+    const applied: (AutoModeStatus | undefined)[] = [];
+    const refresh = createStatusLoader(() => {
+      const request = deferred<AutoModeStatus | undefined>();
+      requests.push(request);
+      return request.promise;
+    }, (next) => applied.push(next));
+
+    const first = refresh("a");
+    requests[0]!.resolve(status({ recent: [decision("allow")] }));
+    await first;
+    const second = refresh("a");
+    requests[1]!.reject(new Error("server restarting"));
+    await second;
+
+    assert.deepEqual(shown(applied), ["cleared", "allow"]);
+  });
+  it("clears the snapshot when no session is routed", async () => {
+    const applied: (AutoModeStatus | undefined)[] = [];
+    const refresh = createStatusLoader(async () => status({ recent: [decision("allow")] }), (next) => applied.push(next));
+
+    await refresh("a");
+    await refresh(undefined);
+
+    assert.deepEqual(shown(applied), ["cleared", "allow", "cleared"]);
+  });
+});
+
+describe("status pill", () => {
+  it("labels the pill from the latest decision", () => {
+    assert.equal(pillLabel(undefined), undefined);
+    assert.equal(pillLabel(status()), undefined);
+    assert.equal(pillLabel(status({ reviewing: [{ sessionID: "a", reviewID: "review-1", startedAt: 1 }] })),
+      "auto-mode reviewing…");
+    assert.equal(pillLabel(status({ recent: [decision("deny")] })), "auto-mode deny");
+    assert.equal(pillLabel(status({ recent: [decision("deny", { errorKind: "provider" })] })), "auto-mode deny: provider");
+  });
+});
