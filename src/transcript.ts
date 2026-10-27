@@ -100,7 +100,8 @@ function clipEscaped(value: string, maxBytes: number): string {
   return `${prefixByEscapedBytes(characters, headBudget)}${marker}${suffixByEscapedBytes(characters, budget - headBudget)}`;
 }
 
-function clipChars(value: string, max: number): string {
+/** Clips text to `max` code points, keeping both ends for review evidence. */
+export function clipChars(value: string, max: number): string {
   const characters = Array.from(value);
   // Compare code points, not UTF-16 units, so astral characters cannot make
   // this return a longer string than it received.
