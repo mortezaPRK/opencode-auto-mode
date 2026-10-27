@@ -87,6 +87,25 @@ describe("review context completeness", () => {
     assert.match(context.transcript, /TAIL_CONSTRAINT/);
     assert.match(context.transcript, /some tool details truncated/);
   });
+  it("keeps both ends of a long tool input with non-BMP characters", () => {
+    const payload = `HEAD_MARKER${"😀".repeat(900)}TAIL_CONSTRAINT`;
+    const context = extractReviewContext([
+      { type: "user", text: "write the file" },
+      { type: "assistant", content: [{ type: "tool", name: "write", state: { input: { content: payload } } }] },
+    ]);
+    assert.equal(context.complete, true);
+    assert.match(context.transcript, /HEAD_MARKER/);
+    assert.match(context.transcript, /TAIL_CONSTRAINT/);
+    assert.match(context.transcript, /some tool details truncated/);
+    assert.ok(Buffer.byteLength(context.transcript) <= 12_000);
+  });
+  it("only clips and flags user text when the code point count exceeds the limit", () => {
+    const text = "😀".repeat(300);
+    const context = extractReviewContext([{ type: "user", text }]);
+    assert.equal(context.complete, true);
+    assert.ok(context.transcript.includes(text));
+    assert.doesNotMatch(context.transcript, /latest user message truncated/);
+  });
   it("keeps the latest user restriction when tool history exceeds the budget", () => {
     const context = extractReviewContext([
       { type: "user", text: "Please make the changes" },

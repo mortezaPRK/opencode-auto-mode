@@ -1,7 +1,7 @@
 const MAX_USERS = 10;
 const MAX_TOOLS = 20;
 const MAX_USER_CHARS = 8_000;
-const MAX_ENTRY_CHARS = 500;
+const MAX_ENTRY_BYTES = 500;
 const MAX_TRANSCRIPT_BYTES = 12_000;
 
 interface ToolEntry {
@@ -12,10 +12,6 @@ interface ToolEntry {
 interface Entry {
   role: "user" | "tool";
   text: string;
-}
-
-function truncate(value: string, max: number): string {
-  return value.length > max ? `${value.slice(0, max - 1)}…` : value;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -57,9 +53,10 @@ function formatTool(tool: ToolEntry): { text: string; truncated: boolean } {
     const raw = typeof input === "string" ? input : JSON.stringify(input);
     if (raw) {
       // Keep the tail as well as the head: written payloads and patches often
-      // carry their constraints at the end.
-      truncated = raw.length > MAX_ENTRY_CHARS;
-      detail = truncate(clipChars(raw, MAX_ENTRY_CHARS), MAX_ENTRY_CHARS);
+      // carry their constraints at the end. Clip once, on escaped bytes, so a
+      // later UTF-16 length check cannot cut the preserved tail back off.
+      detail = clipEscaped(raw, MAX_ENTRY_BYTES);
+      truncated = detail !== raw;
     }
   } catch {
     detail = "";
@@ -104,8 +101,10 @@ function clipEscaped(value: string, maxBytes: number): string {
 }
 
 function clipChars(value: string, max: number): string {
-  if (value.length <= max) return value;
   const characters = Array.from(value);
+  // Compare code points, not UTF-16 units, so astral characters cannot make
+  // this return a longer string than it received.
+  if (characters.length <= max) return value;
   const head = Math.floor(max * 0.6);
   return `${characters.slice(0, head).join("")}…${characters.slice(characters.length - (max - head)).join("")}`;
 }

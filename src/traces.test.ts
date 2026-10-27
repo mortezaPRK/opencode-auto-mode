@@ -31,6 +31,23 @@ describe("review traces", () => {
       assert.equal(spans[0].attributes.find((x: { key: string }) => x.key === "error.kind").value.stringValue, "timeout");
     } finally { globalThis.fetch = original; }
   });
+  it("bounds root-span attributes with the shared record sanitizer", () => {
+    const original = globalThis.fetch;
+    let payload = "";
+    globalThis.fetch = (async (_url, init) => { payload = String(init?.body); return new Response(); }) as typeof fetch;
+    try {
+      const trace = createTraceExporter(true, { OPENCODE_OTLP_ENDPOINT: "http://collector:4318" })!.begin(1000);
+      trace.finish({ ...record, action: "a".repeat(500), agent: "b".repeat(500), stage: "c".repeat(500),
+        errorKind: "ATTACKER_CONTROLLED" as never });
+      const root = JSON.parse(payload).resourceSpans[0].scopeSpans[0].spans[0];
+      const attributes = Object.fromEntries(root.attributes.map((entry: { key: string; value: { stringValue?: string } }) =>
+        [entry.key, entry.value.stringValue]));
+      assert.ok(attributes.action.length <= 128);
+      assert.ok(attributes.agent.length <= 128);
+      assert.ok(attributes.stage.length <= 64);
+      assert.equal(attributes["error.kind"], "provider");
+    } finally { globalThis.fetch = original; }
+  });
   it("exports a root and fallback children with correlated log IDs", () => {
     const original = globalThis.fetch;
     let payload = "";
