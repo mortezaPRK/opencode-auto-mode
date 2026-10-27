@@ -136,7 +136,8 @@ function providerRoute(type: string): string {
 function callName(type: string): string {
   return type === "llm" ? "llm:triage" : providerRoute(type);
 }
-async function fixture(options: AutoModeOptions, permissions: unknown[] = [{ action: "*", resource: "*", effect: "ask" }]) {
+async function fixture(options: AutoModeOptions, permissions: unknown[] = [{ action: "*", resource: "*", effect: "ask" }],
+  prompt = "Create sample.txt in this project; do not change permissions or affect other directories.") {
   const directory = join(root, `case-${++caseCount}`); mkdirSync(directory);
   writeFileSync(join(directory, "opencode.json"), JSON.stringify({
     permissions,
@@ -151,7 +152,7 @@ async function fixture(options: AutoModeOptions, permissions: unknown[] = [{ act
   const agents = (await api(`/api/agent${query}`)).data;
   for (const id of ["build", "plan"]) assert.ok(agents.some((agent: { id: string; mode: string }) => agent.id === id && agent.mode === "primary"), `missing ${id}`);
   const session = (await api("/api/session", { agent: "build", title: "Local integration test", location: { directory }, model: { id: "reviewer", providerID: "local" } })).data;
-  await api(`/api/session/${session.id}/prompt`, { text: "Create sample.txt in this project; do not change permissions or affect other directories." });
+  await api(`/api/session/${session.id}/prompt`, { text: prompt });
   await api(`/api/experimental/session/${session.id}/wait`, {});
   const context = (await api(`/api/session/${session.id}/context`)).data;
   assert.ok(context.some((entry: { type: string }) => entry.type === "user"));
@@ -261,6 +262,13 @@ try {
       await expectPermission(f, "allow", [resource]);
       assert.deepEqual(calls, ["llm:triage"]);
     }
+  });
+  await run("long worker prompt reaches the LLM reviewer", async () => {
+    const longPrompt = `Act as a delegated worker. ${"Use the authorization in this task. ".repeat(40)}Create sample.txt.`;
+    const f = await fixture({ classifiers: [stage("llm")] }, undefined, longPrompt);
+    calls.length = 0;
+    await expectPermission(f, "allow");
+    assert.deepEqual(calls, ["llm:triage"]);
   });
   await run("audit log and OTLP export", async () => {
     const received: unknown[] = [];
