@@ -48,6 +48,17 @@ async function setup(options: unknown = {}, messages: unknown[] = [{ type: "user
 function event(effect: Evaluation["effect"] = "ask"): Evaluation {
   return { sessionID: "session-test", agent: "build", action: "shell", resources: ["touch a"], effect };
 }
+const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+async function waitFor(predicate: () => boolean, timeoutMs = 1_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error("timed out waiting for test condition");
+    await delay(5);
+  }
+}
+function lastRecord(file: string): Record<string, unknown> {
+  return JSON.parse(readFileSync(file, "utf8").trim().split("\n").at(-1)!);
+}
 
 describe("OpenCode permission hook", () => {
   it("only reviews actions that OpenCode asks about", async () => {
@@ -203,6 +214,131 @@ describe("OpenCode permission hook", () => {
       assert.equal(record.error, true);
       assert.equal(record.errorKind, "provider");
       assert.doesNotMatch(JSON.stringify(record), /provider key rejected/);
+      await host.cleanup();
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+  it("aborts every overlapping review when the session is interrupted", async () => {
+    const host = await setup({ classifiers: [{ type: "llm" }] });
+    const resolvers: ((value: { text: string }) => void)[] = [];
+    const signals: AbortSignal[] = [];
+    host.ctx.generate.text = ((_input: { prompt: string }, request?: { signal?: AbortSignal }) => {
+      signals.push(request!.signal!);
+      return new Promise((resolve) => { resolvers.push(resolve); });
+    }) as typeof host.ctx.generate.text;
+    const first = event();
+    const second = event();
+    const firstRun = host.evaluate(first);
+    const secondRun = host.evaluate(second);
+    await waitFor(() => signals.length === 2);
+    host.interrupt();
+    await waitFor(() => signals.every((signal) => signal.aborted));
+    for (const resolve of resolvers) resolve({ text: "ALLOW" });
+    await Promise.all([firstRun, secondRun]);
+    for (const pending of [first, second]) {
+      assert.equal(pending.effect, "ask");
+      assert.match(pending.message!, /interrupted/i);
+    }
+    await host.cleanup();
+  });
+  it("aborts every overlapping review when the plugin unloads", async () => {
+    const host = await setup({ classifiers: [{ type: "llm" }] });
+    const resolvers: ((value: { text: string }) => void)[] = [];
+    const signals: AbortSignal[] = [];
+    host.ctx.generate.text = ((_input: { prompt: string }, request?: { signal?: AbortSignal }) => {
+      signals.push(request!.signal!);
+      return new Promise((resolve) => { resolvers.push(resolve); });
+    }) as typeof host.ctx.generate.text;
+    const first = event();
+    const second = event();
+    const runs = [host.evaluate(first), host.evaluate(second)];
+    await waitFor(() => signals.length === 2);
+    await host.cleanup();
+    await waitFor(() => signals.every((signal) => signal.aborted));
+    for (const resolve of resolvers) resolve({ text: "ALLOW" });
+    await Promise.all(runs);
+    for (const pending of [first, second]) {
+      assert.equal(pending.effect, "ask");
+      assert.match(pending.message!, /interrupted/i);
+    }
+  });
+  it("reviews nothing further with an already-aborted fallback signal", async () => {
+    const host = await setup({ classifiers: [{ type: "llm" }, { type: "llm" }], reviewTimeoutMs: 5_000 });
+    const signals: AbortSignal[] = [];
+    host.ctx.generate.text = ((_input: { prompt: string }, request?: { signal?: AbortSignal }) => {
+      signals.push(request!.signal!);
+      return new Promise<{ text: string }>(() => {});
+    }) as typeof host.ctx.generate.text;
+    const pending = event();
+    const startedAt = Date.now();
+    const evaluation = host.evaluate(pending);
+    await waitFor(() => signals.length === 1);
+    host.interrupt();
+    await evaluation;
+    assert.equal(pending.effect, "ask");
+    assert.match(pending.message!, /interrupted/i);
+    assert.ok(Date.now() - startedAt < 2_000, "an aborted fallback must not wait for its own timeout");
+    assert.equal(signals.length, 2);
+    assert.equal(signals[1]!.aborted, true);
+    await host.cleanup();
+  });
+  it("turns an interrupted denial into a user decision", async () => {
+    const host = await setup({ classifiers: [{ type: "static" }] });
+    let release!: () => void;
+    host.ctx.session.get = () => new Promise((resolve) => {
+      release = () => resolve({ location: { directory: "/repo" }, model: { providerID: "session-provider", id: "session-model", variant: "high" } });
+    });
+    const pending = { ...event(), resources: ["sudo rm -rf /"] };
+    const evaluation = host.evaluate(pending);
+    await waitFor(() => release !== undefined);
+    host.interrupt();
+    await evaluation;
+    release();
+    assert.equal(pending.effect, "ask");
+    assert.match(pending.message!, /interrupted/i);
+    await host.cleanup();
+  });
+  it("reports incomplete authorization context as a terminal error", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "automode-context-"));
+    try {
+      const file = join(directory, "audit.jsonl");
+      const host = await setup({ classifiers: [{ type: "llm" }], auditLog: file }, []);
+      const pending = event();
+      await host.evaluate(pending);
+      assert.equal(pending.effect, "ask");
+      const record = lastRecord(file);
+      assert.equal(record.decision, "ask");
+      assert.equal(record.error, true);
+      assert.equal(record.errorKind, "context");
+      await host.cleanup();
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+  it("reports the deadline rather than the cancellation it triggers", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "automode-deadline-"));
+    try {
+      const file = join(directory, "audit.jsonl");
+      const host = await setup({ classifiers: [{ type: "llm" }], reviewTimeoutMs: 1_000, auditLog: file });
+      host.ctx.generate.text = () => new Promise(() => {});
+      const pending = event();
+      await host.evaluate(pending);
+      assert.equal(pending.effect, "ask");
+      assert.match(pending.message!, /deadline/i);
+      assert.equal(lastRecord(file).errorKind, "deadline");
+      await host.cleanup();
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+  it("reports the deadline rather than an earlier provider failure", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "automode-deadline-"));
+    try {
+      const file = join(directory, "audit.jsonl");
+      const host = await setup({ classifiers: [{ type: "llm" }, { type: "llm" }], reviewTimeoutMs: 1_000, auditLog: file });
+      let calls = 0;
+      host.ctx.generate.text = () => calls++ === 0 ? Promise.reject(new Error("provider rejected")) : new Promise(() => {});
+      const pending = event();
+      await host.evaluate(pending);
+      assert.equal(pending.effect, "ask");
+      assert.match(pending.message!, /deadline/i);
+      assert.equal(calls, 2);
+      assert.equal(lastRecord(file).errorKind, "deadline");
       await host.cleanup();
     } finally { rmSync(directory, { recursive: true, force: true }); }
   });

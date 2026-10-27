@@ -37,6 +37,18 @@ describe("composite classifiers", () => {
     assert.equal(result.stage, "none");
     assert.match(result.reason, /no answer/);
   });
+  it("preserves an error category on terminal decisions", async () => {
+    const stages: ClassifierStage[] = [{ type: "decision", model: "typesafe-ai/jev-latest" }, { type: "llm" }];
+    const seen: string[] = [];
+    const result = await compositeDecision(stages, request, async (stage) => {
+      seen.push(stage.type);
+      return { decision: "ask", reason: "authorization context is unavailable", errorKind: "context" };
+    });
+    assert.equal(result.decision, "ask");
+    assert.equal(result.stage, "decision");
+    assert.equal(result.errorKind, "context");
+    assert.deepEqual(seen, ["decision"]);
+  });
   it("validates policy only on model-based classifiers", () => {
     for (const type of ["llm", "decision"] as const) {
       const model = type === "decision" ? "laya/local" : "provider/model";

@@ -37,7 +37,11 @@ export async function compositeDecision(
         abstainedKind ??= result.errorKind;
         continue;
       }
-      return { decision: result.decision, reason: result.reason, stage: result.stage ?? stage.type };
+      const terminal: ReviewResult = {
+        decision: result.decision, reason: result.reason, stage: result.stage ?? stage.type,
+        ...(result.errorKind === undefined ? {} : { errorKind: result.errorKind }),
+      };
+      return terminal;
     }
   }
   return {

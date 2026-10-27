@@ -11,7 +11,8 @@ import { decisionStage } from "./decisions.js";
 import { createAuditLog } from "./audit.js";
 import { createOtlpExporter } from "./otlp.js";
 import { createTraceExporter } from "./traces.js";
-import { errorKindOf, ReviewFailure, type ReviewErrorKind } from "./errors.js";
+import { errorKindOf, type ReviewErrorKind } from "./errors.js";
+import { withTimeout } from "./timeout.js";
 
 export type { AutoModeOptions, ClassifierStage, DecisionProvider, DecisionStage, ReviewerModel } from "./config.js";
 
@@ -33,9 +34,17 @@ export default Plugin.define({
     const sinks = [createAuditLog(options?.auditLog), createOtlpExporter(options?.otlp)].filter((sink) => sink !== undefined);
     const traces = createTraceExporter(options?.otlp);
     const counts = new Map<string, number>();
-    const running = new Map<string, AbortController>();
+    // Permission evaluations can overlap in one session; keep every active
+    // controller so an interruption aborts all of them, not only the newest.
+    const running = new Map<string, Set<AbortController>>();
     const subscriptions = new AbortController();
     let reviewCounter = 0;
+
+    const abortSession = (sessionID: string) => {
+      const controllers = running.get(sessionID);
+      if (controllers === undefined) return;
+      for (const controller of controllers) controller.abort();
+    };
 
     // Abandon work for a session as soon as the host interrupts it, so a stale
     // review cannot deliver an approval after the user stopped the turn.
@@ -47,7 +56,7 @@ export default Plugin.define({
           for await (const event of events) {
             const data = (event as { data?: { sessionID?: unknown } }).data;
             const sessionID = data?.sessionID;
-            if (sessionID !== undefined) running.get(String(sessionID))?.abort();
+            if (sessionID !== undefined) abortSession(String(sessionID));
           }
         } catch { /* the event stream is best effort */ }
       })();
@@ -66,7 +75,9 @@ export default Plugin.define({
       const trace = traces?.begin(startedAt);
       const hostEffect = event.effect;
       const controller = new AbortController();
-      running.set(event.sessionID, controller);
+      const active = running.get(event.sessionID);
+      if (active === undefined) running.set(event.sessionID, new Set([controller]));
+      else active.add(controller);
       let failure: string | undefined;
       let errorKind: ReviewErrorKind | undefined;
       let expired = false;
@@ -93,8 +104,10 @@ export default Plugin.define({
               contextReason = context.reason ?? contextReason;
               contextLoaded = true;
             }
-            if (!contextComplete)
+            if (!contextComplete) {
+              errorKind ??= "context";
               return { decision: "ask", reason: contextReason, errorKind: "context" };
+            }
             const policy = defaultPolicy(stage.policy);
             const attemptStartedAt = Date.now();
             let outcome: StageResult;
@@ -134,20 +147,22 @@ export default Plugin.define({
         result = await Promise.race([review, deadline]);
       } finally {
         if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
-        if (running.get(event.sessionID) === controller) running.delete(event.sessionID);
+        const controllers = running.get(event.sessionID);
+        if (controllers !== undefined) {
+          controllers.delete(controller);
+          if (controllers.size === 0) running.delete(event.sessionID);
+        }
       }
 
-      if (expired) errorKind ??= "deadline";
+      // The deadline terminated the review even if a provider ignored the abort
+      // and recorded a cancellation or an earlier stage failed first.
+      if (expired) errorKind = "deadline";
       let decision = result.decision;
       let reason = result.reason;
-      // A cancelled review may still resolve from a provider that ignored the
-      // abort, so never turn it into an approval.
-      if (controller.signal.aborted && decision === "allow") {
+      // A cancelled review may resolve from a provider that ignored the abort,
+      // but it must never approve or deny: only the user can decide now.
+      if (controller.signal.aborted && !expired) {
         decision = "ask";
-        reason = "Auto-mode review was interrupted; please decide yourself";
-        errorKind ??= "cancelled";
-      }
-      if (controller.signal.aborted && !expired && decision === "ask") {
         reason = "Auto-mode review was interrupted; please decide yourself";
         errorKind ??= "cancelled";
       }
@@ -186,7 +201,9 @@ export default Plugin.define({
     log.log("Auto-mode loaded");
     return async () => {
       subscriptions.abort();
-      for (const controller of running.values()) controller.abort();
+      for (const controllers of running.values()) {
+        for (const controller of controllers) controller.abort();
+      }
       running.clear();
       try { await permissionRegistration.dispose(); }
       finally { await toolRegistration.dispose(); counts.clear(); log.log("Auto-mode unloaded"); }
@@ -208,18 +225,4 @@ async function llmDecision(ctx: ReviewerContext, request: PermissionRequest, pol
   const response = await withTimeout(ctx.generate.text({ prompt: buildStage2Prompt(request, policy), model: ref }, { signal }), 30_000, signal);
   const decision = parseDecision(response.text);
   return decision.reason === UNCLEAR_RESPONSE ? { ...decision, errorKind: "invalid-output" } : decision;
-}
-
-function withTimeout<T>(promise: Promise<T>, ms: number, signal?: AbortSignal): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new ReviewFailure("timeout", "Review timed out")), ms);
-    const onAbort = () => reject(new ReviewFailure("cancelled", "Review cancelled"));
-    signal?.addEventListener("abort", onAbort, { once: true });
-    const settle = (action: () => void) => {
-      clearTimeout(timer);
-      signal?.removeEventListener("abort", onAbort);
-      action();
-    };
-    promise.then((value) => settle(() => resolve(value)), (error) => settle(() => reject(error)));
-  });
 }
