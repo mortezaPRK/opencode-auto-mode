@@ -118,8 +118,42 @@ describe("shell approval guard", () => {
     assert.equal(chain.decision, "allow");
     assert.equal(chainReviewed, 1);
   });
-  it("runs before decision and model reviewers", async () => {
-    const stages = [{ type: "decision" as const, model: "typesafe-ai/jev-latest" }, { type: "llm" as const }];
+  it("requires review when a read-only command is given write or exec flags", () => {
+    for (const command of [
+      "rg --pre 'sh -c id' x .",
+      "rg --pre-glob '*.txt' --pre ./p x .",
+      "rg -z pattern file",
+      "sort -o /tmp/out file",
+      "sort --compress-program=sh file",
+      "tree -o /tmp/out",
+      "file -C -m /tmp/magic",
+      "bat --pager='sh -c id' file",
+      "bat --config-file=./evil.toml file",
+      "hostname evil",
+      "uniq in.txt out.txt",
+    ]) assert.equal(guardShell([command]), undefined, command);
+    for (const command of ["rg -n sudo src", "sort -u file", "tree -L 2", "file package.json", "bat README.md",
+      "hostname -s", "uniq -c file"])
+      assert.equal(guardShell([command])?.decision, "allow", command);
+  });
+
+  it("does not deny commands that only mention dangerous text", () => {
+    for (const command of ["rg sudo src", "rg -n 'mkfs.ext4' docs", "cat notes-about-sudo.md",
+      "git log --grep=shutdown", 'echo "chmod 777"', "printf '%s\\n' 'rm -rf /'",
+      "git commit -m 'explain reboot handling'"])
+      assert.notEqual(guardShell([command])?.decision, "deny", command);
+    for (const command of ["rg sudo src", "cat notes-about-sudo.md", "git log --grep=shutdown", 'echo "chmod 777"'])
+      assert.equal(guardShell([command])?.decision, "allow", command);
+  });
+
+  it("still denies dangerous operations hidden in nested shells", () => {
+    for (const command of ["bash -c 'rm -rf /'", "sh -lc 'sudo id'", "eval 'chmod 777 x'", "rm -fr /",
+      "sudo -n id", "mkfs.ext4 /dev/sda1"])
+      assert.equal(guardShell([command])?.decision, "deny", command);
+    // Subshell syntax is not parsed into segments, so it stays a manual approval.
+    assert.equal(guardShell(["( sudo id )"])?.decision, "ask");
+  });
+  it("runs before decision and model reviewers", async () => {    const stages = [{ type: "decision" as const, model: "typesafe-ai/jev-latest" }, { type: "llm" as const }];
     assert.equal((await compositeDecision(stages, { action: "shell", resources: ["pwd $(touch marker)"] }, unused)).decision, "ask");
     assert.equal((await compositeDecision(stages, { action: "shell", resources: ["sudo rm -rf /"] }, unused)).decision, "deny");
     const reviewed = await compositeDecision(stages, { action: "shell", resources: ["pwd > marker"] }, async (stage) => {

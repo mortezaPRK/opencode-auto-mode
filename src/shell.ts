@@ -1,28 +1,16 @@
 import { parse } from "shell-quote";
-import { basename } from "node:path";
-import { classify } from "./tiers.js";
 import type { ReviewResult } from "./reviewer.js";
+import {
+  CONTROL_OPERATORS, DYNAMIC, REDIRECT_OPERATORS, SCRIPT_HOSTS, SHELLS, STATEFUL,
+  denyInvocation, isReadOnlyInvocation, resolveExecutable,
+} from "./shell-policy.js";
 
 const MAX_COMMAND_CHARS = 4096;
 const MAX_COMMAND_BYTES = 65_536;
 const BALANCED_QUOTES = /^(?:[^'"\\]|\\[^\r\n]|'[^']*'|"(?:[^"\\]|\\[^\r\n])*")*$/;
-const CONTROL_OPERATORS = new Set([";", "&&", "||", "|", "|&", "&"]);
-const REDIRECT_OPERATORS = new Set([">", ">>", ">&", "<&", "<", "<<", "<<-", "<<<", "<>", ">|", "&>", "&>>"]);
 const WRITE_OPERATORS = new Set([">", ">>", ">|", "&>", "&>>", "<>"]);
-const SHELLS = new Set(["sh", "bash", "dash", "zsh", "ksh", "fish", "pwsh", "powershell", "cmd"]);
-const SCRIPT_HOSTS = new Set(["python", "python3", "node", "perl", "ruby", "php", "awk", "gawk", "lua"]);
-const STATEFUL = new Set(["alias", "unalias", "export", "unset", "set", "shopt", "trap", "umask",
-  "readonly", "declare", "typeset", "local", "function"]);
-const DYNAMIC = new Set(["eval", "source", ".", "exec", "xargs"]);
 const DYNAMIC_SYNTAX = /\$\(|`|\$\(\s*\(|[<>]\(/;
-const ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/;
-const WRAPPERS = new Set(["env", "command", "builtin", "exec", "time", "!", "nohup", "setsid", "nice",
-  "ionice", "stdbuf", "timeout"]);
-const VALUE_OPTIONS = new Set(["-u", "--unset", "-C", "--chdir", "-S", "--split-string", "-a", "--argv0",
-  "-n", "--adjustment", "-s", "--signal", "-k", "--kill-after"]);
-const READ_ONLY = new Set(["pwd", "whoami", "hostname", "uname", "id", "groups", "ls", "cat", "head", "tail",
-  "wc", "date", "echo", "printf", "true", ":", "rg", "grep", "sort", "uniq", "cut", "tr", "jq", "stat", "file",
-  "du", "df", "tree", "bat", "which", "type", "sleep", "test", "basename", "dirname", "realpath", "diff"]);
+const FORK_BOMB = /:\s*\(\s*\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:/;
 
 export function shellWords(command: string): string[] | undefined {
   if (!command || command.length > MAX_COMMAND_CHARS || /[$`~\r\n\0{}[\]]/.test(command) ||
@@ -35,12 +23,6 @@ export function shellWords(command: string): string[] | undefined {
 
 interface Segment { words: string[]; write: boolean }
 type Verdict = { decision: "deny"; reason: string } | { decision: "allow" | "review" | "ask" };
-
-function blockedCommand(command: string): string | undefined {
-  const normalized = shellWords(command);
-  const result = classify("shell", [command, ...(normalized ? [normalized.join(" ")] : [])]);
-  return result.tier === "auto-deny" ? result.reason : undefined;
-}
 
 /** True when the command contains a heredoc marker outside quotes. Heredoc bodies are data. */
 function hasHeredoc(command: string): boolean {
@@ -98,37 +80,6 @@ function heredocMarkers(line: string): HeredocMarker[] {
   return markers;
 }
 
-/** Resolves leading assignments and wrapper options to the effective executable. */
-function resolveExecutable(words: string[]): { name: string; index: number } | undefined {
-  let index = 0;
-  while (index < words.length && ASSIGNMENT.test(words[index])) index++;
-  while (index < words.length) {
-    const name = basename(words[index]);
-    if (!WRAPPERS.has(name)) break;
-    index++;
-    if (name === "timeout") {
-      while (index < words.length && words[index].startsWith("-") && words[index] !== "-") {
-        const option = words[index].split("=", 1)[0];
-        index += VALUE_OPTIONS.has(option) && !words[index].includes("=") ? 2 : 1;
-      }
-      if (index < words.length) index++;
-      continue;
-    }
-    while (index < words.length) {
-      const word = words[index];
-      if (word === "--") { index++; break; }
-      if (word.startsWith("-") && word !== "-") {
-        const option = word.split("=", 1)[0];
-        index += VALUE_OPTIONS.has(option) && !word.includes("=") ? 2 : 1;
-        continue;
-      }
-      if (ASSIGNMENT.test(word)) { index++; continue; }
-      break;
-    }
-  }
-  return index < words.length ? { name: basename(words[index]), index } : undefined;
-}
-
 /** True when the effective executable is a shell, a dynamic builtin, or a stateful builtin. */
 function dynamicExecution(words: string[]): boolean {
   const executable = resolveExecutable(words);
@@ -138,75 +89,25 @@ function dynamicExecution(words: string[]): boolean {
     .some((word) => /^-(?:exec|execdir|ok|okdir|delete)$/.test(word));
 }
 
-function isReadOnlyGit(args: string[]): boolean {
-  if (args.some((arg) =>
-    /^(?:-c|--git-dir|--work-tree|--exec-path|--config-env)(?:=|$)/.test(arg) ||
-    arg === "--ext-diff" || arg === "--exec" || arg.startsWith("--output"))) return false;
-  const subcommand = args[0];
-  if (subcommand === undefined) return false;
-  if (["status", "diff", "log", "show", "rev-parse"].includes(subcommand)) return true;
-  if (subcommand !== "branch") return false;
-  if (args.length === 1) return true;
-  return args.slice(1).every((arg) =>
-    ["--show-current", "--list", "-a", "-r", "-v", "-vv", "--merged", "--no-merged", "--contains", "--points-at", "--format"]
-      .some((safe) => arg === safe || arg.startsWith(`${safe}=`)));
-}
-
-function isReadOnlySed(args: string[]): boolean {
-  if (args.some((arg) => arg === "-i" || arg.startsWith("--in-place") || arg === "-e" ||
-      arg === "--expression" || arg === "-f" || arg === "--file")) return false;
-  return args[0] === "-n" && args[1] !== undefined && /^\d+(?:,\d+)?p$/.test(args[1]);
-}
-
-function isReadOnlyGh(args: string[]): boolean {
-  const [group, subcommand] = args;
-  if (group === "label" && subcommand === "list") return true;
-  if (group === "api") {
-    return !args.some((arg) => arg === "-X" || arg === "--method" || arg.startsWith("-X") ||
-      arg.startsWith("--method=") || ["-f", "--field", "-F", "--raw-field", "--input"].includes(arg));
-  }
-  return new Set(["pr view", "pr list", "pr diff", "pr checks", "issue view", "issue list", "run view",
-    "run list", "repo view", "auth status", "status", "search"]).has(`${group} ${subcommand}`);
-}
-
-function isReadOnly(words: string[]): boolean {
-  const command = basename(words[0]);
-  const args = words.slice(1);
-  if (READ_ONLY.has(command)) {
-    return command !== "date" || !args.some((arg) => arg === "-s" || arg === "--set" || arg.startsWith("--set="));
-  }
-  if (command === "git") return isReadOnlyGit(args);
-  if (command === "find") return !args.some((arg) => /^-(?:fprint|fprint0|fprintf|fls)$/.test(arg));
-  if (command === "sed") return isReadOnlySed(args);
-  if (command === "gh") return isReadOnlyGh(args);
-  if (command === "docker") return args[0] === "logs";
-  if (command === "bun")
-    return args[0] === "test" || (args[0] === "run" && (args[1] === "lint" || args[1] === "typecheck"));
-  return false;
-}
-
 function analyzeSegment(segment: Segment): Verdict {
   if (!segment.words.length) return segment.write ? { decision: "review" } : { decision: "allow" };
   const command = segment.words[0];
   if (!command || command.includes("$")) return { decision: "ask" };
-  const blocked = blockedCommand(segment.words.join(" "));
+  const blocked = denyInvocation(segment.words);
   if (blocked !== undefined) return { decision: "deny", reason: blocked };
   if (dynamicExecution(segment.words)) return { decision: "ask" };
-  if (!segment.write && isReadOnly(segment.words)) return { decision: "allow" };
+  if (!segment.write && isReadOnlyInvocation(segment.words)) return { decision: "allow" };
   return { decision: "review" };
 }
 
 function analyzeLine(command: string): Verdict {
   if (!command.trim()) return { decision: "allow" };
   if (!BALANCED_QUOTES.test(command)) return { decision: "ask" };
-  const blocked = blockedCommand(command);
-  if (blocked !== undefined) return { decision: "deny", reason: blocked };
+  if (FORK_BOMB.test(command)) return { decision: "deny", reason: "dangerous shell operation" };
 
   let tokens;
   try { tokens = parse(command); }
   catch { return { decision: "ask" }; }
-  const blockedTokens = blockedCommand(tokens.filter((token): token is string => typeof token === "string").join(" "));
-  if (blockedTokens !== undefined) return { decision: "deny", reason: blockedTokens };
   if (DYNAMIC_SYNTAX.test(command)) return { decision: "ask" };
 
   const segments: Segment[] = [{ words: [], write: false }];
@@ -295,8 +196,6 @@ function analyzeHeredoc(command: string): Verdict {
 
 function analyze(command: string): Verdict {
   if (hasHeredoc(command)) return analyzeHeredoc(command);
-  const blocked = blockedCommand(command);
-  if (blocked !== undefined) return { decision: "deny", reason: blocked };
   if (command.includes("\n")) {
     let ask = false;
     let review = false;
@@ -330,3 +229,22 @@ export function guardShell(resources: readonly string[]): ReviewResult | undefin
   if (ask) return { decision: "ask", reason: "Shell syntax requires manual approval" };
   return review ? undefined : { decision: "allow", reason: "read-only command" };
 }
+
+export interface ShellClassification {
+  tier: "auto-allow" | "auto-deny" | "review";
+  reason: string;
+}
+
+/**
+ * Static tier classification for shell actions. The shell guard is the single
+ * source of truth so the classifier can never allow or deny something the guard
+ * would not.
+ */
+export function classifyShell(resources: readonly string[]): ShellClassification {
+  const verdict = guardShell(resources);
+  if (verdict?.decision === "deny") return { tier: "auto-deny", reason: verdict.reason };
+  if (verdict?.decision === "allow") return { tier: "auto-allow", reason: verdict.reason };
+  if (verdict?.decision === "ask") return { tier: "review", reason: "shell syntax requires manual approval" };
+  return { tier: "review", reason: "evaluate the entire command as one action" };
+}
+

@@ -1,22 +1,11 @@
 import * as path from "node:path";
 import { lstatSync, realpathSync } from "node:fs";
+import { classifyShell } from "./shell.js";
 
 export type Tier = "auto-allow" | "auto-deny" | "review" | "unknown";
 export interface Classification { tier: Tier; reason: string }
 export interface ClassifyOptions { projectDir?: string; allowInProjectEdits?: boolean }
 
-const READ_ONLY_COMMANDS = new Set(["pwd", "whoami", "hostname", "uname", "id", "groups", "ls", "ls -a", "ls -l", "ls -la", "ls -al", "ls -A",
-  "git status", "git status --short", "git diff", "git log", "git show", "git branch --show-current",
-  "date", "date +%s", "cat", "head", "tail", "rg", "grep", "wc", "bun test", "bun run lint", "bun run typecheck"]);
-const BLOCKED_SHELL = [
-  /\brm\s+-rf?\s+\/(\s|$|\*)/,
-  /\bsudo\b/,
-  /\bmkfs\./,
-  /\bdd\s+if=.*\s+of=\/(dev|sd|nvme|hd)/,
-  /\b(shutdown|reboot|halt|poweroff)\b/,
-  /:\(\)\s*\{\s*:\s*\|\s*:&\s*\};:/,
-  /\bchmod\s+777\b/,
-];
 const SENSITIVE_PATH = /(?:^|[/\\])(?:\.[^/\\]+|opencode\.jsonc?|id_(?:rsa|dsa|ecdsa|ed25519)|[^/\\]+\.(?:pem|key|p12|pfx)|[^/\\]*(?:credentials|token|secret|password|private.key)[^/\\]*)(?:[/\\]|$)/i;
 
 export function isInProject(target: string, projectDir: string): boolean {
@@ -46,16 +35,7 @@ function safeTarget(target: string, projectDir: string): boolean {
 }
 
 export function classify(action: string, resources: readonly string[], options?: ClassifyOptions): Classification {
-  if (action === "shell") {
-    for (const command of resources) {
-      for (const pattern of BLOCKED_SHELL) {
-        if (pattern.test(command)) return { tier: "auto-deny", reason: "dangerous shell operation" };
-      }
-    }
-    if (resources.length > 0 && resources.every((command) => READ_ONLY_COMMANDS.has(command)))
-      return { tier: "auto-allow", reason: "read-only command" };
-    return { tier: "review", reason: "evaluate the entire command as one action" };
-  }
+  if (action === "shell") return classifyShell(resources);
   if (action === "read" || ((action === "edit" || action === "write") && options?.allowInProjectEdits)) {
     if (options?.projectDir && resources.length > 0 && resources.every((target) =>
         target.length > 0 && safeTarget(target, options.projectDir!)))
