@@ -180,6 +180,23 @@ describe("shell policy edge cases", () => {
       assert.equal(guardShell([command])?.decision, "allow", command);
   });
 
+  it("reviews uniq arguments that macOS treats as an output file", () => {
+    for (const command of ["uniq in.txt -out.txt", "uniq in.txt --count", "uniq -z file", "uniq --unknown file"])
+      assert.equal(guardShell([command]), undefined, command);
+    for (const command of ["uniq -f 2 file", "uniq -f2 file", "uniq -ci file", "uniq --skip-fields 2 file",
+      "uniq --count file", "uniq --all-repeated=separate file"])
+      assert.equal(guardShell([command])?.decision, "allow", command);
+  });
+
+  it("reviews date invocations that set the clock", () => {
+    for (const command of ["date 010100002030", "date -u 010100002030", "date -s '2030-01-01'",
+      "date --set=2030-01-01"])
+      assert.equal(guardShell([command]), undefined, command);
+    for (const command of ["date", "date +%s", "date -u +%Y-%m-%d", "date -d tomorrow +%s",
+      "date --date=@0 +%s", "date --iso-8601=seconds", "date -Iseconds", "date -R"])
+      assert.equal(guardShell([command])?.decision, "allow", command);
+  });
+
   it("ignores inherited properties when looking up a command policy", async () => {
     for (const command of ["./constructor", "./__proto__", "./toString", "constructor"]) {
       assert.equal(guardShell([command]), undefined, command);
@@ -207,7 +224,10 @@ describe("shell policy edge cases", () => {
     assert.equal(guardShell(["bash -c 'rm >/dev/null -rf /'"])?.decision, "deny");
     assert.equal(guardShell(["sh -c 'sudo id > /tmp/log'"])?.decision, "deny");
     assert.equal(guardShell(["sh -c 'echo hi > /tmp/log; rm -rf /'"])?.decision, "deny");
+    assert.equal(guardShell(["bash -c '2>/dev/null rm -rf /'"])?.decision, "deny");
+    assert.equal(guardShell(["sh -c '2>&1 sudo id'"])?.decision, "deny");
     assert.equal(guardShell(["bash -c 'echo >/dev/null sudo'"])?.decision, "ask");
+    assert.equal(guardShell(["bash -c 'echo 2>/dev/null sudo id'"])?.decision, "ask");
   });
 
   it("denies identifiable commands before asking about dynamic arguments", () => {

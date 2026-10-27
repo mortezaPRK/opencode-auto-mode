@@ -170,7 +170,11 @@ function invocations(command: string): string[][] {
         continue;
       }
       // A redirection does not end a simple command; only its target is dropped.
-      if (REDIRECT_OPERATORS.has(token.op)) skipNext = true;
+      if (REDIRECT_OPERATORS.has(token.op)) {
+        // A word directly before the operator is a file descriptor (`2>/dev/null`).
+        if (words.length && /^\d+$/.test(words[words.length - 1])) words.pop();
+        skipNext = true;
+      }
     }
   }
   if (words.length) result.push(words);
@@ -207,16 +211,94 @@ export function denyInvocation(words: readonly string[], depth = 0): string | un
   return undefined;
 }
 
-/** Counts operands, honouring `--` and keeping a lone `-` as an operand. */
-function operandCount(args: readonly string[]): number {
-  let count = 0;
+const UNIQ_FLAGS = new Set(["c", "d", "D", "i", "u"]);
+const UNIQ_VALUE_FLAGS = new Set(["f", "s", "w"]);
+const UNIQ_LONG_FLAGS = new Set(["--count", "--repeated", "--ignore-case", "--unique", "--zero-terminated",
+  "--help", "--version"]);
+const UNIQ_LONG_OPTIONAL_FLAGS = new Set(["--all-repeated", "--group"]);
+const UNIQ_LONG_VALUE_FLAGS = new Set(["--skip-fields", "--skip-chars", "--check-chars"]);
+
+/**
+ * `uniq INPUT OUTPUT` writes OUTPUT. macOS stops option parsing at the first
+ * operand, so `uniq in.txt -out.txt` writes a file named `-out.txt`; every
+ * argument after an operand is therefore counted as an operand. Unknown leading
+ * flags fail closed, while known flags keep `uniq -f 2 file` read-only.
+ */
+function isReadOnlyUniq(args: readonly string[]): boolean {
+  let operands = 0;
   let endOfOptions = false;
-  for (const arg of args) {
-    if (endOfOptions) count++;
-    else if (arg === "--") endOfOptions = true;
-    else if (arg === "-" || !arg.startsWith("-")) count++;
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index];
+    if (endOfOptions || operands > 0) { operands++; continue; }
+    if (arg === "--") { endOfOptions = true; continue; }
+    if (arg === "-") { operands++; continue; }
+    if (arg.startsWith("--") && arg.length > 2) {
+      const name = arg.split("=", 1)[0];
+      const attached = arg.length > name.length;
+      if (UNIQ_LONG_VALUE_FLAGS.has(name)) {
+        if (!attached) index++;
+        continue;
+      }
+      if (UNIQ_LONG_OPTIONAL_FLAGS.has(name) || (UNIQ_LONG_FLAGS.has(name) && !attached)) continue;
+      operands++;
+      continue;
+    }
+    if (arg.startsWith("-")) {
+      const letters = arg.slice(1);
+      let known = true;
+      for (let position = 0; position < letters.length; position++) {
+        if (UNIQ_VALUE_FLAGS.has(letters[position])) {
+          if (position === letters.length - 1) index++;
+          break;
+        }
+        if (!UNIQ_FLAGS.has(letters[position])) { known = false; break; }
+      }
+      if (!known) operands++;
+      continue;
+    }
+    operands++;
   }
-  return count;
+  return operands <= 1;
+}
+
+const DATE_FLAGS = new Set(["u", "R", "j"]);
+const DATE_VALUE_FLAGS = new Set(["d", "r", "f"]);
+const DATE_LONG_FLAGS = new Set(["--utc", "--universal", "--rfc-email", "--rfc-2822", "--iso-8601",
+  "--debug", "--help", "--version"]);
+const DATE_LONG_VALUE_FLAGS = new Set(["--date", "--reference", "--file", "--rfc-3339"]);
+
+/**
+ * `date` is read-only only when every argument is a known read-only option or a
+ * `+FORMAT` operand. A positional operand sets the system clock
+ * (`date 010100002030`), so it requires review.
+ */
+function isReadOnlyDate(args: readonly string[]): boolean {
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index];
+    if (arg.startsWith("+")) continue;
+    if (arg === "--") return args.slice(index + 1).every((operand) => operand.startsWith("+"));
+    if (arg.startsWith("--") && arg.length > 2) {
+      const name = arg.split("=", 1)[0];
+      const attached = arg.length > name.length;
+      if (DATE_LONG_VALUE_FLAGS.has(name)) {
+        if (!attached) index++;
+        continue;
+      }
+      if (DATE_LONG_FLAGS.has(name)) continue;
+      return false;
+    }
+    if (!arg.startsWith("-") || arg === "-") return false;
+    for (let position = 1; position < arg.length; position++) {
+      const letter = arg[position];
+      if (letter === "I") break;
+      if (DATE_VALUE_FLAGS.has(letter)) {
+        if (position === arg.length - 1) index++;
+        break;
+      }
+      if (!DATE_FLAGS.has(letter)) return false;
+    }
+  }
+  return true;
 }
 
 const POLICIES: Record<string, (args: readonly string[]) => boolean> = {
@@ -229,11 +311,11 @@ const POLICIES: Record<string, (args: readonly string[]) => boolean> = {
   file: (args) => !hasLongOption(args, ["--compile"]) && !hasShortOption(args, "C"),
   bat: (args) => !hasLongOption(args, ["--pager", "--config-file", "--config-dir"]),
   // `uniq INPUT OUTPUT` writes OUTPUT; only a single operand is read-only.
-  uniq: (args) => operandCount(args) <= 1,
+  uniq: isReadOnlyUniq,
   // A bare argument sets the host name.
   hostname: (args) => args.every((arg) => arg.startsWith("-")) &&
     !hasLongOption(args, ["--file", "--boot"]) && !hasShortOption(args, "F"),
-  date: (args) => !hasLongOption(args, ["--set"]) && !hasShortOption(args, "s"),
+  date: isReadOnlyDate,
 };
 
 const READ_ONLY = new Set(["pwd", "whoami", "id", "groups", "ls", "cat", "head", "tail", "wc", "echo", "printf",
