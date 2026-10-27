@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { createHash } from "node:crypto";
 import { privateFile, STORAGE_DIR } from "./storage.js";
 
 export type DecisionKind = "reviewing" | "allow" | "deny" | "ask";
@@ -16,17 +17,15 @@ export interface DecisionRecord {
 
 export const STATE_FILE = path.join(STORAGE_DIR, "state.json");
 
-const CONFIG_ERROR_FILE = "config-error.json";
-const MAX_CONFIG_ERRORS = 32;
 const MAX_AGE_MS = 10 * 60 * 1000;
+const MAX_CONFIG_MESSAGE = 1024;
 
 export interface ConfigErrorRecord {
   directory: string;
   message: string;
 }
 
-interface ConfigErrorEntry {
-  message: string;
+interface StoredConfigError extends ConfigErrorRecord {
   at: number;
 }
 
@@ -35,61 +34,63 @@ function canonicalDirectory(directory: string): string {
   catch { return path.resolve(directory); }
 }
 
-function readConfigErrors(): Record<string, ConfigErrorEntry> {
+function configErrorFile(directory: string): string {
+  return `config-error-${createHash("sha256").update(directory).digest("hex")}.json`;
+}
+
+function readConfigErrorFile(directory: string): StoredConfigError | undefined {
   let fd: number | undefined;
   try {
-    fd = privateFile(CONFIG_ERROR_FILE, false);
-    if (fs.fstatSync(fd).size > 65_536) return {};
+    fd = privateFile(configErrorFile(directory), false);
+    if (fs.fstatSync(fd).size > 4096) return undefined;
     const parsed: unknown = JSON.parse(fs.readFileSync(fd, "utf8"));
-    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return {};
-    return Object.fromEntries(Object.entries(parsed).filter(([directory, entry]) =>
-      directory.length > 0 && directory.length <= 4096 && typeof entry === "object" && entry !== null &&
-      typeof (entry as ConfigErrorEntry).message === "string" && (entry as ConfigErrorEntry).message.length <= 1024 &&
-      typeof (entry as ConfigErrorEntry).at === "number" && Number.isFinite((entry as ConfigErrorEntry).at)));
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
+    const record = parsed as Partial<StoredConfigError>;
+    if (record.directory !== directory || typeof record.message !== "string" ||
+        record.message.length > MAX_CONFIG_MESSAGE || typeof record.at !== "number" || !Number.isFinite(record.at))
+      return undefined;
+    return { directory: record.directory, message: record.message, at: record.at };
   } catch {
-    return {};
+    return undefined;
   } finally { if (fd !== undefined) fs.closeSync(fd); }
 }
 
-function writeConfigErrors(all: Record<string, ConfigErrorEntry>): void {
+function writeConfigError(record: StoredConfigError): void {
   let fd: number | undefined;
+  const temporary = `config-error-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}.tmp`;
+  const target = configErrorFile(record.directory);
   try {
-    const data = JSON.stringify(all);
-    if (Buffer.byteLength(data) > 65_536) return;
-    fd = privateFile(CONFIG_ERROR_FILE, true);
-    fs.ftruncateSync(fd, 0);
-    fs.writeSync(fd, data, 0);
+    fd = privateFile(temporary, true);
+    fs.writeSync(fd, JSON.stringify(record), 0);
+    fs.closeSync(fd);
+    fd = undefined;
+    fs.renameSync(path.join(STORAGE_DIR, temporary), path.join(STORAGE_DIR, target));
   } catch {
     // Badge state is best effort and must not interrupt permission review.
-  } finally { if (fd !== undefined) fs.closeSync(fd); }
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+    try { fs.rmSync(path.join(STORAGE_DIR, temporary), { force: true }); }
+    catch { /* best effort */ }
+  }
 }
 
 /** Records that the plugin options for a location are unusable, so the TUI can show it. */
 export function recordConfigError(directory: string, message: string): void {
-  const all = readConfigErrors();
-  all[canonicalDirectory(directory)] = { message: message.slice(0, 1024), at: Date.now() };
-  const recent = Object.entries(all).sort((a, b) => b[1].at - a[1].at).slice(0, MAX_CONFIG_ERRORS);
-  writeConfigErrors(Object.fromEntries(recent));
+  const canonical = canonicalDirectory(directory);
+  writeConfigError({ directory: canonical, message: message.slice(0, MAX_CONFIG_MESSAGE), at: Date.now() });
 }
 
 export function readConfigError(directory: string | undefined): ConfigErrorRecord | undefined {
   if (directory === undefined) return undefined;
-  const key = canonicalDirectory(directory);
-  const entry = readConfigErrors()[key];
-  return entry === undefined ? undefined : { directory: key, message: entry.message };
+  const canonical = canonicalDirectory(directory);
+  const record = readConfigErrorFile(canonical);
+  return record === undefined ? undefined : { directory: record.directory, message: record.message };
 }
 
 export function clearConfigError(directory: string): void {
-  const all = readConfigErrors();
-  const key = canonicalDirectory(directory);
-  if (all[key] === undefined) return;
-  delete all[key];
-  if (Object.keys(all).length === 0) {
-    try { fs.rmSync(path.join(STORAGE_DIR, CONFIG_ERROR_FILE), { force: true }); }
-    catch { /* best effort */ }
-    return;
-  }
-  writeConfigErrors(all);
+  try {
+    fs.rmSync(path.join(STORAGE_DIR, configErrorFile(canonicalDirectory(directory))), { force: true });
+  } catch { /* best effort */ }
 }
 
 export function readDecisions(): Record<string, DecisionRecord> {

@@ -20,4 +20,22 @@ describe("config error badge state", () => {
     assert.equal(readConfigError(second), undefined);
     assert.equal(readConfigError(undefined), undefined);
   });
+  it("does not overwrite another project's flag", () => {
+    const directories = Array.from({ length: 5 }, (_, index) => `/tmp/auto-mode-config-${index}-${process.pid}`);
+    for (const directory of directories) clearConfigError(directory);
+    for (const directory of directories) recordConfigError(directory, `invalid ${directory}`);
+    for (const directory of directories) assert.equal(readConfigError(directory)?.message, `invalid ${directory}`);
+    for (const directory of directories) clearConfigError(directory);
+  });
+  it("replaces the same project's flag and bounds the stored message", () => {
+    const directory = `/tmp/auto-mode-config-long-${process.pid}`;
+    clearConfigError(directory);
+    recordConfigError(directory, "first");
+    recordConfigError(directory, "x".repeat(5000));
+    assert.equal(readConfigError(directory)?.message.length, 1024);
+    recordConfigError(directory, "latest");
+    assert.equal(readConfigError(directory)?.message, "latest");
+    clearConfigError(directory);
+    assert.equal(readConfigError(directory), undefined);
+  });
 });
