@@ -136,7 +136,8 @@ function providerRoute(type: string): string {
 function callName(type: string): string {
   return type === "llm" ? "llm:triage" : providerRoute(type);
 }
-async function fixture(options: AutoModeOptions, permissions: unknown[] = [{ action: "*", resource: "*", effect: "ask" }]) {
+async function fixture(options: AutoModeOptions, permissions: unknown[] = [{ action: "*", resource: "*", effect: "ask" }],
+  prompt = "Create sample.txt in this project; do not change permissions or affect other directories.") {
   const directory = join(root, `case-${++caseCount}`); mkdirSync(directory);
   writeFileSync(join(directory, "opencode.json"), JSON.stringify({
     permissions,
@@ -151,7 +152,7 @@ async function fixture(options: AutoModeOptions, permissions: unknown[] = [{ act
   const agents = (await api(`/api/agent${query}`)).data;
   for (const id of ["build", "plan"]) assert.ok(agents.some((agent: { id: string; mode: string }) => agent.id === id && agent.mode === "primary"), `missing ${id}`);
   const session = (await api("/api/session", { agent: "build", title: "Local integration test", location: { directory }, model: { id: "reviewer", providerID: "local" } })).data;
-  await api(`/api/session/${session.id}/prompt`, { text: "Create sample.txt in this project; do not change permissions or affect other directories." });
+  await api(`/api/session/${session.id}/prompt`, { text: prompt });
   await api(`/api/experimental/session/${session.id}/wait`, {});
   const context = (await api(`/api/session/${session.id}/context`)).data;
   assert.ok(context.some((entry: { type: string }) => entry.type === "user"));
@@ -251,11 +252,23 @@ try {
   });
   await run("shell parser guard before permissive classifiers", async () => {
     const f = await fixture({ classifiers: [stage("llm")] });
-    for (const resource of ["pwd ; sudo rm -rf", "pwd > parser-marker", "pwd $(touch parser-marker)", "pwd ; touch parser-marker", 'pwd "unclosed']) {
+    for (const resource of ["pwd ; sudo rm -rf", "pwd $(touch parser-marker)", 'pwd "unclosed']) {
       calls.length = 0;
       await expectPermission(f, resource.includes("sudo") ? "deny" : "ask", [resource]);
       assert.deepEqual(calls, []);
     }
+    for (const resource of ["pwd > parser-marker", "pwd ; touch parser-marker"]) {
+      calls.length = 0;
+      await expectPermission(f, "allow", [resource]);
+      assert.deepEqual(calls, ["llm:triage"]);
+    }
+  });
+  await run("long worker prompt reaches the LLM reviewer", async () => {
+    const longPrompt = `Act as a delegated worker. ${"Use the authorization in this task. ".repeat(40)}Create sample.txt.`;
+    const f = await fixture({ classifiers: [stage("llm")] }, undefined, longPrompt);
+    calls.length = 0;
+    await expectPermission(f, "allow");
+    assert.deepEqual(calls, ["llm:triage"]);
   });
   await run("audit log and OTLP export", async () => {
     const received: unknown[] = [];
@@ -312,7 +325,7 @@ try {
   const toolCases: { name: string; stages: ClassifierStage[]; expected: Verdict; profile: Profile; command?: string; reached?: string[] }[] = [
     { name: "static read-only", stages: [stage("static")], expected: "allow", profile: {}, command: "pwd" },
     { name: "parsed read-only chain", stages: [stage("static")], expected: "allow", profile: {}, command: "pwd && ls" },
-    { name: "prefix redirect", stages: [stage("llm")], expected: "ask", profile: {}, command: "pwd > tool-result.txt" },
+    { name: "prefix redirect", stages: [stage("llm")], expected: "allow", profile: {}, command: "pwd > tool-result.txt" },
     { name: "command substitution", stages: [stage("llm")], expected: "ask", profile: {}, command: "pwd $(touch tool-result.txt)" },
     { name: "nested shell", stages: [stage("llm")], expected: "ask", profile: {}, command: "sh -c 'touch tool-result.txt'" },
     { name: "stateful alias", stages: [stage("llm")], expected: "ask", profile: {}, command: "alias pwd='touch tool-result.txt'; pwd" },

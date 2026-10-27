@@ -36,7 +36,9 @@ opencode service restart
 
 There is no default review pipeline, and empty options are invalid. Add at least
 one review entry. Built-in checks deny dangerous shell commands, allow common
-read-only commands, and leave everything else as `ask`.
+read-only commands, and send other parsed commands to the configured reviewers.
+Dynamic syntax such as command substitution, nested shells, and stateful builtins
+still requires manual approval.
 
 The snippets below change parts of that configuration; keep your `classifiers`
 list when adding other options.
@@ -125,7 +127,8 @@ permissions and leave global permissions unchanged:
 
 A passive indicator shows when the plugin is reviewing the current session.
 It is enabled by default. Set `tui: false` in plugin options to hide it.
-OpenCode's own permission dialog handles manual approvals.
+Invalid options show `auto-mode: invalid config` in the same place and an error
+toast at startup. OpenCode's own permission dialog handles manual approvals.
 
 ## Review options
 

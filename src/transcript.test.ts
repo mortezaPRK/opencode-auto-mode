@@ -1,6 +1,8 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { extractReviewContext, extractTranscript } from "./transcript.js";
+import { buildStage1Prompt } from "./reviewer.js";
+import { defaultPolicy } from "./policy.js";
 
 const messages = [
   { type: "user", text: "clean up old branches" },
@@ -34,11 +36,88 @@ describe("review context completeness", () => {
     for (const field of ["files", "skills", "agents"]) {
       const context = extractReviewContext([{ type: "user", text: "Follow attached constraints", [field]: [{ text: "Do not publish" }] }]);
       assert.equal(context.complete, false);
+      assert.match(context.reason!, /attachments/);
     }
-    assert.equal(extractReviewContext([{ type: "user", text: "" }]).complete, false);
+    const empty = extractReviewContext([{ type: "user", text: "" }]);
+    assert.equal(empty.complete, false);
+    assert.match(empty.reason!, /no text/);
+    assert.match(extractReviewContext([]).reason!, /No user authorization message/);
+  });
+  it("requires approval when a later user message has no text", () => {
+    const context = extractReviewContext([{ type: "user", text: "Make the changes" }, { type: "user", text: "" }]);
+    assert.equal(context.complete, false);
+    assert.match(context.reason!, /no text/);
   });
   it("accepts text-only messages and empty attachment lists", () => {
     assert.equal(extractReviewContext([{ type: "user", text: "Create a", files: [], skills: [], agents: [] }]).complete, true);
+  });
+  it("does not treat tool truncation as missing user evidence", () => {
+    const longTool = {
+      type: "assistant",
+      content: [{ type: "tool", name: "write", state: { input: { content: "x".repeat(501) } } }],
+    };
+    const context = extractReviewContext([{ type: "user", text: "please make the change" }, longTool]);
+    assert.equal(context.complete, true);
+    assert.match(context.transcript, /some tool details truncated/);
+    const manyTools = Array.from({ length: 21 }, () => ({
+      type: "assistant",
+      content: [{ type: "tool", name: "shell", state: { input: "pwd" } }],
+    }));
+    const capped = extractReviewContext([{ type: "user", text: "go" }, ...manyTools]);
+    assert.equal(capped.complete, true);
+    assert.match(capped.transcript, /partial session history/);
+  });
+  it("keeps the latest user restriction when tool history exceeds the budget", () => {
+    const context = extractReviewContext([
+      { type: "user", text: "Please make the changes" },
+      ...Array.from({ length: 30 }, () => ({
+        type: "assistant",
+        content: [{ type: "tool", name: "write", state: { input: "x".repeat(500) } }],
+      })),
+      { type: "user", text: "DO NOT PUBLISH" },
+    ]);
+    assert.equal(context.complete, true);
+    assert.match(context.transcript, /DO NOT PUBLISH/);
+    assert.ok(Buffer.byteLength(context.transcript) <= 12_000);
+  });
+  it("includes long user prompts without blocking review", () => {
+    const prompt = "Create a release. ".repeat(80).trim();
+    const context = extractReviewContext([{ type: "user", text: prompt }]);
+    assert.equal(context.complete, true);
+    assert.ok(context.transcript.includes(prompt));
+    assert.doesNotMatch(context.transcript, /latest user message truncated/);
+  });
+  it("keeps long sessions reviewable", () => {
+    const manyUsers = Array.from({ length: 11 }, (_, index) => ({ type: "user", text: `message ${index}` }));
+    const context = extractReviewContext(manyUsers);
+    assert.equal(context.complete, true);
+    assert.match(context.transcript, /partial/);
+    const worker = extractReviewContext([
+      { type: "user", text: "You are a delegated worker. ".repeat(50) },
+      { type: "assistant", content: [{ type: "tool", name: "write", state: { input: { content: "x".repeat(600) } } }] },
+    ]);
+    assert.equal(worker.complete, true);
+  });
+  it("truncates very long user messages without blocking review", () => {
+    const context = extractReviewContext([{ type: "user", text: "x".repeat(10_000) }]);
+    assert.equal(context.complete, true);
+    assert.match(context.transcript, /latest user message truncated/);
+    assert.ok(Buffer.byteLength(context.transcript) <= 12_000);
+  });
+  it("budgets escaped strings without hiding trailing constraints", () => {
+    const context = extractReviewContext([{ type: "user", text: `${"\0".repeat(6000)}DO NOT PUBLISH` }]);
+    assert.equal(context.complete, true);
+    assert.match(context.transcript, /DO NOT PUBLISH/);
+    assert.ok(Buffer.byteLength(context.transcript) <= 12_000);
+    const json = context.transcript.slice(context.transcript.indexOf("\n") + 1).split("\n…")[0];
+    assert.doesNotThrow(() => JSON.parse(json));
+  });
+  it("budgets multilingual history below the reviewer request limit", () => {
+    const context = extractReviewContext(Array.from({ length: 3 }, () => ({ type: "user", text: "漢".repeat(7900) })));
+    assert.equal(context.complete, true);
+    assert.ok(Buffer.byteLength(context.transcript) <= 12_000);
+    const prompt = buildStage1Prompt({ action: "shell", resources: ["touch marker"], transcript: context.transcript }, defaultPolicy());
+    assert.ok(Buffer.byteLength(prompt) <= 65_536);
   });
 });
 
@@ -63,14 +142,15 @@ describe("extractTranscript", () => {
   });
 
   it("truncates long entries", () => {
-    const transcript = extractTranscript([{ type: "user", text: "x".repeat(5000) }]);
-    assert.ok(transcript.length < 6500);
+    const transcript = extractTranscript([{ type: "user", text: "x".repeat(10_000) }]);
+    assert.ok(Buffer.byteLength(transcript) <= 12_000);
     assert.match(transcript, /…/);
+    assert.match(transcript, /latest user message truncated/);
   });
   it("keeps chronology and marks missing evidence", () => {
     const chronology = extractTranscript([{ type: "user", text: "first" }, { type: "assistant", content: [{ type: "tool", name: "shell", state: { input: "middle" } }] }, { type: "user", text: "last" }]);
     assert.ok(chronology.indexOf("first") < chronology.indexOf("middle"));
     assert.ok(chronology.indexOf("middle") < chronology.indexOf("last"));
-    assert.match(extractTranscript(Array.from({ length: 11 }, () => ({ type: "user", text: "hello" }))), /incomplete/);
+    assert.match(extractTranscript(Array.from({ length: 11 }, () => ({ type: "user", text: "hello" }))), /partial/);
   });
 });
