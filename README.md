@@ -125,7 +125,8 @@ permissions and leave global permissions unchanged:
 
 A passive indicator shows when the plugin is reviewing the current session.
 It is enabled by default. Set `tui: false` in plugin options to hide it.
-OpenCode's own permission dialog handles manual approvals.
+Invalid options show `auto-mode: invalid config` in the same place and an error
+toast at startup. OpenCode's own permission dialog handles manual approvals.
 
 ## Review options
 

@@ -1,6 +1,6 @@
 import { Plugin } from "@opencode/plugin";
 import { createLogger } from "./logger.js";
-import { recordDecision } from "./state.js";
+import { clearConfigError, recordConfigError, recordDecision } from "./state.js";
 import { defaultPolicy } from "./policy.js";
 import { extractReviewContext } from "./transcript.js";
 import { scanResultContent, withInjectionWarning } from "./probe.js";
@@ -18,9 +18,16 @@ export default Plugin.define({
   id: "opencode-auto-mode",
   setup: async (ctx) => {
     const log = createLogger("events.log");
+    const directory = ctx.location?.directory;
     let options: ReturnType<typeof parseOptions> | undefined;
-    try { options = parseOptions(ctx.options); }
-    catch { log.log("Invalid configuration; automatic approval disabled"); }
+    try {
+      options = parseOptions(ctx.options);
+      if (directory !== undefined) clearConfigError(directory);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      log.log(`Invalid configuration; automatic approval disabled: ${detail}`);
+      if (directory !== undefined) recordConfigError(directory, detail);
+    }
     const sinks = [createAuditLog(options?.auditLog), createOtlpExporter(options?.otlp)].filter((sink) => sink !== undefined);
     const traces = createTraceExporter(options?.otlp);
     const counts = new Map<string, number>();
