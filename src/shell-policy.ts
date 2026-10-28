@@ -17,7 +17,19 @@ export const DYNAMIC = new Set(["eval", "source", ".", "exec", "xargs"]);
 export const ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/;
 export const CONTROL_OPERATORS = new Set([";", "&&", "||", "|", "|&", "&"]);
 export const REDIRECT_OPERATORS = new Set([">", ">>", ">&", "<&", "<", "<<", "<<-", "<<<", "<>", ">|", "&>", "&>>"]);
-const WORD_BREAK = /[\s;|&()<>]/;
+/**
+ * Characters a shell treats as word separators.
+ *
+ * JS `\s` is wider — it also matches CR, FF, VT, NBSP, U+2028/U+2029, and other
+ * Unicode spaces — so every boundary scan here spells the shell set out, and
+ * `hasNonShellWhitespace` rejects anything wider before parsing.
+ */
+const WORD_BREAK = /[ \t\n;|&()<>]/;
+
+/** True when the text contains whitespace a shell does not treat as a separator. */
+export function hasNonShellWhitespace(text: string): boolean {
+  return /[^\S \t\n]/.test(text);
+}
 
 type OptionArity = "flag" | "value";
 
@@ -301,7 +313,7 @@ export function stripDescriptorPrefixes(command: string): string {
       continue;
     }
     result += character;
-    boundary = /[\s;|&()<>]/.test(character);
+    boundary = /[ \t\n;|&()<>]/.test(character);
     index++;
   }
   return result;
@@ -685,8 +697,13 @@ export function normalizeContinuations(command: string): string {
  * prefixes and midword comment markers are stripped, and the remainder is handed
  * to `shell-quote`. Nested scripts (`sh -c`, `eval`) reach this same parser, so
  * they get the same normalization as a top-level command line.
+ *
+ * Text with whitespace a shell does not treat as a separator is refused instead
+ * of parsed: `shell-quote` splits on JS `\s`, which would move word and heredoc
+ * boundaries. Callers treat the throw as unparseable and ask.
  */
 export function parseShell(command: string): ParseEntry[] {
+  if (hasNonShellWhitespace(command)) throw new Error("shell whitespace is not supported");
   return parse(escapeLiteralHashes(stripDescriptorPrefixes(normalizeContinuations(command))));
 }
 
@@ -700,7 +717,7 @@ export function parseShell(command: string): ParseEntry[] {
  * runs, so ambiguous invocations must not be approved automatically.
  */
 export function hasAmbiguousDescriptorClose(command: string): boolean {
-  const delimiter = /[\s;|&()<>]/;
+  const delimiter = /[ \t\n;|&()<>]/;
   let boundary = true;
   let index = 0;
   while (index < command.length) {

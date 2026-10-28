@@ -1,8 +1,9 @@
 import type { ReviewResult } from "./reviewer.js";
 import {
   CONTROL_OPERATORS, DYNAMIC, REDIRECT_OPERATORS, SCRIPT_HOSTS, SHELLS, STATEFUL,
-  denyInvocation, hasAmbiguousDescriptorClose, hasAmbiguousHeredoc, hasHeredoc, heredocMarkers,
-  isReadOnlyInvocation, normalizeContinuations, parseShell, resolveExecutable, stripDescriptorPrefixes,
+  denyInvocation, hasAmbiguousDescriptorClose, hasAmbiguousHeredoc, hasHeredoc, hasNonShellWhitespace,
+  heredocMarkers, isReadOnlyInvocation, normalizeContinuations, parseShell, resolveExecutable,
+  stripDescriptorPrefixes,
 } from "./shell-policy.js";
 
 const MAX_COMMAND_CHARS = 4096;
@@ -49,8 +50,8 @@ type Token = string | { comment: string } | { op: string; pattern?: string };
 
 interface ParsedLine { segments: Segment[]; complete: boolean }
 
-/** Characters that end an unquoted shell word. */
-const WORD_DELIMITER = /[\s;|&()<>]/;
+/** Characters that end an unquoted shell word. JS `\s` is wider than a shell, so the set is explicit. */
+const WORD_DELIMITER = /[ \t\n;|&()<>]/;
 
 /**
  * One entry per shell word, true when the word contains an unquoted expansion
@@ -339,6 +340,11 @@ function analyzeHeredoc(command: string): Verdict {
 }
 
 function analyze(command: string): Verdict {
+  // A shell separates words only on space, tab, and newline. JS `\s` (and the
+  // parser behind it) also matches CR, FF, VT, NBSP, and Unicode spaces, which
+  // can move a heredoc boundary or turn a midword hash into a comment, so any of
+  // them fails closed before normalization, the deny pass, or parsing.
+  if (hasNonShellWhitespace(command)) return { decision: "ask" };
   // Fail closed on a heredoc header that normalization cannot be trusted on:
   // the raw source is the only place its marker and delimiter are still intact.
   if (hasAmbiguousHeredoc(command)) return { decision: "ask" };

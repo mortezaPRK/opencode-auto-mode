@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { compositeDecision } from "./classifier.js";
-import { escapeLiteralHashes, hasAmbiguousDescriptorClose, normalizeContinuations, stripDescriptorPrefixes } from "./shell-policy.js";
+import { escapeLiteralHashes, hasAmbiguousDescriptorClose, normalizeContinuations, parseShell, stripDescriptorPrefixes } from "./shell-policy.js";
 import { guardShell, shellWords } from "./shell.js";
 
 const unused = async () => { throw new Error("unexpected reviewer call"); };
@@ -50,8 +50,6 @@ describe("shell approval guard", () => {
       "cd /tmp",
       "exit 0",
       "cat > /tmp/check.ts <<'EOF'\nrm -rf /tmp/data\nEOF",
-      "./safe\u00a0other",
-      "touch a\u000bfoo",
     ]) assert.equal(guardShell([command]), undefined, command);
   });
   it("asks for dynamic or unparseable shell syntax", () => {
@@ -86,6 +84,8 @@ describe("shell approval guard", () => {
       "bash <<'EOF'\npwd\nEOF",
       "cat <<EOF\n$(touch marker)\nEOF",
       "cat <<EOF\ntext",
+      "./safe\u00a0other",
+      "touch a\u000bfoo",
     ]) assert.equal(guardShell([command])?.decision, "ask", command);
   });
   it("keeps deny precedence across lines and resources", () => {
@@ -233,6 +233,32 @@ describe("shell approval guard", () => {
       "cat <<\"$x\"\nbody\n$x\npwd", "cat <<_EOF_1\nx\n_EOF_1\npwd", "cat <<2\nx\n2\npwd",
       "cat <<- 'EOF'\n\tx\n\tEOF\npwd", "cat <<'A B'\nx\nA B\npwd",
       "cat <<\"'EOF'\"\nx\n'EOF'\npwd", "cat <<\"$'EOF'\"\nx\n$'EOF'\npwd"])
+      assert.equal(guardShell([command])?.decision, "allow", command);
+  });
+  it("asks for whitespace a shell does not treat as a word separator", () => {
+    // CR, FF, VT, NBSP, U+2028/U+2029, and em space are ordinary word characters
+    // to a shell, so they must never be treated as word or heredoc boundaries.
+    const controls = ["\r", "\f", "\v", "\u00a0", "\u2028", "\u2029", "\u2003"];
+    for (const character of controls) {
+      // The delimiter word keeps the character, so the real terminator differs
+      // and a body collected on the shortened delimiter would swallow the tail.
+      assert.equal(guardShell([`cat <<EOF${character}\nx\nEOF${character}\nsudo id\nEOF`])?.decision,
+        "ask", `heredoc ${JSON.stringify(character)}`);
+      // The character is midword, so `#` stays literal and the tail still runs.
+      assert.equal(guardShell([`echo a${character}#x ;sudo id`])?.decision,
+        "ask", `hash ${JSON.stringify(character)}`);
+      // The guard rejects the whole command before normalization or parsing.
+      assert.equal(guardShell([`pwd${character}`])?.decision, "ask", `plain ${JSON.stringify(character)}`);
+      assert.throws(() => parseShell(`echo a${character}b`), /shell whitespace/, JSON.stringify(character));
+    }
+    // The reported commands: a CR delimiter and a CR before a midword hash.
+    assert.equal(guardShell(["cat <<EOF\r\nx\nEOF\r\nsudo id\nEOF"])?.decision, "ask");
+    assert.equal(guardShell(["echo a\r#x ;sudo id"])?.decision, "ask");
+    // A nested shell script reaches the same parser, which refuses the text.
+    assert.equal(guardShell(["sh -c 'echo a\u00a0b'"])?.decision, "ask");
+    assert.equal(guardShell(["sh -c 'echo a\u00a0b'", "sudo id"])?.decision, "deny");
+    // Space, tab, and newline remain the only word separators.
+    for (const command of ["echo a b", "echo a\tb", "pwd\nls"])
       assert.equal(guardShell([command])?.decision, "allow", command);
   });
   it("keeps a continued command exactly as dangerous as the command it joins", () => {
