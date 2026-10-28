@@ -19,7 +19,7 @@ export default Plugin.define({
       "command.open": "Open auto-mode decisions",
       "panel.title": "Auto-mode",
       "panel.empty": "No decisions in this session yet.",
-      "panel.disabled": "Auto-mode has no valid configuration; every action is asked.",
+      "panel.disabled": "Auto-mode has no valid configuration; automatic review is disabled. Host permissions still apply.",
       "panel.reviewing": "Reviewing…",
       "pill.title": "Auto-mode decisions",
     },
