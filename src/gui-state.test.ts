@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { createStatusGuard, createStatusLoader, pillLabel, statusTarget, type StatusTarget } from "./gui-state.js";
+import { createStatusGuard, createStatusLoader, panelView, pillLabel, statusTarget, type StatusTarget } from "./gui-state.js";
 import type { AutoModeDecision, AutoModeStatus } from "./rpc.js";
 
 const OWN = "sidecar";
@@ -59,6 +59,36 @@ describe("status guard", () => {
     guard.select("b");
     guard.select("a");
     assert.equal(guard.accept(request!), false);
+    const next = guard.begin("a");
+    assert.equal(guard.accept(next!), true);
+  });
+  it("accepts a slow response issued before a newer request", () => {
+    const guard = createStatusGuard();
+    guard.select("a");
+    const slow = guard.begin("a");
+    const newer = guard.begin("a");
+    // Numbering the newer request must not invalidate the slow response: a
+    // poll slower than the interval still describes this session.
+    assert.equal(guard.accept(slow!), true);
+    assert.equal(guard.accept(newer!), true);
+    assert.equal(guard.accept(slow!), false);
+  });
+  it("drops an older response that settles after a newer one", () => {
+    const guard = createStatusGuard();
+    guard.select("a");
+    const older = guard.begin("a");
+    const newer = guard.begin("a");
+    assert.equal(guard.accept(newer!), true);
+    assert.equal(guard.accept(older!), false);
+  });
+  it("invalidates every response from before a selection change", () => {
+    const guard = createStatusGuard();
+    guard.select("a");
+    const first = guard.begin("a");
+    guard.select("b");
+    const second = guard.begin("b");
+    assert.equal(guard.accept(first!), false);
+    assert.equal(guard.accept(second!), true);
   });
 });
 
@@ -132,6 +162,46 @@ describe("status loader", () => {
 
     assert.deepEqual(shown(applied), ["cleared", "deny"]);
   });
+  it("keeps every response from polls that take longer than the interval", async () => {
+    const requests: Deferred<AutoModeStatus | undefined>[] = [];
+    const applied: (AutoModeStatus | undefined)[] = [];
+    const refresh = createStatusLoader(() => {
+      const request = deferred<AutoModeStatus | undefined>();
+      requests.push(request);
+      return request.promise;
+    }, (next) => applied.push(next));
+
+    // Polling every 3s while each request takes 4s leaves two in flight.
+    const first = refresh(target("a"));
+    const second = refresh(target("a"));
+    requests[0]!.resolve(status({ recent: [decision("allow")] }));
+    await first;
+    requests[1]!.resolve(status({ recent: [decision("deny")] }));
+    await second;
+
+    assert.deepEqual(shown(applied), ["cleared", "allow", "deny"]);
+  });
+  it("drops a response for a session the user routed away from and back to", async () => {
+    const requests: Deferred<AutoModeStatus | undefined>[] = [];
+    const applied: (AutoModeStatus | undefined)[] = [];
+    const refresh = createStatusLoader(() => {
+      const request = deferred<AutoModeStatus | undefined>();
+      requests.push(request);
+      return request.promise;
+    }, (next) => applied.push(next));
+
+    const first = refresh(target("a"));
+    const second = refresh(target("b"));
+    const third = refresh(target("a"));
+    requests[2]!.resolve(status({ recent: [decision("deny")] }));
+    await third;
+    requests[0]!.resolve(status({ recent: [decision("allow")] }));
+    await first;
+    requests[1]!.resolve(status({ recent: [decision("allow")] }));
+    await second;
+
+    assert.deepEqual(shown(applied), ["cleared", "cleared", "cleared", "deny"]);
+  });
   it("clears the previous session before the next request fails", async () => {
     const requests: Deferred<AutoModeStatus | undefined>[] = [];
     const applied: (AutoModeStatus | undefined)[] = [];
@@ -191,6 +261,24 @@ describe("status target", () => {
       { key: "https://other\nshared", sessionID: "shared", ownServer: false },
     );
     assert.equal(statusTarget(undefined), undefined);
+  });
+});
+
+describe("decisions panel", () => {
+  it("shows the empty state for a missing or an empty snapshot", () => {
+    assert.equal(panelView(undefined), "empty");
+    assert.equal(panelView(status()), "empty");
+    assert.equal(panelView(status({ reviewing: [{ sessionID: "a", reviewID: "review-1", startedAt: 1 }] })), "entries");
+    assert.equal(panelView(status({ recent: [decision("allow")] })), "entries");
+  });
+  it("shows the empty state after the loader applies a defined empty snapshot", async () => {
+    const applied: (AutoModeStatus | undefined)[] = [];
+    const refresh = createStatusLoader(async () => status(), (next) => applied.push(next));
+
+    await refresh(target("a"));
+
+    assert.notEqual(applied.at(-1), undefined);
+    assert.equal(panelView(applied.at(-1)), "empty");
   });
 });
 

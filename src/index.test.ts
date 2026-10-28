@@ -20,6 +20,11 @@ async function setup(options: unknown = {}, messages: unknown[] = [{ type: "user
   let wake: (() => void) | undefined;
   let rpcHandlers: Record<string, (input: unknown) => Promise<unknown>> = {};
   const rpcEvents: unknown[] = [];
+  // The status event sink is replaceable after setup so a test can stall or
+  // fail delivery the way a busy or restarting client would.
+  const delivery = {
+    emit: async (_name: string, payload: unknown) => { rpcEvents.push(payload); },
+  };
   function subscribe(input: { signal?: AbortSignal }) {
     if (input.signal !== undefined) subscriptions.push(input.signal);
     return (async function* () {
@@ -45,7 +50,7 @@ async function setup(options: unknown = {}, messages: unknown[] = [{ type: "user
     rpc: {
       register: async (_definition: unknown, handlers: typeof rpcHandlers) => {
         rpcHandlers = handlers;
-        return { events: { emit: async (_name: string, payload: unknown) => { rpcEvents.push(payload); } }, dispose: async () => { disposed++; } };
+        return { events: delivery, dispose: async () => { disposed++; } };
       },
     },
     generate: { text: async ({ prompt, model }: { prompt: string; model?: { id: string; providerID: string; variant?: string } | null }) => { prompts.push(prompt); models.push(model); return { text: answers.shift() ?? "ASK: unclear" }; } },
@@ -53,7 +58,7 @@ async function setup(options: unknown = {}, messages: unknown[] = [{ type: "user
   const cleanup = await plugin.setup(ctx as unknown as Parameters<typeof plugin.setup>[0]);
   return {
     evaluate: (evaluation: Evaluation) => evaluate(evaluation),
-    prompts, models, ctx, disposed: () => disposed, rpcEvents, subscriptions,
+    prompts, models, ctx, disposed: () => disposed, rpcEvents, delivery, subscriptions,
     status: async (input: unknown = {}) => rpcHandlers.status!(input),
     interrupt: (sessionID = "session-test") => { interrupts.push({ data: { sessionID } }); wake?.(); },
     cleanup: async () => { await cleanup?.(); },
@@ -732,6 +737,45 @@ describe("OpenCode permission hook", () => {
     assert.doesNotMatch(JSON.stringify(after), /Build a feature/);
     assert.equal(host.rpcEvents.length, 1);
     await host.cleanup();
+  });
+  it("returns the permission decision without waiting for a stalled status event", async () => {
+    const host = await setup({ classifiers: [{ type: "static" }] });
+    let emitted = 0;
+    host.delivery.emit = () => { emitted++; return new Promise<void>(() => {}); };
+    const pending = { ...event(), resources: ["sudo rm -rf /"] };
+    const outcome = await Promise.race([
+      host.evaluate(pending).then(() => "returned" as const),
+      delay(1_000).then(() => "blocked" as const),
+    ]);
+    assert.equal(outcome, "returned");
+    assert.equal(pending.effect, "deny");
+    assert.equal(emitted, 1);
+    await host.cleanup();
+  });
+  it("survives a status event that throws synchronously", async () => {
+    const host = await setup({ classifiers: [{ type: "static" }] });
+    host.delivery.emit = () => { throw new Error("status delivery failed"); };
+    const pending = { ...event(), resources: ["sudo rm -rf /"] };
+    await host.evaluate(pending);
+    assert.equal(pending.effect, "deny");
+    await host.cleanup();
+  });
+  it("does not leave a rejected status event unhandled", async () => {
+    const host = await setup({ classifiers: [{ type: "static" }] });
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      host.delivery.emit = () => Promise.reject(new Error("status delivery failed"));
+      const pending = { ...event(), resources: ["sudo rm -rf /"] };
+      await host.evaluate(pending);
+      assert.equal(pending.effect, "deny");
+      await delay(20);
+      assert.deepEqual(unhandled, []);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+      await host.cleanup();
+    }
   });
   it("reports an invalid configuration over RPC", async () => {
     const host = await setup({ classifiers: [{ type: "bogus" }] });

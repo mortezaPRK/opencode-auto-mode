@@ -2,7 +2,7 @@
 import { createSignal, For, onCleanup } from "solid-js";
 import { Command, ComposerPill, Panel, Plugin, createKeyed, type PanelTab } from "@opencode/plugin/gui";
 import { AutoMode, type AutoModeStatus } from "./rpc.js";
-import { createStatusLoader, latest, pillLabel, statusTarget } from "./gui-state.js";
+import { createStatusLoader, latest, panelView, pillLabel, statusTarget } from "./gui-state.js";
 
 const POLL_MS = 3_000;
 const NOTICE_MS = 30_000;
@@ -57,7 +57,7 @@ export default Plugin.define({
           {status()?.enabled === false
             ? <div>{ctx.t("panel.disabled")}</div>
             : null}
-          {status() === undefined
+          {panelView(status()) === "empty"
             ? <div>{ctx.t("panel.empty")}</div>
             : (
               <>

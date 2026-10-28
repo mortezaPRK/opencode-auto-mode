@@ -36,37 +36,51 @@ export function statusTarget(session: RoutedSession | undefined): StatusTarget |
  * Guards the desktop app's status snapshot against slow responses. A status
  * request can outlive the session it was made for: a poll for session A can
  * settle after the user routed B, and two polls for one session can settle out
- * of order. The guard numbers requests so only the newest response for the
- * selection that is still routed reaches the panel and the pill.
+ * of order. The guard numbers requests, invalidates every request made before
+ * a selection change, and advances a watermark as responses are accepted, so
+ * only the newest response for the selection that is still routed reaches the
+ * panel and the pill. Issuing a request never invalidates an earlier response:
+ * a poll that takes longer than the polling interval still describes the
+ * session it settles for.
  */
 export interface StatusGuard {
   /** Follow a selection key; true when the snapshot belongs to an earlier selection. */
   select(key: string | undefined): boolean;
   /** Number a request; undefined when the selection is no longer routed. */
   begin(key: string): number | undefined;
-  /** Whether a response is still the newest request for the selection. */
+  /** Whether a response is newer than every response already accepted for this selection. */
   accept(token: number): boolean;
 }
 
 export function createStatusGuard(): StatusGuard {
   let selected: string | undefined;
   let issued = 0;
-  let newest = 0;
+  // Highest token issued before the current selection: every token at or below
+  // it belongs to a request for an earlier selection, including one the user
+  // routed away from and back to.
+  let invalidated = 0;
+  // Highest token whose response was accepted for the current selection.
+  let accepted = 0;
 
   return {
     select(key) {
       if (key === selected) return false;
       selected = key;
       // Responses to requests for the previous selection are now stale.
-      newest = ++issued;
+      invalidated = issued;
+      accepted = 0;
       return true;
     },
     begin(key) {
       if (key !== selected) return undefined;
-      return (newest = ++issued);
+      return ++issued;
     },
     accept(token) {
-      return token === newest;
+      // A response is accepted unless a newer one for this selection already
+      // was; accepting it advances the watermark past every older request.
+      if (token <= invalidated || token <= accepted) return false;
+      accepted = token;
+      return true;
     },
   };
 }
@@ -106,6 +120,17 @@ export function createStatusLoader(
 
 export function latest(status: AutoModeStatus | undefined): AutoModeDecision | undefined {
   return status?.recent.at(-1);
+}
+
+/**
+ * What the decisions panel lists for a snapshot. A defined snapshot with
+ * nothing reviewing and no decisions yet is still the normal new-session case,
+ * so it shows the empty state rather than a blank panel.
+ */
+export function panelView(status: AutoModeStatus | undefined): "empty" | "entries" {
+  return status === undefined || (status.reviewing.length === 0 && status.recent.length === 0)
+    ? "empty"
+    : "entries";
 }
 
 export function pillLabel(status: AutoModeStatus | undefined): string | undefined {

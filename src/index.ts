@@ -64,6 +64,16 @@ export default Plugin.define({
       });
     } catch { log.log("Status RPC is unavailable"); }
 
+    // Status events are only a freshness bonus: clients poll `status`, so a
+    // slow or failing emit must never keep the permission hook waiting. Start
+    // the delivery without awaiting it and observe both a synchronous throw
+    // from `emit` and a rejected promise it returns.
+    const publish = (payload: Record<string, unknown>) => {
+      try {
+        void Promise.resolve(rpc?.events.emit("decision", payload)).catch(() => {});
+      } catch { /* status delivery is best effort */ }
+    };
+
     const abortSession = (sessionID: string) => {
       const controllers = running.get(sessionID);
       if (controllers === undefined) return;
@@ -293,7 +303,7 @@ export default Plugin.define({
           durationMs: tracked.durationMs, at: tracked.at,
         };
         if (tracked.errorKind !== undefined) payload.errorKind = tracked.errorKind;
-        try { await rpc?.events.emit("decision", payload); } catch { /* status delivery is best effort */ }
+        publish(payload);
       }),
       abandonSetup,
     );
