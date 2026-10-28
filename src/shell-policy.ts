@@ -53,8 +53,11 @@ function longOptions(spec: string): Record<string, OptionArity> {
  * to `sudo` rather than to the option value.
  */
 const WRAPPER_GRAMMARS: Record<string, WrapperGrammar> = {
-  env: { short: shortOptions("u:S:C:i0v"), long: longOptions(
-    "--unset: --chdir: --split-string: --ignore-environment --null --debug --block-signal --default-signal --ignore-signal") },
+  // `env -S` / `--split-string` reparses its value into command words, so the
+  // effective executable is not the next word. Leaving the option unknown makes
+  // the invocation fail closed to manual approval instead of resolving past it.
+  env: { short: shortOptions("u:C:i0v"), long: longOptions(
+    "--unset: --chdir: --ignore-environment --null --debug --block-signal --default-signal --ignore-signal") },
   command: { short: shortOptions("pvV"), long: longOptions("") },
   builtin: { short: shortOptions(""), long: longOptions("") },
   exec: { short: shortOptions("a:cl"), long: longOptions("") },
@@ -436,8 +439,13 @@ const UNIQ_LONG_VALUE_FLAGS = new Set(["--skip-fields", "--skip-chars", "--check
  * operand, so `uniq in.txt -out.txt` writes a file named `-out.txt`; every
  * argument after an operand is therefore counted as an operand. Unknown leading
  * flags fail closed, while known flags keep `uniq -f 2 file` read-only.
+ *
+ * An unquoted glob can expand into more than one word, so `uniq *.txt` can
+ * become `uniq a.txt b.txt` and overwrite the last match. Quoted glob characters
+ * stay literal and one-operand invocations remain read-only.
  */
-function isReadOnlyUniq(args: readonly string[]): boolean {
+function isReadOnlyUniq(args: readonly string[], globs: readonly boolean[]): boolean {
+  if (globs.some(Boolean)) return false;
   let operands = 0;
   let endOfOptions = false;
   for (let index = 0; index < args.length; index++) {
@@ -514,7 +522,7 @@ function isReadOnlyDate(args: readonly string[]): boolean {
   return true;
 }
 
-const POLICIES: Record<string, (args: readonly string[]) => boolean> = {
+const POLICIES: Record<string, (args: readonly string[], globs: readonly boolean[]) => boolean> = {
   // Flags that read a program from a file, run a command, or write output.
   rg: (args) => !hasLongOption(args, ["--pre", "--pre-glob", "--hostname-bin", "--search-zip"]) &&
     !hasShortOption(args, "z"),
@@ -522,12 +530,22 @@ const POLICIES: Record<string, (args: readonly string[]) => boolean> = {
     !hasShortOption(args, "oT"),
   tree: (args) => !hasLongOption(args, ["--output"]) && !hasShortOption(args, "o"),
   file: (args) => !hasLongOption(args, ["--compile"]) && !hasShortOption(args, "C"),
-  bat: (args) => !hasLongOption(args, ["--pager", "--config-file", "--config-dir", "--generate-config-file"]),
-  // `uniq INPUT OUTPUT` writes OUTPUT; only a single operand is read-only.
+  // `cache --build` / `--clear` mutate the cache, and `--lessopen` runs the
+  // configured pager preprocessor.
+  bat: (args) => !hasLongOption(args, ["--pager", "--config-file", "--config-dir", "--generate-config-file",
+    "--build", "--clear", "--lessopen"]),
+  // `uniq INPUT OUTPUT` writes OUTPUT; only a single literal operand is read-only.
   uniq: isReadOnlyUniq,
-  // A bare argument sets the host name.
-  hostname: (args) => args.every((arg) => arg.startsWith("-")) &&
-    !hasLongOption(args, ["--file", "--boot"]) && !hasShortOption(args, "F"),
+  // A bare argument sets the host name; `--` ends options and `-` is an operand.
+  hostname: (args) => {
+    let endOfOptions = false;
+    for (const arg of args) {
+      if (endOfOptions) return false;
+      if (arg === "--") { endOfOptions = true; continue; }
+      if (arg === "-" || !arg.startsWith("-")) return false;
+    }
+    return !hasLongOption(args, ["--file", "--boot"]) && !hasShortOption(args, "Fb");
+  },
   date: isReadOnlyDate,
 };
 
@@ -569,13 +587,15 @@ function isReadOnlyGh(args: readonly string[]): boolean {
 /**
  * True only when one parsed simple command is read-only. Callers pass an
  * already-split segment, so chaining, redirection and wrappers are handled
- * before this point.
+ * before this point. `globs` marks words that came from an unquoted glob token,
+ * which can expand into several arguments at execution time.
  */
-export function isReadOnlyInvocation(words: readonly string[]): boolean {
+export function isReadOnlyInvocation(words: readonly string[], globs: readonly boolean[] = []): boolean {
   const command = basename(words[0] ?? "");
   const args = words.slice(1);
+  const argGlobs = globs.slice(1);
   // Own properties only: `./constructor` must not resolve to `Object`.
-  if (Object.hasOwn(POLICIES, command)) return POLICIES[command](args);
+  if (Object.hasOwn(POLICIES, command)) return POLICIES[command](args, argGlobs);
   if (READ_ONLY.has(command)) return true;
   if (command === "git") return isReadOnlyGit(args);
   if (command === "find") return !args.some((arg) => /^-(?:fprint|fprint0|fprintf|fls)$/.test(arg));

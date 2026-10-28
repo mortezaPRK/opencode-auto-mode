@@ -92,7 +92,16 @@ describe("shell approval guard", () => {
     assert.equal(guardShell(["bash -c pwd", "sudo id"])?.decision, "deny");
     assert.equal(guardShell(["bash -c pwd\nsudo id"])?.decision, "deny");
     assert.equal(guardShell(["pwd $(touch marker)", "sudo id"])?.decision, "deny");
+    assert.equal(guardShell(["pwd $(touch marker)\nsudo id"])?.decision, "deny");
     assert.equal(guardShell(["bash -c pwd", "touch marker"])?.decision, "ask");
+  });
+  it("denies blocked invocations whose quoted argument spans a literal newline", () => {
+    for (const command of ["sudo echo 'first\nsecond'", 'sudo echo "first\nsecond"',
+      "pwd\nsudo echo 'first\nsecond'\nls", "echo \"first\nsecond\"\nsudo id",
+      "sh -c 'sudo echo \"first\nsecond\"'", "eval 'sudo echo \"first\nsecond\"'",
+      "cat <<'EOF'\ntext\nEOF\nsudo echo 'first\nsecond'"])
+      assert.equal(guardShell([command])?.decision, "deny", command);
+    assert.equal(guardShell(["echo 'first\nsecond'"])?.decision, "allow");
   });
   it("feeds parsed read-only commands into the static stage without bypassing model-only pipelines", async () => {
     assert.deepEqual(shellWords('touch "a b"'), ["touch", "a b"]);
@@ -191,6 +200,35 @@ describe("shell policy edge cases", () => {
       assert.equal(guardShell([command])?.decision, "allow", command);
   });
 
+  it("reviews uniq operands that can glob-expand into the output argument", () => {
+    for (const command of ["uniq *.txt", "uniq -c *.txt", "uniq -f *.txt", "uniq -- *.txt",
+      "uniq in.txt *.txt", "uniq [ab].txt", "uniq {a,b}.txt", "uniq a'b'[c].txt",
+      "uniq 2>/dev/null [ab].txt", "uniq $HOME/x"])
+      assert.equal(guardShell([command]), undefined, command);
+    // Quoted or escaped glob characters are literal operands, so one-operand calls stay read-only.
+    for (const command of ["uniq '*.txt'", 'uniq "*.txt"', "uniq -c '*.txt'", "uniq -- '*.txt'",
+      "uniq '[ab].txt'", "uniq '{a,b}.txt'", "uniq \\[ab\\].txt", "uniq 2>/dev/null '*.txt'",
+      'uniq "$HOME/x"'])
+      assert.equal(guardShell([command])?.decision, "allow", command);
+  });
+
+  it("reviews bat cache mutations and lessopen preprocessors", () => {
+    for (const command of ["bat cache --build", "bat cache --clear", "bat --lessopen file",
+      "bat --lessopen='sh -c id' file", "bat cache --bui", "bat cache --cle", "bat --less=less"])
+      assert.equal(guardShell([command]), undefined, command);
+    for (const command of ["bat README.md", "bat --style=numbers README.md", "bat cache --list"])
+      assert.equal(guardShell([command])?.decision, "allow", command);
+  });
+
+  it("reviews hostname operands and host-name setting options", () => {
+    for (const command of ["hostname -", "hostname -- -review-host", "hostname -b", "hostname -b review-host",
+      "hostname --boot", "hostname --boo", "hostname --file /tmp/name", "hostname --fil=/tmp/name",
+      "hostname -F /tmp/name"])
+      assert.equal(guardShell([command]), undefined, command);
+    for (const command of ["hostname", "hostname --", "hostname -s", "hostname -f", "hostname -I"])
+      assert.equal(guardShell([command])?.decision, "allow", command);
+  });
+
   it("reviews date invocations that set the clock", () => {
     for (const command of ["date 010100002030", "date -u 010100002030", "date -s '2030-01-01'",
       "date --set=2030-01-01"])
@@ -248,6 +286,12 @@ describe("shell policy edge cases", () => {
       assert.equal(guardShell([command]), undefined, command);
     // An unknown wrapper option could consume the executable, so a human decides.
     for (const command of ["stdbuf --unknown sudo id", "env -Q sudo id"])
+      assert.equal(guardShell([command])?.decision, "ask", command);
+  });
+
+  it("asks for env split-string instead of resolving past its value", () => {
+    for (const command of ["env -S 'sudo id'", "env --split-string='sudo id'", "env --split-string 'sudo id'",
+      "env --split 'sudo id'", "env -iS 'sudo id'", "env -S pwd", "sh -c \"env -S 'sudo id'\""])
       assert.equal(guardShell([command])?.decision, "ask", command);
   });
 
@@ -327,5 +371,13 @@ describe("shell policy edge cases", () => {
   it("treats a glob redirection target as a write", () => {
     for (const command of ["pwd > *.txt", "pwd > *.txt file"])
       assert.equal(guardShell([command]), undefined, command);
+  });
+
+  it("never auto-approves the newly reviewed dangerous operations", () => {
+    for (const command of ["env -S 'sudo id'", "env --split-string='sudo id'", "uniq *.txt",
+      "uniq [ab].txt", "uniq {a,b}.txt", "uniq in.txt *.txt", "bat cache --build", "bat cache --clear",
+      "bat --lessopen file", "hostname -", "hostname -- -review-host", "hostname -b review-host",
+      "sudo echo 'first\nsecond'"])
+      assert.notEqual(guardShell([command])?.decision, "allow", command);
   });
 });

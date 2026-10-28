@@ -2,6 +2,7 @@ import type { ReviewResult } from "./reviewer.js";
 import {
   CONTROL_OPERATORS, DYNAMIC, REDIRECT_OPERATORS, SCRIPT_HOSTS, SHELLS, STATEFUL,
   denyInvocation, hasAmbiguousDescriptorClose, isReadOnlyInvocation, parseShell, resolveExecutable,
+  stripDescriptorPrefixes,
 } from "./shell-policy.js";
 
 const MAX_COMMAND_CHARS = 4096;
@@ -20,7 +21,7 @@ export function shellWords(command: string): string[] | undefined {
   } catch { return undefined; }
 }
 
-interface Segment { words: string[]; write: boolean }
+interface Segment { words: string[]; globs: boolean[]; write: boolean }
 type Verdict = { decision: "deny"; reason: string } | { decision: "allow" | "review" | "ask" };
 
 /** True when the command contains a heredoc marker outside quotes. Heredoc bodies are data. */
@@ -95,7 +96,7 @@ function analyzeSegment(segment: Segment): Verdict {
   const blocked = denyInvocation(segment.words);
   if (blocked !== undefined) return { decision: "deny", reason: blocked };
   if (dynamicExecution(segment.words)) return { decision: "ask" };
-  if (!segment.write && isReadOnlyInvocation(segment.words)) return { decision: "allow" };
+  if (!segment.write && isReadOnlyInvocation(segment.words, segment.globs)) return { decision: "allow" };
   return { decision: "review" };
 }
 
@@ -104,34 +105,112 @@ type Token = string | { comment: string } | { op: string; pattern?: string };
 
 interface ParsedLine { segments: Segment[]; complete: boolean }
 
+/** Characters that end an unquoted shell word. */
+const WORD_DELIMITER = /[\s;|&()<>]/;
+
+/**
+ * One entry per shell word, true when the word contains an unquoted expansion
+ * that can turn it into several arguments.
+ *
+ * `shell-quote` only marks `*` and `?` as globs, but bracket (`[ab]`) and brace
+ * (`{a,b}`) expansion, and unquoted parameter expansion, change the argument
+ * count too. This scan is quote- and escape-aware, so quoted or escaped expansion
+ * characters stay literal; matching the flags by position keeps the raw text out
+ * of the parsed-command logic.
+ */
+function wordExpansions(command: string): boolean[] {
+  const expansions: boolean[] = [];
+  let present = false;
+  let expansion = false;
+  let quote: "'" | '"' | "$'" | undefined;
+  const flush = () => {
+    if (!present) return;
+    expansions.push(expansion);
+    present = false;
+    expansion = false;
+  };
+  for (let index = 0; index < command.length; index++) {
+    const character = command[index];
+    if (quote === "'") {
+      if (character === "'") quote = undefined;
+      continue;
+    }
+    if (quote === "$'") {
+      if (character === "\\") index++;
+      else if (character === "'") quote = undefined;
+      continue;
+    }
+    if (quote === '"') {
+      if (character === "\\") index++;
+      else if (character === '"') quote = undefined;
+      continue;
+    }
+    if (character === "\\") {
+      present = true;
+      index++;
+      continue;
+    }
+    if (character === "'" || character === '"' || (character === "$" && command[index + 1] === "'")) {
+      present = true;
+      if (character === "'" || character === '"') quote = character;
+      else { quote = "$'"; index++; }
+      continue;
+    }
+    if (character === "#" && (index === 0 || WORD_DELIMITER.test(command[index - 1]))) {
+      const end = command.indexOf("\n", index);
+      flush();
+      if (end === -1) break;
+      index = end;
+      continue;
+    }
+    if (WORD_DELIMITER.test(character)) { flush(); continue; }
+    if (character === "*" || character === "?" || character === "[" || character === "{" ||
+        character === "$") expansion = true;
+    present = true;
+  }
+  flush();
+  return expansions;
+}
+
 /** Splits parsed tokens into simple commands, tracking whether the whole line parsed. */
-function lineSegments(tokens: readonly Token[]): ParsedLine {
-  const segments: Segment[] = [{ words: [], write: false }];
+function lineSegments(tokens: readonly Token[], expansions: readonly boolean[] = []): ParsedLine {
+  const segments: Segment[] = [{ words: [], globs: [], write: false }];
   let current = segments[0];
   let redirect: { write: boolean } | undefined;
+  let wordIndex = 0;
+  const nextExpansion = () => expansions[wordIndex++] ?? false;
   for (const token of tokens) {
     if (typeof token === "string") {
       if (redirect) {
         const target = token;
+        nextExpansion();
         if (redirect.write && target !== "/dev/null" && !/^\d+$/.test(target) && !target.startsWith("&"))
           current.write = true;
         redirect = undefined;
-      } else current.words.push(token);
+      } else {
+        current.words.push(token);
+        current.globs.push(nextExpansion());
+      }
       continue;
     }
     if ("comment" in token) continue;
     if (token.op === "glob" && token.pattern !== undefined) {
       if (redirect) {
         // A glob is still a redirection target, so it never becomes a command word.
+        nextExpansion();
         if (redirect.write) current.write = true;
         redirect = undefined;
-      } else current.words.push(token.pattern);
+      } else {
+        nextExpansion();
+        current.words.push(token.pattern);
+        current.globs.push(true);
+      }
       continue;
     }
     if (CONTROL_OPERATORS.has(token.op)) {
       // A control operator before the redirection target is invalid syntax.
       if (redirect) return { segments, complete: false };
-      current = { words: [], write: false };
+      current = { words: [], globs: [], write: false };
       segments.push(current);
       continue;
     }
@@ -155,7 +234,7 @@ function analyzeLine(command: string): Verdict {
   try { tokens = parseShell(command); }
   catch { return { decision: "ask" }; }
 
-  const { segments, complete } = lineSegments(tokens);
+  const { segments, complete } = lineSegments(tokens, wordExpansions(stripDescriptorPrefixes(command)));
   // Deny rules that are already visible must win even when later arguments are
   // dynamic (`sudo id $(...)`) and even when the line only parses partially.
   for (const segment of segments) {
@@ -172,6 +251,70 @@ function analyzeLine(command: string): Verdict {
   let review = false;
   for (const segment of segments) {
     const verdict = analyzeSegment(segment);
+    if (verdict.decision === "deny") return verdict;
+    if (verdict.decision === "ask") ask = true;
+    else if (verdict.decision === "review") review = true;
+  }
+  if (ask) return { decision: "ask" };
+  return { decision: review ? "review" : "allow" };
+}
+
+/**
+ * Splits a script into logical lines. Newlines inside quotes, or escaped by a
+ * backslash, are part of the current word rather than command separators, so a
+ * deny rule still sees the complete invocation (`sudo echo 'first\nsecond'`)
+ * before a line can fall back to manual approval.
+ */
+function logicalLines(command: string): string[] {
+  const lines: string[] = [];
+  let start = 0;
+  let quote: "'" | '"' | "$'" | undefined;
+  for (let index = 0; index < command.length; index++) {
+    const character = command[index];
+    if (quote === "'") {
+      if (character === "'") quote = undefined;
+      continue;
+    }
+    if (quote === "$'") {
+      if (character === "\\") index++;
+      else if (character === "'") quote = undefined;
+      continue;
+    }
+    if (quote === '"') {
+      if (character === "\\") index++;
+      else if (character === '"') quote = undefined;
+      continue;
+    }
+    if (character === "\\") { index++; continue; }
+    if (character === "'") { quote = "'"; continue; }
+    if (character === '"') { quote = '"'; continue; }
+    if (character === "$" && command[index + 1] === "'") { quote = "$'"; index++; continue; }
+    if (character === "#" && (index === 0 || WORD_DELIMITER.test(command[index - 1]))) {
+      // A comment runs to the end of the physical line; quotes inside it are text.
+      const end = command.indexOf("\n", index);
+      if (end === -1) break;
+      lines.push(command.slice(start, end));
+      start = end + 1;
+      index = end;
+      continue;
+    }
+    if (character === "\n") {
+      lines.push(command.slice(start, index));
+      start = index + 1;
+    }
+  }
+  lines.push(command.slice(start));
+  return lines;
+}
+
+/** Analyzes every logical line, keeping deny precedence over ask and review. */
+function analyzeLines(command: string): Verdict {
+  let ask = false;
+  let review = false;
+  for (const line of logicalLines(command)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const verdict = analyzeLine(trimmed);
     if (verdict.decision === "deny") return verdict;
     if (verdict.decision === "ask") ask = true;
     else if (verdict.decision === "review") review = true;
@@ -200,15 +343,12 @@ function analyzeHeredoc(command: string): Verdict {
     bodies.push({ lines: body, quoted: marker.quoted });
   }
 
-  let ask = false;
-  let review = false;
-  for (const line of [firstLine, ...lines.slice(index)]) {
-    if (!line.trim()) continue;
-    const verdict = analyzeLine(line);
-    if (verdict.decision === "deny") return verdict;
-    if (verdict.decision === "ask") ask = true;
-    else if (verdict.decision === "review") review = true;
-  }
+  // Analyze the command line and anything after the heredoc bodies as one
+  // script, so a quoted newline cannot split a blocked invocation in two.
+  const script = analyzeLines([firstLine, ...lines.slice(index)].join("\n"));
+  if (script.decision === "deny") return script;
+  let ask = script.decision === "ask";
+  const review = script.decision === "review";
   for (const body of bodies) {
     // Unquoted heredoc bodies undergo command and parameter expansion.
     if (!body.quoted && DYNAMIC_SYNTAX.test(body.lines.join("\n"))) return { decision: "ask" };
@@ -217,7 +357,7 @@ function analyzeHeredoc(command: string): Verdict {
     const words = parseShell(firstLine).filter((token): token is string => typeof token === "string");
     const executable = resolveExecutable(words);
     if (executable === undefined || SHELLS.has(executable.name) || SCRIPT_HOSTS.has(executable.name) ||
-        DYNAMIC.has(executable.name) || STATEFUL.has(executable.name)) return { decision: "ask" };
+        DYNAMIC.has(executable.name) || STATEFUL.has(executable.name)) ask = true;
   } catch { return { decision: "ask" }; }
   if (ask) return { decision: "ask" };
   return { decision: review ? "review" : "allow" };
@@ -225,20 +365,7 @@ function analyzeHeredoc(command: string): Verdict {
 
 function analyze(command: string): Verdict {
   if (hasHeredoc(command)) return analyzeHeredoc(command);
-  if (command.includes("\n")) {
-    let ask = false;
-    let review = false;
-    for (const line of command.split("\n")) {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith("#")) continue;
-      const verdict = analyzeLine(trimmed);
-      if (verdict.decision === "deny") return verdict;
-      if (verdict.decision === "ask") ask = true;
-      else if (verdict.decision === "review") review = true;
-    }
-    if (ask) return { decision: "ask" };
-    return { decision: review ? "review" : "allow" };
-  }
+  if (command.includes("\n")) return analyzeLines(command);
   return analyzeLine(command);
 }
 
