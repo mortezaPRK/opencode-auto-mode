@@ -4,10 +4,10 @@ import { clearConfigError, recordConfigError, recordDecision } from "./state.js"
 import { defaultPolicy } from "./policy.js";
 import { extractReviewContext } from "./transcript.js";
 import { scanResultContent, withInjectionWarning } from "./probe.js";
-import { buildStage1Prompt, buildStage2Prompt, parseDecision, parseStage1, withDenySuffix, UNCLEAR_RESPONSE, type PermissionRequest, type ReviewResult, type StageResult } from "./reviewer.js";
+import { buildStage1Prompt, buildStage2Prompt, parseDecision, parseStage1, withDenySuffix, type PermissionRequest, type ReviewResult, type StageResult } from "./reviewer.js";
 import { DEFAULT_REVIEW_TIMEOUT_MS, parseOptions, parseReviewerModel, type ReviewerModelRef } from "./config.js";
 import { compositeDecision } from "./classifier.js";
-import { decisionStage } from "./decisions.js";
+import { decisionStage, DEFAULT_DECISION_TIMEOUT_MS } from "./decisions.js";
 import { createAuditLog } from "./audit.js";
 import { createOtlpExporter } from "./otlp.js";
 import { createTraceExporter, type ClassifierAttempt } from "./traces.js";
@@ -98,7 +98,17 @@ export default Plugin.define({
           const signal = controller.signal;
           // A cancelled review must not start host or provider work at all.
           throwIfAborted(signal);
-          const info = await withTimeout(ctx.session.get({ sessionID: event.sessionID }, { signal }), 3_000, signal).catch(() => undefined);
+          let info: Awaited<ReturnType<typeof ctx.session.get>> | undefined;
+          let lookupError: ReviewErrorKind | undefined;
+          try {
+            info = await withTimeout(ctx.session.get({ sessionID: event.sessionID }, { signal }), 3_000, signal);
+          } catch (error) {
+            // The lookup only adds the session model and project directory, so
+            // a failure must not fail the review. Keep its category: when the
+            // missing session model is what prevents model review, the audit
+            // record and spans must still explain that the lookup blocked it.
+            lookupError = errorKindOf(error);
+          }
           // The session lookup swallow keeps a deadline or interruption from
           // failing the review, but an interrupted lookup must stop here.
           throwIfAborted(signal);
@@ -145,8 +155,12 @@ export default Plugin.define({
             }
             let outcome: StageResult;
             try {
-              outcome = stage.type === "llm" ? await llmDecision(ctx, request, policy, signal, stage.model, info?.model) :
-                await decisionStage(stage, request, policy, undefined, signal);
+              outcome = stage.type === "llm" ? await llmDecision(ctx, request, policy, signal, stage.model, info?.model, lookupError) :
+                // A typed provider may ignore its abort signal. Bound the stage
+                // here so an interruption or unload settles as cancelled right
+                // away instead of waiting for the overall review deadline.
+                await withTimeout(decisionStage(stage, request, policy, undefined, signal),
+                  stage.timeoutMs ?? DEFAULT_DECISION_TIMEOUT_MS, signal);
             } catch (error) {
               const kind = expired ? "deadline" : errorKindOf(error);
               outcome = { decision: "abstain", reason: `${stage.type} reviewer unavailable`, errorKind: kind };
@@ -272,9 +286,15 @@ function throwIfAborted(signal: AbortSignal): void {
   if (signal.aborted) throw new ReviewFailure("cancelled", "Review cancelled");
 }
 
-async function llmDecision(ctx: ReviewerContext, request: PermissionRequest, policy: ReturnType<typeof defaultPolicy>, signal: AbortSignal, model?: string, sessionModel?: ReviewerModelRef): Promise<StageResult> {
+async function llmDecision(ctx: ReviewerContext, request: PermissionRequest, policy: ReturnType<typeof defaultPolicy>, signal: AbortSignal, model?: string, sessionModel?: ReviewerModelRef, sessionLookupError?: ReviewErrorKind): Promise<StageResult> {
   const ref = model ? parseReviewerModel(model) : sessionModel;
-  if (!ref) return { decision: "abstain", reason: "Session model is unavailable; configure a reviewer model" };
+  if (!ref) return {
+    decision: "abstain",
+    reason: "Session model is unavailable; configure a reviewer model",
+    // Only a failed lookup explains the missing model; an explicit reviewer or
+    // a static stage is unaffected and must not inherit the lookup's category.
+    ...(sessionLookupError === undefined ? {} : { errorKind: sessionLookupError }),
+  };
   const prompt = buildStage1Prompt(request, policy);
   if (Buffer.byteLength(prompt) > 65_536) return { decision: "ask", reason: "Request too large for automatic review" };
   throwIfAborted(signal);
@@ -283,6 +303,7 @@ async function llmDecision(ctx: ReviewerContext, request: PermissionRequest, pol
   // The triage call may settle after an interruption; do not start stage two.
   throwIfAborted(signal);
   const response = await withTimeout(ctx.generate.text({ prompt: buildStage2Prompt(request, policy), model: ref }, { signal }), 30_000, signal);
-  const decision = parseDecision(response.text);
-  return decision.reason === UNCLEAR_RESPONSE ? { ...decision, errorKind: "invalid-output" } : decision;
+  // parseDecision reports malformed output structurally, so a valid verdict
+  // is never reclassified by comparing its reason text.
+  return parseDecision(response.text);
 }

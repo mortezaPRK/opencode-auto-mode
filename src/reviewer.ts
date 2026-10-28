@@ -110,9 +110,14 @@ export function parseDecision(text: string): ReviewResult {
     return { decision: match[1].toLowerCase() as Decision, reason: match[2].trim() };
   }
 
+  // Only a response that breaks the verdict contract is malformed. A valid
+  // verdict keeps the reason the reviewer chose, even when it reads like this
+  // fallback text, so the category travels with the parse result instead of
+  // being guessed from the reason later.
   return {
     decision: "ask",
     reason: UNCLEAR_RESPONSE,
+    errorKind: "invalid-output",
   };
 }
 

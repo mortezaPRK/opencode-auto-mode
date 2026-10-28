@@ -20,6 +20,8 @@ const choices = {
   ask: "Authorization, evidence, or impact is uncertain; the human must decide.",
 } as const;
 const MAX_BYTES = 65_536;
+/** Bounds one typed provider request so a hung provider cannot hold the review. */
+export const DEFAULT_DECISION_TIMEOUT_MS = 10_000;
 const SYSTEM_ONE_URL = "https://api.typesafe.ai/v1/systemone";
 const LOCAL_SYSTEM_ONE_URL = "http://127.0.0.1:8000/v1/systemone";
 const OPENAI_URL = "https://api.openai.com/v1/decisions";
@@ -33,7 +35,7 @@ type RuntimeDecisionStage = DecisionStage & { readonly apiKey?: string; readonly
 
 /** Per-request abort signal: the stage timeout bound by the overall review deadline. */
 function abortSignal(stage: RuntimeDecisionStage): AbortSignal {
-  const timeout = AbortSignal.timeout(stage.timeoutMs ?? 10_000);
+  const timeout = AbortSignal.timeout(stage.timeoutMs ?? DEFAULT_DECISION_TIMEOUT_MS);
   return stage.signal === undefined ? timeout : AbortSignal.any([timeout, stage.signal]);
 }
 

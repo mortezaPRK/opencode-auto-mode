@@ -28,11 +28,21 @@ describe("parseDecision", () => {
   });
 
   it("requires a complete unambiguous verdict", () => {
-    for (const text of ["allow, looks fine", "allowance unavailable", "ALLOW: safe\nDENY: unsafe", "ALLOW:", "ALLOW: yes\rno", "not allowed"])
-      assert.equal(parseDecision(text).decision, "ask", text);
+    for (const text of ["allow, looks fine", "allowance unavailable", "ALLOW: safe\nDENY: unsafe", "ALLOW:", "ALLOW: yes\rno", "not allowed"]) {
+      const parsed = parseDecision(text);
+      assert.equal(parsed.decision, "ask", text);
+      assert.equal(parsed.errorKind, "invalid-output", text);
+    }
     const unclear = parseDecision("maybe, need more context");
     assert.equal(unclear.decision, "ask");
     assert.match(unclear.reason, /unclear/);
+    assert.equal(unclear.errorKind, "invalid-output");
+  });
+
+  it("keeps a valid ask whose reason matches the unclear text out of the malformed category", () => {
+    const parsed = parseDecision("ASK: Reviewer response unclear");
+    assert.deepEqual(parsed, { decision: "ask", reason: "Reviewer response unclear" });
+    assert.equal(parsed.errorKind, undefined);
   });
 });
 

@@ -63,6 +63,125 @@ function lastRecord(file: string): Record<string, unknown> {
   return JSON.parse(readFileSync(file, "utf8").trim().split("\n").at(-1)!);
 }
 
+interface ExportedSpan {
+  status: { code: number };
+  attributes: { key: string; value: { stringValue?: string } }[];
+}
+function exportedSpans(body: string): ExportedSpan[] {
+  return JSON.parse(body).resourceSpans[0].scopeSpans[0].spans;
+}
+function spanValue(span: ExportedSpan, key: string): string | undefined {
+  return span.attributes.find((entry) => entry.key === key)?.value.stringValue;
+}
+
+/** Captures OTLP exports and, when `hangProvider` is set, holds provider requests open. */
+function captureFetch(hangProvider = false) {
+  const original = globalThis.fetch;
+  const traceBodies: string[] = [];
+  let providerCalls = 0;
+  let release: ((response: Response) => void) | undefined;
+  globalThis.fetch = ((input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input);
+    if (url.endsWith("/v1/traces")) { traceBodies.push(String(init?.body)); return Promise.resolve(new Response()); }
+    if (url.endsWith("/v1/logs")) return Promise.resolve(new Response());
+    providerCalls++;
+    return hangProvider ? new Promise<Response>((resolve) => { release = resolve; }) : Promise.resolve(new Response());
+  }) as typeof fetch;
+  return {
+    traceBodies,
+    providerCalls: () => providerCalls,
+    release: (response: Response) => release?.(response),
+    restore: () => { globalThis.fetch = original; },
+  };
+}
+
+/** Records timer handles so a test can prove cancellation cleared its bounds. */
+function trackTimers() {
+  const originalSet = globalThis.setTimeout;
+  const originalClear = globalThis.clearTimeout;
+  const created: { handle: ReturnType<typeof setTimeout>; ms?: number }[] = [];
+  const cleared = new Set<ReturnType<typeof setTimeout>>();
+  globalThis.setTimeout = ((handler: () => void, ms?: number, ...args: unknown[]) => {
+    const schedule = originalSet as unknown as (callback: () => void, timeout?: number, ...rest: unknown[]) => ReturnType<typeof setTimeout>;
+    const handle = schedule(handler, ms, ...args);
+    created.push({ handle, ms });
+    return handle;
+  }) as unknown as typeof globalThis.setTimeout;
+  globalThis.clearTimeout = ((handle?: ReturnType<typeof setTimeout>) => {
+    if (handle !== undefined) cleared.add(handle);
+    originalClear(handle);
+  }) as typeof globalThis.clearTimeout;
+  return {
+    created, cleared,
+    restore: () => { globalThis.setTimeout = originalSet; globalThis.clearTimeout = originalClear; },
+  };
+}
+const providerAnswer = JSON.stringify({ answers: { permission: {
+  type: "choice", choice: "allow", confidence: 0.99, probabilities: { allow: 0.99, deny: 0.005, ask: 0.005 },
+} } });
+
+/**
+ * A typed provider that never settles and ignores its abort signal must not
+ * hold the review until the overall deadline. Cancellation has to settle the
+ * review, keep the fallback stage untouched, finalize pending spans, and clear
+ * every bound it armed.
+ */
+async function expectHungTypedReviewCancelled(stop: "interrupt" | "unload"): Promise<void> {
+  const directory = mkdtempSync(join(tmpdir(), "automode-hung-"));
+  const exports = captureFetch(true);
+  const timers = trackTimers();
+  try {
+    const file = join(directory, "audit.jsonl");
+    const host = await setup({
+      classifiers: [
+        { type: "decision", model: "laya/local", timeoutMs: 7_777 },
+        { type: "decision", model: "laya/local" },
+      ],
+      reviewTimeoutMs: 4_321,
+      auditLog: file,
+      otlp: { endpoint: "http://collector:4318" },
+    });
+    const pending = event();
+    const startedAt = Date.now();
+    const evaluation = host.evaluate(pending);
+    await waitFor(() => exports.providerCalls() === 1);
+    if (stop === "interrupt") host.interrupt();
+    else await host.cleanup();
+    await evaluation;
+    assert.ok(Date.now() - startedAt < 3_000, "cancellation must not wait for the review deadline");
+    assert.equal(pending.effect, "ask");
+    assert.match(pending.message!, /interrupted/i);
+    assert.equal(exports.providerCalls(), 1, "no fallback provider may start after cancellation");
+    assert.equal(host.prompts.length, 0, "no fallback reviewer may start after cancellation");
+    const record = lastRecord(file);
+    assert.equal(record.error, true);
+    assert.equal(record.errorKind, "cancelled");
+    assert.equal(exports.traceBodies.length, 1, "the settled review must export its trace once");
+    const spans = exportedSpans(exports.traceBodies[0]!);
+    assert.equal(spans.length, 2);
+    for (const span of spans) {
+      assert.equal(span.status.code, 2);
+      assert.equal(spanValue(span, "error.kind"), "cancelled");
+    }
+    for (const ms of [7_777, 4_321]) {
+      const timer = timers.created.find((item) => item.ms === ms);
+      assert.ok(timer, `the ${ms}ms bound must be armed`);
+      assert.ok(timers.cleared.has(timer.handle), `cancellation must clear the ${ms}ms timer`);
+    }
+    // The provider still settles later; it must not mutate the exported span
+    // or produce a second export.
+    exports.release(new Response(providerAnswer));
+    await delay(10);
+    assert.equal(exports.traceBodies.length, 1, "a late provider must not export again");
+    assert.equal(spanValue(exportedSpans(exports.traceBodies[0]!)[1]!, "error.kind"), "cancelled");
+    if (stop === "interrupt") await host.cleanup();
+  } finally {
+    timers.restore();
+    exports.restore();
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
 describe("OpenCode permission hook", () => {
   it("only reviews actions that OpenCode asks about", async () => {
     const host = await setup({ classifiers: [{ type: "llm" }] });
@@ -264,6 +383,12 @@ describe("OpenCode permission hook", () => {
       assert.match(pending.message!, /interrupted/i);
     }
   });
+  it("settles a hung typed reviewer as cancelled when the session is interrupted", async () => {
+    await expectHungTypedReviewCancelled("interrupt");
+  });
+  it("settles a hung typed reviewer as cancelled when the plugin unloads", async () => {
+    await expectHungTypedReviewCancelled("unload");
+  });
   it("stops before starting a fallback provider with an already-aborted signal", async () => {
     const host = await setup({ classifiers: [{ type: "llm" }, { type: "llm" }], reviewTimeoutMs: 5_000 });
     const signals: AbortSignal[] = [];
@@ -322,6 +447,49 @@ describe("OpenCode permission hook", () => {
     assert.equal(generateCalls, 0);
     await host.cleanup();
   });
+  it("reports why a failed session lookup blocked model review", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "automode-lookup-"));
+    try {
+      const file = join(directory, "audit.jsonl");
+      const host = await setup({ classifiers: [{ type: "llm" }], auditLog: file });
+      host.ctx.session.get = async () => { throw new Error("lookup unavailable"); };
+      const pending = event();
+      await host.evaluate(pending);
+      assert.equal(pending.effect, "ask");
+      assert.deepEqual(host.prompts, []);
+      const record = lastRecord(file);
+      assert.equal(record.decision, "ask");
+      assert.equal(record.error, true);
+      assert.equal(record.errorKind, "provider");
+      assert.doesNotMatch(JSON.stringify(record), /lookup unavailable/);
+      await host.cleanup();
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+  it("keeps an explicitly configured reviewer working when the session lookup fails", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "automode-lookup-"));
+    try {
+      const file = join(directory, "audit.jsonl");
+      const host = await setup({ classifiers: [{ type: "llm", model: "anthropic/claude-sonnet-4-5" }], auditLog: file });
+      host.ctx.session.get = async () => { throw new Error("lookup unavailable"); };
+      const pending = event();
+      await host.evaluate(pending);
+      assert.equal(pending.effect, "allow");
+      assert.equal(host.prompts.length, 2);
+      const record = lastRecord(file);
+      assert.equal(record.decision, "allow");
+      assert.equal(record.error, undefined);
+      assert.equal(record.errorKind, undefined);
+      await host.cleanup();
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+  it("keeps static review working when the session lookup fails", async () => {
+    const host = await setup({ classifiers: [{ type: "static" }] });
+    host.ctx.session.get = async () => { throw new Error("lookup unavailable"); };
+    const pending = { ...event(), resources: ["sudo rm -rf /"] };
+    await host.evaluate(pending);
+    assert.equal(pending.effect, "deny");
+    await host.cleanup();
+  });
   it("reports cancellation over an earlier provider failure", async () => {
     const directory = mkdtempSync(join(tmpdir(), "automode-cancelled-"));
     try {
@@ -359,6 +527,38 @@ describe("OpenCode permission hook", () => {
       assert.equal(record.errorKind, "context");
       await host.cleanup();
     } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+  it("reports a valid unclear ask without marking audit or spans as errors", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "automode-ask-"));
+    const exports = captureFetch();
+    try {
+      const file = join(directory, "audit.jsonl");
+      const host = await setup(
+        { classifiers: [{ type: "llm" }], auditLog: file, otlp: { endpoint: "http://collector:4318" } },
+        [{ type: "user", text: "Create a file named a" }],
+        ["BLOCK", "ASK: Reviewer response unclear"],
+      );
+      const pending = event();
+      await host.evaluate(pending);
+      assert.equal(pending.effect, "ask");
+      assert.equal(pending.message, "Reviewer response unclear");
+      const record = lastRecord(file);
+      assert.equal(record.decision, "ask");
+      assert.equal(record.error, undefined);
+      assert.equal(record.errorKind, undefined);
+      assert.equal(exports.traceBodies.length, 1);
+      const spans = exportedSpans(exports.traceBodies[0]!);
+      assert.equal(spans.length, 2);
+      for (const span of spans) {
+        assert.equal(span.status.code, 1);
+        assert.equal(spanValue(span, "error.kind"), undefined);
+      }
+      assert.equal(spanValue(spans[1]!, "decision"), "ask");
+      await host.cleanup();
+    } finally {
+      exports.restore();
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
   it("reports the deadline rather than the cancellation it triggers", async () => {
     const directory = mkdtempSync(join(tmpdir(), "automode-deadline-"));
