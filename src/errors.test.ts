@@ -18,8 +18,10 @@ describe("review error categories", () => {
     for (const kind of kinds) assert.equal(errorKindOf(new ReviewFailure(kind, "bounded")), kind);
   });
   it("classifies malformed output and unknown provider failures", () => {
-    assert.equal(errorKindOf(new Error("Invalid decision response")), "invalid-output");
-    assert.equal(errorKindOf(new Error("Decision response too large")), "invalid-output");
+    assert.equal(errorKindOf(new ReviewFailure("invalid-output", "Invalid decision response")), "invalid-output");
+    assert.equal(errorKindOf(new Error("wrapped", { cause: new ReviewFailure("invalid-output", "Invalid decision response") })), "invalid-output");
+    assert.equal(errorKindOf(new Error("Invalid API key")), "provider");
+    assert.equal(errorKindOf(new Error("Invalid decision response")), "provider");
     assert.equal(errorKindOf(new Error("connection refused")), "provider");
     assert.equal(errorKindOf("not an error"), "provider");
   });

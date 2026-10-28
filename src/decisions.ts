@@ -12,7 +12,7 @@ import { AIError, InvalidProviderOutputError, ModelID } from "@opencode/ai";
 import { localEndpoint, parseReviewerModel, type DecisionStage } from "./config.js";
 import { buildReviewPrompt, type Decision, type PermissionRequest, type StageResult } from "./reviewer.js";
 import type { ReviewPolicy } from "./policy.js";
-import { errorKindOf } from "./errors.js";
+import { errorKindOf, ReviewFailure } from "./errors.js";
 
 const choices = {
   allow: "The whole action is safe and authorized by the user for this exact scope.",
@@ -48,14 +48,14 @@ function object(value: unknown): value is Record<string, unknown> {
 function answer(value: unknown, stage: RuntimeDecisionStage): StageResult {
   if (!object(value) || value.type !== "choice" || typeof value.choice !== "string" || !Object.hasOwn(choices, value.choice) ||
       !probability(value.confidence) || !object(value.probabilities))
-    throw new Error("Invalid decision response");
+    throw new ReviewFailure("invalid-output", "Invalid decision response");
   const entries = Object.entries(value.probabilities);
   if (entries.length !== 3 || entries.some(([key, value]) => !Object.hasOwn(choices, key) || !probability(value)))
-    throw new Error("Invalid decision probabilities");
+    throw new ReviewFailure("invalid-output", "Invalid decision probabilities");
   const probabilities = value.probabilities as Record<Decision, number>;
   if (Math.abs(Object.values(probabilities).reduce((a, b) => a + b, 0) - 1) > 0.01 ||
       probabilities[value.choice as Decision] < Math.max(...Object.values(probabilities)))
-    throw new Error("Inconsistent decision probabilities");
+    throw new ReviewFailure("invalid-output", "Inconsistent decision probabilities");
   if (value.choice === "ask") return { decision: "ask", reason: `${stage.model} requested human review` };
   const threshold = stage.minConfidence ?? 0.9;
   if (value.confidence < threshold || probabilities[value.choice as Decision] < threshold) {
@@ -63,6 +63,11 @@ function answer(value: unknown, stage: RuntimeDecisionStage): StageResult {
     return { decision: "abstain", reason: `${stage.model} abstained below the confidence threshold` };
   }
   return { decision: value.choice as Decision, reason: `${stage.model} decision (confidence ${value.confidence})` };
+}
+
+function parseJSON(value: string): unknown {
+  try { return JSON.parse(value); }
+  catch (error) { throw new ReviewFailure("invalid-output", "Decision response is not valid JSON", { cause: error }); }
 }
 
 async function readJSON(response: Response): Promise<unknown> {
@@ -75,10 +80,10 @@ async function readJSON(response: Response): Promise<unknown> {
       const { done, value } = await reader.read();
       if (done) break;
       size += value.length;
-      if (size > MAX_BYTES) throw new Error("Decision response too large");
+      if (size > MAX_BYTES) throw new ReviewFailure("invalid-output", "Decision response too large");
       chunks.push(value);
     }
-    return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    return parseJSON(Buffer.concat(chunks).toString("utf8"));
   } finally {
     await reader.cancel().catch(() => {});
     reader.releaseLock();
@@ -96,8 +101,10 @@ function systemOneEndpoint(stage: RuntimeDecisionStage): string {
 }
 
 function evaluationChoice(value: unknown): EvaluationAnswer {
-  if (!object(value) || value.type !== "choice" || typeof value.choice !== "string") throw new Error("Invalid System One answer");
-  if (!object(value.probabilities) || !probability(value.confidence)) throw new Error("Invalid System One answer");
+  if (!object(value) || value.type !== "choice" || typeof value.choice !== "string")
+    throw new ReviewFailure("invalid-output", "Invalid System One answer");
+  if (!object(value.probabilities) || !probability(value.confidence))
+    throw new ReviewFailure("invalid-output", "Invalid System One answer");
   return {
     type: "choice",
     choice: value.choice,
@@ -185,15 +192,16 @@ async function openAIDecision(
   });
   const parsed = await readJSON(response);
   if (!object(parsed) || !Array.isArray(parsed.answers) || parsed.answers.length !== 1 || !object(parsed.answers[0]) ||
-      parsed.answers[0].name !== "permission") throw new Error("Invalid OpenAI answer");
+      parsed.answers[0].name !== "permission") throw new ReviewFailure("invalid-output", "Invalid OpenAI answer");
   const selected = parsed.answers[0];
   if (selected.type === "refusal") return { decision: "abstain", reason: `${stage.model} declined the decision` };
   if (!Array.isArray(selected.probabilities) || selected.probabilities.length !== 3)
-    throw new Error("Invalid OpenAI probabilities");
+    throw new ReviewFailure("invalid-output", "Invalid OpenAI probabilities");
   const distribution: Record<string, unknown> = {};
   for (const entry of selected.probabilities) {
     if (!object(entry) || typeof entry.value !== "string" || !Object.hasOwn(choices, entry.value) ||
-        Object.hasOwn(distribution, entry.value)) throw new Error("Invalid OpenAI probability entry");
+        Object.hasOwn(distribution, entry.value))
+      throw new ReviewFailure("invalid-output", "Invalid OpenAI probability entry");
     distribution[entry.value] = entry.probability;
   }
   return answer({ ...selected, probabilities: distribution }, stage);

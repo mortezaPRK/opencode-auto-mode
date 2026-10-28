@@ -8,9 +8,25 @@ export class ReviewFailure extends Error {
   }
 }
 
+/** Finds an explicit category even when a provider library wraps our failure. */
+function explicitKind(error: unknown): ReviewErrorKind | undefined {
+  let current = error;
+  for (let depth = 0; depth < 4; depth++) {
+    if (current instanceof ReviewFailure) return current.kind;
+    if (typeof current !== "object" || current === null) return undefined;
+    const cause = (current as { cause?: unknown }).cause;
+    if (cause === undefined || cause === current) return undefined;
+    current = cause;
+  }
+  return undefined;
+}
+
 /** Maps arbitrary thrown values to a bounded category without exposing provider text. */
 export function errorKindOf(error: unknown): ReviewErrorKind {
-  if (error instanceof ReviewFailure) return error.kind;
+  // Only ReviewFailure marks malformed reviewer output. Provider text such as
+  // "Invalid API key" stays a provider failure even when a wrapper reuses it.
+  const explicit = explicitKind(error);
+  if (explicit !== undefined) return explicit;
   const name = error instanceof Error ? error.name : "";
   const message = error instanceof Error ? error.message : "";
   // AbortSignal.timeout() aborts with a TimeoutError whose message also says
@@ -19,6 +35,5 @@ export function errorKindOf(error: unknown): ReviewErrorKind {
       (typeof DOMException === "function" && error instanceof DOMException && error.code === DOMException.TIMEOUT_ERR)) return "timeout";
   if (name === "AbortError" || /abort|cancel/i.test(message)) return "cancelled";
   if (/timeout|timed out/i.test(message)) return "timeout";
-  if (/invalid|too large|unexpected/i.test(message)) return "invalid-output";
   return "provider";
 }

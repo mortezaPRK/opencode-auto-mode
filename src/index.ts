@@ -10,7 +10,7 @@ import { compositeDecision } from "./classifier.js";
 import { decisionStage } from "./decisions.js";
 import { createAuditLog } from "./audit.js";
 import { createOtlpExporter } from "./otlp.js";
-import { createTraceExporter } from "./traces.js";
+import { createTraceExporter, type ClassifierAttempt } from "./traces.js";
 import { errorKindOf, ReviewFailure, type ReviewErrorKind } from "./errors.js";
 import { withTimeout } from "./timeout.js";
 
@@ -62,6 +62,15 @@ export default Plugin.define({
       })();
     }
 
+    // A failed hook registration must not leave the event reader or reviews alive.
+    const abandonSetup = () => {
+      subscriptions.abort();
+      for (const controllers of running.values()) {
+        for (const controller of controllers) controller.abort();
+      }
+      running.clear();
+    };
+
     const permissionRegistration = await ctx.permission.hook("evaluate", async (event) => {
       if (event.effect !== "ask") return;
       if (!options) {
@@ -82,6 +91,7 @@ export default Plugin.define({
       let errorKind: ReviewErrorKind | undefined;
       let expired = false;
       let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+      let pendingAttempt: ClassifierAttempt | undefined;
 
       const review = (async (): Promise<ReviewResult> => {
         try {
@@ -120,20 +130,36 @@ export default Plugin.define({
             throwIfAborted(signal);
             const policy = defaultPolicy(stage.policy);
             const attemptStartedAt = Date.now();
+            let attempt: ClassifierAttempt | undefined;
+            if (trace !== undefined) {
+              // Register the child span before awaiting the provider so a
+              // deadline can export it even when the provider never settles.
+              attempt = {
+                index: options.classifiers.indexOf(stage), type: stage.type,
+                model: stage.model ?? (info?.model ? `${info.model.providerID}/${info.model.id}` : undefined),
+                startedAt: attemptStartedAt, durationMs: 0,
+                result: { decision: "abstain", reason: "Review attempt pending", errorKind: "cancelled" },
+              };
+              trace.attempts.push(attempt);
+              pendingAttempt = attempt;
+            }
             let outcome: StageResult;
             try {
               outcome = stage.type === "llm" ? await llmDecision(ctx, request, policy, signal, stage.model, info?.model) :
                 await decisionStage(stage, request, policy, undefined, signal);
             } catch (error) {
-              const kind = errorKindOf(error);
+              const kind = expired ? "deadline" : errorKindOf(error);
               outcome = { decision: "abstain", reason: `${stage.type} reviewer unavailable`, errorKind: kind };
             }
             if (outcome.errorKind !== undefined) errorKind ??= outcome.errorKind;
-            trace?.attempts.push({
-              index: options.classifiers.indexOf(stage), type: stage.type,
-              model: stage.model ?? (info?.model ? `${info.model.providerID}/${info.model.id}` : undefined),
-              startedAt: attemptStartedAt, durationMs: Date.now() - attemptStartedAt, result: outcome,
-            });
+            // A deadline or cancellation owns the final cause. Leave the span
+            // pending for the finalizer instead of letting the aborted
+            // provider overwrite an outcome that was already exported.
+            if (attempt !== undefined && pendingAttempt === attempt && !expired && !signal.aborted) {
+              pendingAttempt = undefined;
+              attempt.durationMs = Date.now() - attemptStartedAt;
+              attempt.result = outcome;
+            }
             return outcome;
           });
         } catch (error) {
@@ -177,6 +203,22 @@ export default Plugin.define({
         reason = "Auto-mode review was interrupted; please decide yourself";
         errorKind = "cancelled";
       }
+      // Finalize a child span whose provider is still running so the exported
+      // trace reports the termination cause without waiting for it.
+      if (pendingAttempt !== undefined) {
+        const attempt = pendingAttempt;
+        pendingAttempt = undefined;
+        attempt.durationMs = Date.now() - attempt.startedAt;
+        attempt.result = {
+          decision: "abstain",
+          reason: expired ? "Review deadline exceeded" : "Review cancelled",
+          errorKind: expired ? "deadline" : "cancelled",
+        };
+      }
+      // Release any provider request still running after a local timeout.
+      // This runs after cancellation normalization so a completed allow/deny
+      // is delivered unchanged.
+      controller.abort();
       event.effect = decision;
       event.message = decision === "deny" ? withDenySuffix(reason) : reason;
       if (decision === "deny") {
@@ -197,6 +239,9 @@ export default Plugin.define({
       trace?.finish(auditRecord);
       for (const sink of sinks) sink.write(auditRecord);
       recordDecision({ requestID: reviewID, sessionID: event.sessionID, decision: event.effect, reason: "", at: Date.now() });
+    }).catch((error) => {
+      abandonSetup();
+      throw error;
     });
     const toolRegistration = await ctx.tool.hook("execute.after", (event) => {
       try {
@@ -206,16 +251,13 @@ export default Plugin.define({
           result.content = withInjectionWarning(result.content as string | ReadonlyArray<{ type: string; text?: string }>);
       } catch { log.log("Output screening failed"); }
     }).catch(async (error) => {
+      abandonSetup();
       await permissionRegistration.dispose();
       throw error;
     });
     log.log("Auto-mode loaded");
     return async () => {
-      subscriptions.abort();
-      for (const controllers of running.values()) {
-        for (const controller of controllers) controller.abort();
-      }
-      running.clear();
+      abandonSetup();
       try { await permissionRegistration.dispose(); }
       finally { await toolRegistration.dispose(); counts.clear(); log.log("Auto-mode unloaded"); }
     };

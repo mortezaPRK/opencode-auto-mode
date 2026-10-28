@@ -16,8 +16,10 @@ async function setup(options: unknown = {}, messages: unknown[] = [{ type: "user
   const prompts: string[] = [];
   const models: ({ id: string; providerID: string; variant?: string } | null | undefined)[] = [];
   const interrupts: { data: { sessionID: string } }[] = [];
+  const subscriptionSignals: AbortSignal[] = [];
   let wake: (() => void) | undefined;
   async function* subscribe(input: { signal?: AbortSignal }) {
+    if (input.signal !== undefined) subscriptionSignals.push(input.signal);
     while (!input.signal?.aborted) {
       if (!interrupts.length) {
         await new Promise<void>((resolve) => {
@@ -40,7 +42,8 @@ async function setup(options: unknown = {}, messages: unknown[] = [{ type: "user
   };
   const cleanup = await plugin.setup(ctx as unknown as Parameters<typeof plugin.setup>[0]);
   return {
-    evaluate, prompts, models, ctx, disposed: () => disposed,
+    evaluate: (evaluation: Evaluation) => evaluate(evaluation),
+    prompts, models, ctx, disposed: () => disposed, subscriptionSignals,
     interrupt: (sessionID = "session-test") => { interrupts.push({ data: { sessionID } }); wake?.(); },
     cleanup: async () => { await cleanup?.(); },
   };
@@ -204,16 +207,16 @@ describe("OpenCode permission hook", () => {
     assert.match(pending.message!, /interrupted/i);
     await host.cleanup();
   });
-  it("records a bounded failure kind in the audit log", async () => {
+  it("keeps provider authentication failures categorized as provider", async () => {
     const directory = mkdtempSync(join(tmpdir(), "automode-audit-"));
     try {
       const host = await setup({ classifiers: [{ type: "llm" }], auditLog: join(directory, "audit.jsonl") });
-      host.ctx.generate.text = async () => { throw new Error("provider key rejected"); };
+      host.ctx.generate.text = async () => { throw new Error("Invalid API key"); };
       await host.evaluate(event());
       const record = JSON.parse(readFileSync(join(directory, "audit.jsonl"), "utf8").trim().split("\n").at(-1)!);
       assert.equal(record.error, true);
       assert.equal(record.errorKind, "provider");
-      assert.doesNotMatch(JSON.stringify(record), /provider key rejected/);
+      assert.doesNotMatch(JSON.stringify(record), /Invalid API key/);
       await host.cleanup();
     } finally { rmSync(directory, { recursive: true, force: true }); }
   });
@@ -386,6 +389,124 @@ describe("OpenCode permission hook", () => {
       assert.equal(lastRecord(file).errorKind, "deadline");
       await host.cleanup();
     } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+  it("exports a pending typed attempt when the review deadline expires", async () => {
+    const originalFetch = globalThis.fetch;
+    let traceBody: string | undefined;
+    let traceRequests = 0;
+    let releaseProvider: ((response: Response) => void) | undefined;
+    globalThis.fetch = ((input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/v1/traces")) {
+        traceRequests++;
+        traceBody = String(init?.body);
+        return Promise.resolve(new Response());
+      }
+      if (url.endsWith("/v1/logs")) return Promise.resolve(new Response());
+      return new Promise<Response>((resolve) => { releaseProvider = resolve; });
+    }) as typeof fetch;
+    try {
+      const host = await setup({
+        classifiers: [{ type: "decision", model: "laya/local", endpoint: "http://127.0.0.1:8000/v1/systemone" }],
+        reviewTimeoutMs: 1_000,
+        otlp: { endpoint: "http://collector:4318" },
+      });
+      const startedAt = Date.now();
+      const pending = event();
+      await host.evaluate(pending);
+      assert.equal(pending.effect, "ask");
+      assert.match(pending.message!, /deadline/i);
+      assert.ok(Date.now() - startedAt < 5_000);
+      assert.ok(traceBody, "the deadline must export the trace");
+      const spans = JSON.parse(traceBody!).resourceSpans[0].scopeSpans[0].spans;
+      assert.equal(spans.length, 2);
+      assert.equal(spans[1].name, "auto_mode.classifier");
+      assert.equal(spans[1].attributes.find((attr: { key: string }) => attr.key === "classifier.type").value.stringValue, "decision");
+      assert.equal(spans[1].attributes.find((attr: { key: string }) => attr.key === "error.kind").value.stringValue, "deadline");
+      assert.equal(spans[1].status.code, 2);
+      assert.equal(spans[0].attributes.find((attr: { key: string }) => attr.key === "error.kind").value.stringValue, "deadline");
+      releaseProvider?.(new Response(JSON.stringify({ answers: { permission: {
+        type: "choice", choice: "allow", confidence: 0.99, probabilities: { allow: 0.99, deny: 0.005, ask: 0.005 },
+      } } })));
+      await delay(10);
+      assert.equal(traceRequests, 1, "a late provider must not export again");
+      assert.equal(JSON.parse(traceBody!).resourceSpans[0].scopeSpans[0].spans[1]
+        .attributes.find((attr: { key: string }) => attr.key === "error.kind").value.stringValue, "deadline");
+      await host.cleanup();
+    } finally { globalThis.fetch = originalFetch; }
+  });
+  it("releases provider calls after a successful decision without changing it", async () => {
+    const host = await setup({ classifiers: [{ type: "llm" }] });
+    let providerSignal: AbortSignal | undefined;
+    host.ctx.generate.text = ((_input: { prompt: string }, request?: { signal?: AbortSignal }) => {
+      providerSignal = request?.signal;
+      return Promise.resolve({ text: "ALLOW" });
+    }) as typeof host.ctx.generate.text;
+    const pending = event();
+    await host.evaluate(pending);
+    assert.equal(pending.effect, "allow");
+    assert.ok(providerSignal?.aborted, "the finished review must release its provider signal");
+    await host.cleanup();
+  });
+  it("releases a timed-out decision request without turning it into a cancellation", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = ((_input: string | URL | Request, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener("abort", () => reject(init.signal!.reason), { once: true });
+    })) as typeof fetch;
+    try {
+      const host = await setup({
+        classifiers: [{ type: "decision", model: "laya/local", timeoutMs: 20 }],
+        reviewTimeoutMs: 5_000,
+      });
+      let reviewSignal: AbortSignal | undefined;
+      host.ctx.session.get = (async (_input: unknown, request?: { signal?: AbortSignal }) => {
+        reviewSignal = request?.signal;
+        return { location: { directory: "/repo" }, model: { providerID: "session-provider", id: "session-model", variant: "high" } };
+      }) as typeof host.ctx.session.get;
+      const pending = event();
+      await host.evaluate(pending);
+      assert.equal(pending.effect, "ask");
+      assert.match(pending.message!, /unavailable|no classifier/i);
+      assert.ok(reviewSignal?.aborted, "cleanup must abort the review controller after a local timeout");
+      await host.cleanup();
+    } finally { globalThis.fetch = originalFetch; }
+  });
+  it("aborts the event subscription when permission hook registration fails", async () => {
+    const host = await setup({ classifiers: [{ type: "static" }] });
+    host.ctx.permission.hook = async () => { throw new Error("permission registration failed"); };
+    await assert.rejects(Promise.resolve(plugin.setup(host.ctx as unknown as Parameters<typeof plugin.setup>[0])));
+    assert.equal(host.subscriptionSignals.length, 2);
+    assert.equal(host.subscriptionSignals[1]!.aborted, true);
+    await host.cleanup();
+  });
+  it("aborts the subscription and active reviews when tool hook registration fails", async () => {
+    const host = await setup({ classifiers: [{ type: "llm" }] });
+    let rejectTool!: (error: Error) => void;
+    let toolStarted!: () => void;
+    const toolRegistration = new Promise<void>((resolve) => { toolStarted = resolve; });
+    host.ctx.tool.hook = (() => {
+      toolStarted();
+      return new Promise((_resolve, reject) => { rejectTool = reject; });
+    }) as typeof host.ctx.tool.hook;
+    const setupRun = plugin.setup(host.ctx as unknown as Parameters<typeof plugin.setup>[0]);
+    await toolRegistration;
+    assert.equal(host.subscriptionSignals.length, 2);
+    let providerSignal: AbortSignal | undefined;
+    host.ctx.generate.text = ((_input: { prompt: string }, request?: { signal?: AbortSignal }) => {
+      providerSignal = request?.signal;
+      return new Promise<{ text: string }>(() => {});
+    }) as typeof host.ctx.generate.text;
+    const pending = event();
+    const reviewRun = host.evaluate(pending);
+    await waitFor(() => providerSignal !== undefined);
+    rejectTool(new Error("tool registration failed"));
+    await assert.rejects(Promise.resolve(setupRun));
+    assert.equal(host.subscriptionSignals[1]!.aborted, true);
+    await waitFor(() => providerSignal!.aborted);
+    await reviewRun;
+    assert.equal(pending.effect, "ask");
+    assert.match(pending.message!, /interrupted/i);
+    await host.cleanup();
   });
   it("keeps repeated policy denials denied and disposes partial setup", async () => {    const host = await setup({ classifiers: [{ type: "static" }] });
     for (let i = 0; i < 25; i++) {
