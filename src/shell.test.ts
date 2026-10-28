@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { compositeDecision } from "./classifier.js";
-import { escapeLiteralHashes, hasAmbiguousDescriptorClose, stripDescriptorPrefixes } from "./shell-policy.js";
+import { escapeLiteralHashes, hasAmbiguousDescriptorClose, normalizeContinuations, stripDescriptorPrefixes } from "./shell-policy.js";
 import { guardShell, shellWords } from "./shell.js";
 
 const unused = async () => { throw new Error("unexpected reviewer call"); };
@@ -102,6 +102,59 @@ describe("shell approval guard", () => {
       "cat <<'EOF'\ntext\nEOF\nsudo echo 'first\nsecond'"])
       assert.equal(guardShell([command])?.decision, "deny", command);
     assert.equal(guardShell(["echo 'first\nsecond'"])?.decision, "allow");
+  });
+  it("denies blocked invocations split by a backslash continuation", () => {
+    for (const command of ["sudo echo first \\\nsecond", "pwd; sudo \\\nid", "pwd; s\\\nu\\\ndo id",
+      "su\\\ndo id", "pwd; rm -r\\\nf /", "rm -rf \\\n/", "chmod 77\\\n7 secret",
+      "chmod 777 2\\\n>/dev/null secret", "mkfs.ext\\\n4 /dev/sda1", "dd of=\\\n/dev/sda",
+      "shutdown -\\\nh now", "stdbuf -o L \\\nsudo id", "env -u HOME sudo \\\nid",
+      "bash -c 'sudo echo first \\\nsecond'", "bash -c 's\\\nudo id'", "eval 'rm -rf \\\n/'",
+      "cat <<'EOF'\ntext\nEOF\nsudo echo first \\\nsecond", "cat <<'EOF'\na \\\nb\nEOF\nsudo \\\nid"])
+      assert.equal(guardShell([command])?.decision, "deny", command);
+  });
+  it("keeps continuations literal where the shell keeps them", () => {
+    // Outside quotes, and inside double quotes, the shell removes the pair.
+    assert.equal(normalizeContinuations("sudo \\\nid"), "sudo id");
+    assert.equal(normalizeContinuations('echo "a \\\nb"'), 'echo "a b"');
+    // Single quotes and ANSI-C quoting hold the backslash and newline as data.
+    assert.equal(normalizeContinuations("echo 'a \\\nb'"), "echo 'a \\\nb'");
+    assert.equal(normalizeContinuations("echo $'a \\\nb'"), "echo $'a \\\nb'");
+    // An escaped backslash leaves a newline that still separates commands.
+    assert.equal(normalizeContinuations("echo a\\\\\nb"), "echo a\\\\\nb");
+    assert.equal(normalizeContinuations("echo a\\\\\\\nb"), "echo a\\\\b");
+    // A comment ends at its newline, and heredoc bodies are copied unchanged.
+    assert.equal(normalizeContinuations("echo a # comment \\\nsudo id"), "echo a # comment \\\nsudo id");
+    assert.equal(normalizeContinuations("cat <<'EOF'\nsudo \\\nid\nEOF"), "cat <<'EOF'\nsudo \\\nid\nEOF");
+    assert.equal(normalizeContinuations("cat <<EOF\na \\\nb\nEOF"), "cat <<EOF\na \\\nb\nEOF");
+    assert.equal(normalizeContinuations("cat <<'A' <<'B'\na \\\nb\nA\nc \\\nd\nB"),
+      "cat <<'A' <<'B'\na \\\nb\nA\nc \\\nd\nB");
+    // A here-string has no body, so a following command is still normalized.
+    assert.equal(normalizeContinuations("cat <<< 'x' ; sudo \\\nid"), "cat <<< 'x' ; sudo id");
+    assert.equal(guardShell(["cat <<< 'x'"])?.decision, "allow");
+    assert.equal(guardShell(["cat <<< 'x' ; sudo id"])?.decision, "deny");
+    for (const command of ["sudo \\\nid", "echo 'a \\\nb'", "cat <<EOF\na \\\nb\nEOF", "touch 'unclosed \\\nword"])
+      assert.equal(normalizeContinuations(normalizeContinuations(command)), normalizeContinuations(command), command);
+    for (const command of ["echo a \\\nb", 'echo "a \\\nb"', "echo 'a \\\nb'", "echo $'a \\\nb'",
+      "cat <<'EOF'\nsudo \\\nid\nEOF", "cat <<'A' <<'B'\na \\\nb\nA\nc \\\nd\nB"])
+      assert.equal(guardShell([command])?.decision, "allow", command);
+    // `a\\`+newline leaves a real newline, so the next line is its own command.
+    assert.equal(guardShell(["echo a\\\\\nb"]), undefined);
+  });
+  it("keeps a continued command exactly as dangerous as the command it joins", () => {
+    const insert = (command: string, index: number) => `${command.slice(0, index)}\\\n${command.slice(index)}`;
+    for (const command of ["sudo id", "su root", "rm -rf /", "rm -r / --no-preserve-root", "chmod 777 secret",
+      "mkfs.ext4 /dev/sda1", "dd of=/dev/sda", "shutdown -h now", "bash -c 'sudo id'", "eval 'rm -rf /'"]) {
+      assert.equal(guardShell([command])?.decision, "deny", command);
+      for (let index = 0; index <= command.length; index++) {
+        // A continuation is invisible to the shell, so no split may loosen a deny.
+        assert.equal(guardShell([insert(command, index)])?.decision, "deny", insert(command, index));
+      }
+    }
+    for (const command of ["pwd", "echo done", "git status --short", "ls -la src", "date +%s"]) {
+      assert.equal(guardShell([command])?.decision, "allow", command);
+      for (let index = 0; index <= command.length; index++)
+        assert.equal(guardShell([insert(command, index)])?.decision, "allow", insert(command, index));
+    }
   });
   it("treats hashes as comments only at the start of a word", () => {
     for (const command of ["echo a#b ; sudo id", "echo a#b; sudo id", "echo a#b && sudo id",

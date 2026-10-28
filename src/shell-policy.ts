@@ -380,9 +380,197 @@ export function escapeLiteralHashes(command: string): string {
   return result;
 }
 
-/** Parses a command without descriptor prefixes or midword comment markers. */
+export interface HeredocMarker { delimiter: string; quoted: boolean; stripTabs: boolean }
+
+/**
+ * Reads the here-document marker that starts at `<<`, returning the marker and
+ * the offset just past its delimiter.
+ *
+ * A here-string (`<<<`) is not a here-document and has no body, and a `<<`
+ * without a delimiter introduces nothing, so both return undefined.
+ */
+function heredocMarkerAt(line: string, index: number): { marker: HeredocMarker; end: number } | undefined {
+  if (line[index] !== "<" || line[index + 1] !== "<" || line[index + 2] === "<" || line[index - 1] === "<")
+    return undefined;
+  let cursor = index + 2;
+  const stripTabs = line[cursor] === "-";
+  if (stripTabs) cursor++;
+  while (line[cursor] === " " || line[cursor] === "\t") cursor++;
+  let delimiter = "";
+  let quoted = false;
+  if (line[cursor] === "'" || line[cursor] === '"') {
+    const closing = line[cursor];
+    quoted = true;
+    cursor++;
+    while (cursor < line.length && line[cursor] !== closing) delimiter += line[cursor++];
+    if (line[cursor] === closing) cursor++;
+  } else {
+    while (cursor < line.length && /[A-Za-z0-9_]/.test(line[cursor])) delimiter += line[cursor++];
+  }
+  return delimiter ? { marker: { delimiter, quoted, stripTabs }, end: cursor } : undefined;
+}
+
+/** Reads heredoc markers on one line, ignoring markers inside quoted strings and comments. */
+export function heredocMarkers(line: string): HeredocMarker[] {
+  const markers: HeredocMarker[] = [];
+  let quote: "'" | '"' | undefined;
+  for (let index = 0; index < line.length; index++) {
+    const character = line[index];
+    if (quote === "'") { if (character === "'") quote = undefined; continue; }
+    if (quote === '"') {
+      if (character === "\\") { index++; continue; }
+      if (character === '"') quote = undefined;
+      continue;
+    }
+    if (character === "'" || character === '"') { quote = character; continue; }
+    if (character === "\\") { index++; continue; }
+    if (character === "#" && (index === 0 || WORD_BREAK.test(line[index - 1]))) break;
+    if (character !== "<") continue;
+    const parsed = heredocMarkerAt(line, index);
+    if (parsed === undefined) continue;
+    markers.push(parsed.marker);
+    index = parsed.end - 1;
+  }
+  return markers;
+}
+
+/**
+ * Copies here-document bodies verbatim, returning the copied text and the
+ * offset where the command script resumes.
+ */
+function heredocBodies(command: string, start: number, markers: readonly HeredocMarker[]): { text: string; end: number } {
+  let index = start;
+  let text = "";
+  for (const marker of markers) {
+    let closed = false;
+    while (index < command.length) {
+      const newline = command.indexOf("\n", index);
+      const stop = newline === -1 ? command.length : newline + 1;
+      const line = command.slice(index, newline === -1 ? command.length : newline);
+      text += command.slice(index, stop);
+      index = stop;
+      if ((marker.stripTabs ? line.replace(/^\t+/, "") : line) === marker.delimiter) { closed = true; break; }
+    }
+    if (!closed) break;
+  }
+  return { text, end: index };
+}
+
+/**
+ * Removes `\`-newline continuations so the command is validated and parsed as
+ * the shell would run it.
+ *
+ * A shell deletes a backslash-newline pair while reading a command line, so
+ * `sudo echo first \`+newline+`second` is one `sudo` invocation, and a continued
+ * flag such as `rm -r`+newline+`f` is the dangerous `-rf`. Removing the pair
+ * before quote validation and before the source scans keeps every later check
+ * on the same text the shell sees.
+ *
+ * Continuations are kept wherever the shell keeps them:
+ * - single quotes and `$'...'` hold the backslash and the newline as data,
+ * - an escaped backslash (`\\`+newline) leaves a real newline that ends the line,
+ * - a comment ends at its newline, so a trailing backslash does not continue it,
+ * - here-document bodies are data and are copied unchanged.
+ */
+export function normalizeContinuations(command: string): string {
+  if (!command.includes("\n")) return command;
+  let result = "";
+  let index = 0;
+  let wordStart = true;
+  let pending: HeredocMarker[] = [];
+  while (index < command.length) {
+    const character = command[index];
+    if (character === "\\") {
+      const next = command[index + 1];
+      if (next === "\n") { index += 2; continue; }
+      if (next === undefined) { result += character; break; }
+      result += character + next;
+      wordStart = false;
+      index += 2;
+      continue;
+    }
+    if (character === "'") {
+      const end = command.indexOf("'", index + 1);
+      const stop = end === -1 ? command.length : end + 1;
+      result += command.slice(index, stop);
+      wordStart = false;
+      index = stop;
+      continue;
+    }
+    if (character === "$" && command[index + 1] === "'") {
+      let cursor = index + 2;
+      while (cursor < command.length && command[cursor] !== "'") cursor += command[cursor] === "\\" ? 2 : 1;
+      const stop = Math.min(cursor + 1, command.length);
+      result += command.slice(index, stop);
+      wordStart = false;
+      index = stop;
+      continue;
+    }
+    if (character === '"') {
+      let cursor = index + 1;
+      let quoted = "\"";
+      while (cursor < command.length) {
+        const inner = command[cursor];
+        if (inner === "\\") {
+          const next = command[cursor + 1];
+          if (next === "\n") { cursor += 2; continue; }
+          quoted += next === undefined ? inner : inner + next;
+          cursor += next === undefined ? 1 : 2;
+          continue;
+        }
+        quoted += inner;
+        cursor++;
+        if (inner === '"') break;
+      }
+      result += quoted;
+      wordStart = false;
+      index = cursor;
+      continue;
+    }
+    if (character === "#" && wordStart) {
+      const end = command.indexOf("\n", index);
+      const stop = end === -1 ? command.length : end;
+      result += command.slice(index, stop);
+      index = stop;
+      continue;
+    }
+    if (character === "<") {
+      const parsed = heredocMarkerAt(command, index);
+      if (parsed !== undefined) {
+        result += command.slice(index, parsed.end);
+        pending.push(parsed.marker);
+        wordStart = false;
+        index = parsed.end;
+        continue;
+      }
+    }
+    if (character === "\n") {
+      result += character;
+      index++;
+      wordStart = true;
+      if (pending.length) {
+        const bodies = heredocBodies(command, index, pending);
+        result += bodies.text;
+        index = bodies.end;
+        pending = [];
+      }
+      continue;
+    }
+    result += character;
+    wordStart = WORD_BREAK.test(character);
+    index++;
+  }
+  return result;
+}
+
+/**
+ * Parses the command a shell would run: continuations are removed, descriptor
+ * prefixes and midword comment markers are stripped, and the remainder is handed
+ * to `shell-quote`. Nested scripts (`sh -c`, `eval`) reach this same parser, so
+ * they get the same normalization as a top-level command line.
+ */
 export function parseShell(command: string): ParseEntry[] {
-  return parse(escapeLiteralHashes(stripDescriptorPrefixes(command)));
+  return parse(escapeLiteralHashes(stripDescriptorPrefixes(normalizeContinuations(command))));
 }
 
 /**

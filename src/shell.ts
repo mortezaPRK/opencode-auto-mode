@@ -1,8 +1,8 @@
 import type { ReviewResult } from "./reviewer.js";
 import {
   CONTROL_OPERATORS, DYNAMIC, REDIRECT_OPERATORS, SCRIPT_HOSTS, SHELLS, STATEFUL,
-  denyInvocation, hasAmbiguousDescriptorClose, isReadOnlyInvocation, parseShell, resolveExecutable,
-  stripDescriptorPrefixes,
+  denyInvocation, hasAmbiguousDescriptorClose, heredocMarkers, isReadOnlyInvocation, normalizeContinuations,
+  parseShell, resolveExecutable, stripDescriptorPrefixes,
 } from "./shell-policy.js";
 
 const MAX_COMMAND_CHARS = 4096;
@@ -37,47 +37,10 @@ function hasHeredoc(command: string): boolean {
     }
     if (character === "'" || character === '"') { quote = character; continue; }
     if (character === "\\") { index++; continue; }
-    if (character === "<" && command[index + 1] === "<" && command[index + 2] !== "<") return true;
+    if (character === "<" && command[index + 1] === "<" && command[index + 2] !== "<" &&
+        command[index - 1] !== "<") return true;
   }
   return false;
-}
-
-interface HeredocMarker { delimiter: string; quoted: boolean; stripTabs: boolean }
-
-/** Reads heredoc markers on one line, ignoring markers inside quoted strings and comments. */
-function heredocMarkers(line: string): HeredocMarker[] {
-  const markers: HeredocMarker[] = [];
-  let quote: "'" | '"' | undefined;
-  for (let index = 0; index < line.length; index++) {
-    const character = line[index];
-    if (quote === "'") { if (character === "'") quote = undefined; continue; }
-    if (quote === '"') {
-      if (character === "\\") { index++; continue; }
-      if (character === '"') quote = undefined;
-      continue;
-    }
-    if (character === "'" || character === '"') { quote = character; continue; }
-    if (character === "\\") { index++; continue; }
-    if (character === "#" && (index === 0 || /\s/.test(line[index - 1] ?? ""))) break;
-    if (character !== "<" || line[index + 1] !== "<" || line[index + 2] === "<") continue;
-    let cursor = index + 2;
-    const stripTabs = line[cursor] === "-";
-    if (stripTabs) cursor++;
-    while (line[cursor] === " " || line[cursor] === "\t") cursor++;
-    let delimiter = "";
-    let quoted = false;
-    if (line[cursor] === "'" || line[cursor] === '"') {
-      const closing = line[cursor];
-      quoted = true;
-      cursor++;
-      while (cursor < line.length && line[cursor] !== closing) delimiter += line[cursor++];
-    } else {
-      while (cursor < line.length && /[A-Za-z0-9_]/.test(line[cursor])) delimiter += line[cursor++];
-    }
-    if (delimiter) markers.push({ delimiter, quoted, stripTabs });
-    index = cursor - 1;
-  }
-  return markers;
 }
 
 /** True when the effective executable is a shell, a dynamic builtin, or a stateful builtin. */
@@ -269,10 +232,12 @@ function analyzeLine(command: string): Verdict {
 }
 
 /**
- * Splits a script into logical lines. Newlines inside quotes, or escaped by a
- * backslash, are part of the current word rather than command separators, so a
- * deny rule still sees the complete invocation (`sudo echo 'first\nsecond'`)
- * before a line can fall back to manual approval.
+ * Splits a normalized script into logical lines. Newlines inside quotes are part
+ * of the current word rather than command separators, so a deny rule still sees
+ * the complete invocation (`sudo echo 'first\nsecond'`) before a line can fall
+ * back to manual approval. `analyze` removes `\`-newline continuations first, so
+ * the remaining newlines are the ones the shell treats as separators; the
+ * backslash branch here only keeps an escaped character attached to its word.
  */
 function logicalLines(command: string): string[] {
   const lines: string[] = [];
@@ -386,9 +351,12 @@ function analyzeHeredoc(command: string): Verdict {
 }
 
 function analyze(command: string): Verdict {
-  if (hasHeredoc(command)) return analyzeHeredoc(command);
-  if (command.includes("\n")) return analyzeLines(command);
-  return analyzeLine(command);
+  // Normalize once, before routing: `logicalLines` must split on the newlines
+  // the shell actually treats as separators, and heredoc bodies stay untouched.
+  const normalized = normalizeContinuations(command);
+  if (hasHeredoc(normalized)) return analyzeHeredoc(normalized);
+  if (normalized.includes("\n")) return analyzeLines(normalized);
+  return analyzeLine(normalized);
 }
 
 export function guardShell(resources: readonly string[]): ReviewResult | undefined {
