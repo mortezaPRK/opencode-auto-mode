@@ -15,6 +15,8 @@ async function setup(options: unknown = {}, messages: unknown[] = [{ type: "user
   let disposed = 0;
   const disposals: string[] = [];
   let permissionDispose: (() => Promise<void>) | undefined;
+  let rpcDispose: (() => Promise<void>) | undefined;
+  let toolDispose: (() => unknown) | undefined;
   const prompts: string[] = [];
   const models: ({ id: string; providerID: string; variant?: string } | null | undefined)[] = [];
   const interrupts: { data: { sessionID: string } }[] = [];
@@ -46,13 +48,13 @@ async function setup(options: unknown = {}, messages: unknown[] = [{ type: "user
   const ctx = {
     options,
     permission: { hook: async (_: string, handler: typeof evaluate) => { evaluate = handler; return { dispose: async () => { disposed++; disposals.push("permission"); await permissionDispose?.(); } }; } },
-    tool: { hook: async () => ({ dispose: async () => { disposed++; disposals.push("tool"); } }) },
+    tool: { hook: async () => ({ dispose: () => { disposed++; disposals.push("tool"); return toolDispose?.(); } }) },
     session: { get: async () => ({ location: { directory: "/repo" }, model: { providerID: "session-provider", id: "session-model", variant: "high" } }), context: async () => messages },
     event: { subscribe },
     rpc: {
       register: async (_definition: unknown, handlers: typeof rpcHandlers) => {
         rpcHandlers = handlers;
-        return { events: delivery, dispose: async () => { disposed++; disposals.push("rpc"); } };
+        return { events: delivery, dispose: async () => { disposed++; disposals.push("rpc"); await rpcDispose?.(); } };
       },
     },
     generate: { text: async ({ prompt, model }: { prompt: string; model?: { id: string; providerID: string; variant?: string } | null }) => { prompts.push(prompt); models.push(model); return { text: answers.shift() ?? "ASK: unclear" }; } },
@@ -63,6 +65,10 @@ async function setup(options: unknown = {}, messages: unknown[] = [{ type: "user
     prompts, models, ctx, disposed: () => disposed, disposals, rpcEvents, delivery, subscriptions,
     /** Holds every permission-hook disposal open on the given gate. */
     stallPermissionDispose: (gate: () => Promise<void>) => { permissionDispose = gate; },
+    /** Holds the status RPC disposal open, or fails it, on the given gate. */
+    stallRpcDispose: (gate: () => Promise<void>) => { rpcDispose = gate; },
+    /** Replaces the tool-hook disposal so it can throw or reject synchronously. */
+    failToolDispose: (gate: () => unknown) => { toolDispose = gate; },
     status: async (input: unknown = {}) => rpcHandlers.status!(input),
     interrupt: (sessionID = "session-test") => { interrupts.push({ data: { sessionID } }); wake?.(); },
     cleanup: async () => { await cleanup?.(); },
@@ -408,6 +414,94 @@ describe("OpenCode permission hook", () => {
   });
   it("settles a hung typed reviewer as cancelled when the plugin unloads", async () => {
     await expectHungTypedReviewCancelled("unload");
+  });
+  it("starts both hook disposals before a stalled status RPC disposal settles", async () => {
+    const host = await setup({ classifiers: [{ type: "llm" }] });
+    // Hold the optional status service's disposal open: unload must abandon
+    // work and start both hook disposals instead of gating them on it.
+    let rpcDisposalStarted!: () => void;
+    const rpcStarted = new Promise<void>((resolve) => { rpcDisposalStarted = resolve; });
+    let releaseRpc!: () => void;
+    const rpcGate = new Promise<void>((resolve) => { releaseRpc = resolve; });
+    host.stallRpcDispose(() => { rpcDisposalStarted(); return rpcGate; });
+
+    const signals: AbortSignal[] = [];
+    host.ctx.generate.text = ((_input: { prompt: string }, request?: { signal?: AbortSignal }) => {
+      signals.push(request!.signal!);
+      return new Promise<{ text: string }>(() => {});
+    }) as typeof host.ctx.generate.text;
+    const pending = event();
+    const reviewRun = host.evaluate(pending);
+    await waitFor(() => signals.length === 1);
+
+    let unloaded = false;
+    const unloadRun = host.cleanup().then(() => { unloaded = true; });
+    await rpcStarted;
+
+    // The event stream and the active review are abandoned, and both hooks are
+    // disposed, even though the status RPC disposal is still stalled.
+    assert.equal(host.subscriptions[0]!.aborted, true);
+    await waitFor(() => signals[0]!.aborted);
+    assert.ok(host.disposals.includes("permission"), "the permission hook must be disposed");
+    assert.ok(host.disposals.includes("tool"), "the tool hook must be disposed");
+    assert.equal(unloaded, false, "the unload must still wait for the stalled RPC disposal");
+
+    // A review the host dispatches while cleanup is stalled must not start
+    // provider work: it stays with the user.
+    const late = event();
+    const lateOutcome = await Promise.race([
+      host.evaluate(late).then(() => "returned" as const),
+      delay(1_000).then(() => "blocked" as const),
+    ]);
+    assert.equal(lateOutcome, "returned", "a post-abandonment review must not wait on a provider");
+    assert.equal(late.effect, "ask");
+    assert.match(late.message!, /interrupted/i);
+    assert.equal(signals.length, 1, "abandonment must block new provider work");
+
+    // The abandoned review settles as ask without waiting for the gate.
+    await reviewRun;
+    assert.equal(pending.effect, "ask");
+    assert.match(pending.message!, /interrupted/i);
+
+    releaseRpc();
+    await unloadRun;
+    assert.equal(unloaded, true);
+
+    // Once unload settles, a dispatched evaluation still starts no review.
+    const after = event();
+    const afterOutcome = await Promise.race([
+      host.evaluate(after).then(() => "returned" as const),
+      delay(1_000).then(() => "blocked" as const),
+    ]);
+    assert.equal(afterOutcome, "returned", "an unloaded review must not wait on a provider");
+    assert.equal(after.effect, "ask");
+    assert.match(after.message!, /interrupted/i);
+    assert.equal(signals.length, 1);
+    assert.equal(host.disposed(), 3);
+  });
+  it("settles unload when a cleanup throws or rejects without skipping the others", async () => {
+    // A rejected status RPC disposal must not skip either hook disposal.
+    const rejecting = await setup({ classifiers: [{ type: "static" }] });
+    rejecting.stallRpcDispose(() => Promise.reject(new Error("status disposal failed")));
+    await rejecting.cleanup();
+    assert.deepEqual([...rejecting.disposals].sort(), ["permission", "rpc", "tool"]);
+
+    // A hook disposal that throws synchronously must not skip the other hook or
+    // the status RPC, and must not surface as an unhandled rejection.
+    const throwing = await setup({ classifiers: [{ type: "static" }] });
+    throwing.failToolDispose(() => { throw new Error("tool disposal failed"); });
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      await throwing.cleanup();
+      await delay(20);
+      assert.deepEqual([...throwing.disposals].sort(), ["permission", "rpc", "tool"]);
+      assert.equal(throwing.disposed(), 3);
+      assert.deepEqual(unhandled, []);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
   });
   it("stops before starting a fallback provider with an already-aborted signal", async () => {
     const host = await setup({ classifiers: [{ type: "llm" }, { type: "llm" }], reviewTimeoutMs: 5_000 });

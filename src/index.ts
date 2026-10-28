@@ -18,6 +18,9 @@ import { createStatusTracker } from "./status.js";
 
 export type { AutoModeOptions, ClassifierStage, DecisionProvider, DecisionStage, ReviewerModel } from "./config.js";
 
+/** Delivered whenever auto-mode abandons a review: only the user can decide now. */
+const INTERRUPTED_REASON = "Auto-mode review was interrupted; please decide yourself";
+
 export default Plugin.define({
   id: "opencode-auto-mode",
   setup: async (ctx) => {
@@ -96,20 +99,50 @@ export default Plugin.define({
       })();
     }
 
-    // A failed hook registration must not leave the event reader, active
-    // reviews, or the status RPC alive.
-    const abandonSetup = async () => {
+    // Once abandonment starts, an evaluation the host dispatched earlier may
+    // still reach the hook while cleanup is stalled. Record it so the handler
+    // never starts review work the interruption subscription can no longer
+    // cancel.
+    let stopping = false;
+
+    // Stop the event reader and every active review synchronously, before any
+    // cleanup is awaited: a stalled disposal must not leave an in-flight review
+    // able to deliver an allow instead of the cancellation that becomes `ask`.
+    const abandon = () => {
+      stopping = true;
       subscriptions.abort();
       for (const controllers of running.values()) {
         for (const controller of controllers) controller.abort();
       }
       running.clear();
-      await rpc?.dispose().catch(() => {});
+    };
+
+    // A cleanup can throw synchronously instead of rejecting. Turn that into a
+    // rejection so it cannot skip the cleanups started beside it, escape before
+    // the caller awaits them, or replace the original registration error.
+    const start = (cleanup: () => unknown): Promise<unknown> => {
+      try { return Promise.resolve(cleanup()); } catch (error) { return Promise.reject(error); }
+    };
+
+    // Abandon work and start every cleanup before awaiting any of them: a
+    // stalled status RPC or hook disposal must not keep the others alive. Their
+    // failures settle together and never mask the caller's original error.
+    const abandonSetup = async (...cleanups: (() => unknown)[]) => {
+      abandon();
+      await Promise.allSettled([start(() => rpc?.dispose()), ...cleanups.map((cleanup) => start(cleanup))]);
     };
 
     const permissionRegistration = await registerHook(
       () => ctx.permission.hook("evaluate", async (event) => {
         if (event.effect !== "ask") return;
+        // The host can still dispatch an evaluation it decided to ask about
+        // after abandonment started, while a stalled cleanup keeps this hook
+        // registered. The interruption subscription is already gone, so never
+        // start review work here: leave the ask to the user.
+        if (stopping) {
+          event.message = INTERRUPTED_REASON;
+          return;
+        }
         if (!options) {
           event.effect = "ask";
           event.message = "Invalid auto-mode configuration; please decide yourself";
@@ -252,7 +285,7 @@ export default Plugin.define({
         // cancellation is the termination cause even if a provider failed first.
         if (controller.signal.aborted && !expired) {
           decision = "ask";
-          reason = "Auto-mode review was interrupted; please decide yourself";
+          reason = INTERRUPTED_REASON;
           errorKind = "cancelled";
         }
         // Finalize a child span whose provider is still running so the exported
@@ -318,26 +351,26 @@ export default Plugin.define({
       }),
       async () => {
         // Begin abandoning before awaiting either cleanup: a stalled permission
-        // disposal must not leave the event subscription and active reviews
-        // running, where an in-flight review could deliver an allow instead of
-        // the cancellation that normalizes to `ask`. Both cleanups start here
-        // and settle together; their failures must not replace the original
-        // registration error.
-        await Promise.allSettled([
-          abandonSetup(),
-          Promise.resolve().then(() => permissionRegistration.dispose()),
-        ]);
+        // disposal or status RPC must not leave the event subscription and
+        // active reviews running, where an in-flight review could deliver an
+        // allow instead of the cancellation that normalizes to `ask`. Both
+        // cleanups start here and settle together; their failures must not
+        // replace the original registration error.
+        await abandonSetup(() => permissionRegistration.dispose());
       },
     );
     log.log("Auto-mode loaded");
     return async () => {
-      await abandonSetup();
-      try { await permissionRegistration.dispose(); }
-      finally {
-        await toolRegistration.dispose();
-        counts.clear();
-        log.log("Auto-mode unloaded");
-      }
+      // Start abandonment and both hook disposals together rather than gating
+      // them on the optional status service: a stalled RPC disposal must never
+      // leave a hook registered after the interruption subscription was
+      // aborted, where the host could still start reviews.
+      await abandonSetup(
+        () => permissionRegistration.dispose(),
+        () => toolRegistration.dispose(),
+      );
+      counts.clear();
+      log.log("Auto-mode unloaded");
     };
   },
 });
