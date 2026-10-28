@@ -1,4 +1,5 @@
 import type { AuditLog, AuditRecord } from "./audit.js";
+import { sanitizeRecord } from "./audit.js";
 
 export interface OtlpOptions { endpoint?: string; headers?: Record<string, string>; timeoutMs?: number }
 
@@ -26,26 +27,27 @@ const attr = (key: string, value: string | number | boolean) => ({
 });
 
 export function toLogRecord(record: AuditRecord) {
-  const severity = record.decision === "deny" ? { severityNumber: 13, severityText: "WARN" } : { severityNumber: 9, severityText: "INFO" };
+  const safe = sanitizeRecord(record);
+  const severity = safe.decision === "deny" ? { severityNumber: 13, severityText: "WARN" } : { severityNumber: 9, severityText: "INFO" };
   return {
-    timeUnixNano: String(BigInt(Date.parse(record.ts)) * 1_000_000n),
-    ...(record.traceID === undefined ? {} : { traceId: record.traceID, spanId: record.spanID }),
+    timeUnixNano: String(BigInt(Date.parse(safe.ts)) * 1_000_000n),
+    ...(safe.traceID === undefined ? {} : { traceId: safe.traceID, spanId: safe.spanID }),
     ...severity,
-    body: { stringValue: record.reason },
+    body: { stringValue: safe.reason },
     attributes: [
       attr("event.name", "auto_mode.decision"),
-      attr("session.id", record.sessionID),
-      attr("review.id", record.reviewID),
-      attr("agent", record.agent ?? ""),
-      attr("action", record.action),
-      attr("resources", record.resources.join(" ; ")),
-      attr("host_effect", record.hostEffect),
-      attr("decision", record.decision),
-      attr("stage", record.stage),
-      attr("duration_ms", record.durationMs),
-      attr("error", record.error === true),
-      ...(record.errorKind === undefined ? [] : [attr("error.kind", record.errorKind)]),
-      ...(record.errorDetail === undefined ? [] : [attr("error.detail", record.errorDetail)]),
+      attr("session.id", safe.sessionID),
+      attr("review.id", safe.reviewID),
+      attr("agent", safe.agent ?? ""),
+      attr("action", safe.action),
+      attr("resources", safe.resources.join(" ; ")),
+      attr("host_effect", safe.hostEffect),
+      attr("decision", safe.decision),
+      attr("stage", safe.stage),
+      attr("duration_ms", safe.durationMs),
+      attr("error", safe.error === true),
+      ...(safe.errorKind === undefined ? [] : [attr("error.kind", safe.errorKind)]),
+      ...(safe.errorDetail === undefined ? [] : [attr("error.detail", safe.errorDetail)]),
     ],
   };
 }

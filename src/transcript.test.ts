@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { extractReviewContext, extractTranscript } from "./transcript.js";
+import { clipChars, extractReviewContext, extractTranscript } from "./transcript.js";
 import { buildStage1Prompt } from "./reviewer.js";
 import { defaultPolicy } from "./policy.js";
 
@@ -40,13 +40,22 @@ describe("review context completeness", () => {
     }
     const empty = extractReviewContext([{ type: "user", text: "" }]);
     assert.equal(empty.complete, false);
-    assert.match(empty.reason!, /no text/);
+    assert.match(empty.reason!, /No user authorization message/);
     assert.match(extractReviewContext([]).reason!, /No user authorization message/);
   });
-  it("requires approval when a later user message has no text", () => {
+  it("ignores empty user turns instead of failing the whole session", () => {
     const context = extractReviewContext([{ type: "user", text: "Make the changes" }, { type: "user", text: "" }]);
+    assert.equal(context.complete, true);
+    assert.match(context.transcript, /Make the changes/);
+    assert.equal(extractReviewContext([{ type: "user", text: "" }, { type: "user", text: " " }]).complete, false);
+  });
+  it("treats model-facing skill messages as unreviewable evidence", () => {
+    const context = extractReviewContext([
+      { type: "user", text: "Follow the release skill" },
+      { type: "skill", skill: "release", name: "Release", text: "Publish to production" },
+    ]);
     assert.equal(context.complete, false);
-    assert.match(context.reason!, /no text/);
+    assert.match(context.reason!, /attachments/);
   });
   it("accepts text-only messages and empty attachment lists", () => {
     assert.equal(extractReviewContext([{ type: "user", text: "Create a", files: [], skills: [], agents: [] }]).complete, true);
@@ -66,6 +75,52 @@ describe("review context completeness", () => {
     const capped = extractReviewContext([{ type: "user", text: "go" }, ...manyTools]);
     assert.equal(capped.complete, true);
     assert.match(capped.transcript, /partial session history/);
+  });
+  it("keeps the tail of a long tool input so written payloads stay reviewable", () => {
+    const context = extractReviewContext([
+      { type: "user", text: "write the file" },
+      { type: "assistant", content: [{ type: "tool", name: "write", state: {
+        input: { content: `${"a".repeat(900)}TAIL_CONSTRAINT` },
+      } }] },
+    ]);
+    assert.equal(context.complete, true);
+    assert.match(context.transcript, /TAIL_CONSTRAINT/);
+    assert.match(context.transcript, /some tool details truncated/);
+  });
+  it("keeps both ends of a long tool input with non-BMP characters", () => {
+    const payload = `HEAD_MARKER${"😀".repeat(900)}TAIL_CONSTRAINT`;
+    const context = extractReviewContext([
+      { type: "user", text: "write the file" },
+      { type: "assistant", content: [{ type: "tool", name: "write", state: { input: { content: payload } } }] },
+    ]);
+    assert.equal(context.complete, true);
+    assert.match(context.transcript, /HEAD_MARKER/);
+    assert.match(context.transcript, /TAIL_CONSTRAINT/);
+    assert.match(context.transcript, /some tool details truncated/);
+    assert.ok(Buffer.byteLength(context.transcript) <= 12_000);
+  });
+  it("does not clip user text whose code points fit even when UTF-16 units do not", () => {
+    // 5 000 code points but 10 000 UTF-16 units: a unit-based guard clips this
+    // and duplicates the ends even though nothing should be dropped.
+    const text = "😀".repeat(5_000);
+    assert.equal(Array.from(text).length, 5_000);
+    assert.ok(text.length > 8_000);
+    const clipped = clipChars(text, 8_000);
+    assert.equal(clipped, text);
+    assert.equal(Array.from(clipped).length, 5_000);
+    assert.equal(clipped.match(/😀/gu)?.length, 5_000);
+    assert.doesNotMatch(clipped, /…/);
+  });
+  it("keeps user text within both limits exact and unflagged", () => {
+    // 8 000 code points and 8 001 UTF-16 units but only ~8 KB escaped, so the
+    // 12 000-byte transcript budget cannot explain away a truncation note.
+    const text = `${"a".repeat(7_999)}😀`;
+    const context = extractReviewContext([{ type: "user", text }]);
+    assert.equal(context.complete, true);
+    assert.ok(context.transcript.includes(text));
+    assert.equal(context.transcript.match(/😀/gu)?.length, 1);
+    assert.doesNotMatch(context.transcript, /latest user message truncated/);
+    assert.ok(Buffer.byteLength(context.transcript) <= 12_000);
   });
   it("keeps the latest user restriction when tool history exceeds the budget", () => {
     const context = extractReviewContext([
