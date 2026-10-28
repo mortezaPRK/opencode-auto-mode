@@ -114,14 +114,16 @@ const WORD_DELIMITER = /[\s;|&()<>]/;
  *
  * `shell-quote` only marks `*` and `?` as globs, but bracket (`[ab]`) and brace
  * (`{a,b}`) expansion, and unquoted parameter expansion, change the argument
- * count too. This scan is quote- and escape-aware, so quoted or escaped expansion
- * characters stay literal; matching the flags by position keeps the raw text out
- * of the parsed-command logic.
+ * count too. This scan is quote- and escape-aware, so quoted or escaped bracket,
+ * brace, and parameter markers are not flagged here. `shell-quote` still reports
+ * an escaped `*`/`?` as a glob token, which stays conservatively reviewed.
+ * Matching the flags by position keeps the raw text out of the parsed logic.
  */
 function wordExpansions(command: string): boolean[] {
   const expansions: boolean[] = [];
   let present = false;
   let expansion = false;
+  let wordStart = true;
   let quote: "'" | '"' | "$'" | undefined;
   const flush = () => {
     if (!present) return;
@@ -147,26 +149,33 @@ function wordExpansions(command: string): boolean[] {
     }
     if (character === "\\") {
       present = true;
-      index++;
+      if (index + 1 < command.length && command[++index] !== "\n") wordStart = false;
       continue;
     }
     if (character === "'" || character === '"' || (character === "$" && command[index + 1] === "'")) {
       present = true;
+      wordStart = false;
       if (character === "'" || character === '"') quote = character;
       else { quote = "$'"; index++; }
       continue;
     }
-    if (character === "#" && (index === 0 || WORD_DELIMITER.test(command[index - 1]))) {
+    if (character === "#" && wordStart) {
       const end = command.indexOf("\n", index);
       flush();
       if (end === -1) break;
       index = end;
+      wordStart = true;
       continue;
     }
-    if (WORD_DELIMITER.test(character)) { flush(); continue; }
+    if (WORD_DELIMITER.test(character)) {
+      flush();
+      wordStart = true;
+      continue;
+    }
     if (character === "*" || character === "?" || character === "[" || character === "{" ||
         character === "$") expansion = true;
     present = true;
+    wordStart = false;
   }
   flush();
   return expansions;
@@ -268,6 +277,7 @@ function analyzeLine(command: string): Verdict {
 function logicalLines(command: string): string[] {
   const lines: string[] = [];
   let start = 0;
+  let wordStart = true;
   let quote: "'" | '"' | "$'" | undefined;
   for (let index = 0; index < command.length; index++) {
     const character = command[index];
@@ -285,23 +295,35 @@ function logicalLines(command: string): string[] {
       else if (character === '"') quote = undefined;
       continue;
     }
-    if (character === "\\") { index++; continue; }
-    if (character === "'") { quote = "'"; continue; }
-    if (character === '"') { quote = '"'; continue; }
-    if (character === "$" && command[index + 1] === "'") { quote = "$'"; index++; continue; }
-    if (character === "#" && (index === 0 || WORD_DELIMITER.test(command[index - 1]))) {
+    if (character === "\\") {
+      if (index + 1 < command.length) {
+        if (command[++index] !== "\n") wordStart = false;
+      } else wordStart = false;
+      continue;
+    }
+    if (character === "'" || character === '"' || (character === "$" && command[index + 1] === "'")) {
+      wordStart = false;
+      if (character === "'" || character === '"') quote = character;
+      else { quote = "$'"; index++; }
+      continue;
+    }
+    if (character === "#" && wordStart) {
       // A comment runs to the end of the physical line; quotes inside it are text.
       const end = command.indexOf("\n", index);
       if (end === -1) break;
       lines.push(command.slice(start, end));
       start = end + 1;
       index = end;
+      wordStart = true;
       continue;
     }
     if (character === "\n") {
       lines.push(command.slice(start, index));
       start = index + 1;
+      wordStart = true;
+      continue;
     }
+    wordStart = WORD_DELIMITER.test(character);
   }
   lines.push(command.slice(start));
   return lines;

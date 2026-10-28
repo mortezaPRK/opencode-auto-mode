@@ -17,6 +17,7 @@ export const DYNAMIC = new Set(["eval", "source", ".", "exec", "xargs"]);
 export const ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/;
 export const CONTROL_OPERATORS = new Set([";", "&&", "||", "|", "|&", "&"]);
 export const REDIRECT_OPERATORS = new Set([">", ">>", ">&", "<&", "<", "<<", "<<-", "<<<", "<>", ">|", "&>", "&>>"]);
+const WORD_BREAK = /[\s;|&()<>]/;
 
 type OptionArity = "flag" | "value";
 
@@ -306,9 +307,82 @@ export function stripDescriptorPrefixes(command: string): string {
   return result;
 }
 
-/** Parses a command without descriptor prefixes, so numeric operands survive. */
+/**
+ * Escapes a `#` that is part of a word so `shell-quote` does not mistake it for
+ * the start of a comment.
+ *
+ * Shell comments begin only at the start of a word. `shell-quote` instead ends
+ * the command at any unquoted `#`, which can hide a later command
+ * (`echo a#b ; sudo id`). Escaping that literal hash preserves the word text and
+ * lets the deny pass see the rest of the line. A real word-start comment is left
+ * untouched, and quoted or escaped hashes are already literal.
+ */
+export function escapeLiteralHashes(command: string): string {
+  let result = "";
+  let wordStart = true;
+  let quote: "'" | '"' | "$'" | undefined;
+  for (let index = 0; index < command.length; index++) {
+    const character = command[index];
+    if (quote === "'") {
+      result += character;
+      if (character === "'") quote = undefined;
+      continue;
+    }
+    if (quote === "$'") {
+      result += character;
+      if (character === "\\") {
+        if (index + 1 < command.length) result += command[++index];
+      } else if (character === "'") quote = undefined;
+      continue;
+    }
+    if (quote === '"') {
+      result += character;
+      if (character === "\\") {
+        if (index + 1 < command.length) result += command[++index];
+      } else if (character === '"') quote = undefined;
+      continue;
+    }
+    if (character === "\\") {
+      result += character;
+      if (index + 1 < command.length) {
+        const escaped = command[++index];
+        result += escaped;
+        if (escaped !== "\n") wordStart = false;
+      } else wordStart = false;
+      continue;
+    }
+    if (character === "'" || character === '"' || (character === "$" && command[index + 1] === "'")) {
+      result += character;
+      wordStart = false;
+      if (character === "'" || character === '"') quote = character;
+      else {
+        quote = "$'";
+        result += command[++index];
+      }
+      continue;
+    }
+    if (character === "#") {
+      if (wordStart) {
+        result += command.slice(index);
+        break;
+      }
+      result += "\\#";
+      continue;
+    }
+    if (WORD_BREAK.test(character)) {
+      result += character;
+      wordStart = true;
+      continue;
+    }
+    result += character;
+    wordStart = false;
+  }
+  return result;
+}
+
+/** Parses a command without descriptor prefixes or midword comment markers. */
 export function parseShell(command: string): ParseEntry[] {
-  return parse(stripDescriptorPrefixes(command));
+  return parse(escapeLiteralHashes(stripDescriptorPrefixes(command)));
 }
 
 /**

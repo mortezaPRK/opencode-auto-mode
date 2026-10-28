@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { compositeDecision } from "./classifier.js";
-import { hasAmbiguousDescriptorClose, stripDescriptorPrefixes } from "./shell-policy.js";
+import { escapeLiteralHashes, hasAmbiguousDescriptorClose, stripDescriptorPrefixes } from "./shell-policy.js";
 import { guardShell, shellWords } from "./shell.js";
 
 const unused = async () => { throw new Error("unexpected reviewer call"); };
@@ -103,6 +103,25 @@ describe("shell approval guard", () => {
       assert.equal(guardShell([command])?.decision, "deny", command);
     assert.equal(guardShell(["echo 'first\nsecond'"])?.decision, "allow");
   });
+  it("treats hashes as comments only at the start of a word", () => {
+    for (const command of ["echo a#b ; sudo id", "echo a#b; sudo id", "echo a#b && sudo id",
+      "echo a#b | sudo id", "echo a#b\nsudo id", "echo 'a\nb'#c ; sudo id",
+      'echo "a\nb"#c ; sudo id', "echo a\\ #b ; sudo id", "echo ''#c ; sudo id",
+      'echo ""#c ; sudo id', "echo $'a#b' ; sudo id", "echo '#' ; sudo id", 'echo "#" ; sudo id',
+      "echo \\# ; sudo id", "VAR=#x sudo id", "echo ${x#y} ; sudo id", "echo $# ; sudo id",
+      "echo ${#var} ; sudo id", 'echo "${x#y}" ; sudo id', "echo ${x##*/} ; sudo id",
+      "sh -c 'echo a#b ; sudo id'", "eval 'echo a#b ; sudo id'", "bash -c 'echo a#b ; sudo id'",
+      "cat <<'EOF'\ntext\nEOF\necho a#b ; sudo id"])
+      assert.equal(guardShell([command])?.decision, "deny", command);
+    // Quoted, escaped, and quoted-newline hashes stay literal.
+    for (const command of ["echo '#'", 'echo "#"', "echo \\#", "echo a#b", "echo 'a#b'", 'echo "a#b"',
+      "echo $'a#b'", "echo 'a\nb#c'"])
+      assert.equal(guardShell([command])?.decision, "allow", command);
+    // A real word-start comment still discards the rest of its line.
+    for (const command of ["echo a # comment ; sudo id", "echo a#b # comment ; sudo id",
+      "echo 'a\nb' #comment ; sudo id"])
+      assert.equal(guardShell([command])?.decision, "allow", command);
+  });
   it("feeds parsed read-only commands into the static stage without bypassing model-only pipelines", async () => {
     assert.deepEqual(shellWords('touch "a b"'), ["touch", "a b"]);
     assert.equal(guardShell(["touch file"]), undefined);
@@ -203,9 +222,9 @@ describe("shell policy edge cases", () => {
   it("reviews uniq operands that can glob-expand into the output argument", () => {
     for (const command of ["uniq *.txt", "uniq -c *.txt", "uniq -f *.txt", "uniq -- *.txt",
       "uniq in.txt *.txt", "uniq [ab].txt", "uniq {a,b}.txt", "uniq a'b'[c].txt",
-      "uniq 2>/dev/null [ab].txt", "uniq $HOME/x"])
+      "uniq 2>/dev/null [ab].txt", "uniq $HOME/x", "uniq \\*.txt", "uniq \\?.txt"])
       assert.equal(guardShell([command]), undefined, command);
-    // Quoted or escaped glob characters are literal operands, so one-operand calls stay read-only.
+    // Quoted glob characters (and escaped brackets/braces) are literal operands, so one-operand calls stay read-only.
     for (const command of ["uniq '*.txt'", 'uniq "*.txt"', "uniq -c '*.txt'", "uniq -- '*.txt'",
       "uniq '[ab].txt'", "uniq '{a,b}.txt'", "uniq \\[ab\\].txt", "uniq 2>/dev/null '*.txt'",
       'uniq "$HOME/x"'])
@@ -293,6 +312,16 @@ describe("shell policy edge cases", () => {
     for (const command of ["env -S 'sudo id'", "env --split-string='sudo id'", "env --split-string 'sudo id'",
       "env --split 'sudo id'", "env -iS 'sudo id'", "env -S pwd", "sh -c \"env -S 'sudo id'\""])
       assert.equal(guardShell([command])?.decision, "ask", command);
+  });
+
+  it("escapes only literal hashes that shell-quote would read as comments", () => {
+    assert.equal(escapeLiteralHashes("echo a#b ; sudo id"), "echo a\\#b ; sudo id");
+    assert.equal(escapeLiteralHashes("echo a # comment ; sudo id"), "echo a # comment ; sudo id");
+    assert.equal(escapeLiteralHashes("echo 'a#b' ; sudo id"), "echo 'a#b' ; sudo id");
+    assert.equal(escapeLiteralHashes("echo a\\#b ; sudo id"), "echo a\\#b ; sudo id");
+    assert.equal(escapeLiteralHashes("echo a\\ #b ; sudo id"), "echo a\\ \\#b ; sudo id");
+    assert.equal(escapeLiteralHashes("VAR=#x sudo id"), "VAR=\\#x sudo id");
+    assert.equal(escapeLiteralHashes("echo $'a#b' ; sudo id"), "echo $'a#b' ; sudo id");
   });
 
   it("drops only descriptor prefixes that are adjacent in the source", () => {
