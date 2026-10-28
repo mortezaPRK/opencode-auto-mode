@@ -1,14 +1,13 @@
 import type { ReviewResult } from "./reviewer.js";
 import {
-  CONTROL_OPERATORS, DYNAMIC, REDIRECT_OPERATORS, SCRIPT_HOSTS, SHELLS, STATEFUL,
-  denyInvocation, hasAmbiguousDescriptorClose, hasAssembledUndecodedSyntax, hasHeredoc,
+  BALANCED_QUOTES, CONTROL_OPERATORS, DYNAMIC, REDIRECT_OPERATORS, SCRIPT_HOSTS, SHELLS, STATEFUL,
+  denyCleanPrefix, denyInvocation, hasAmbiguousDescriptorClose, hasAssembledUndecodedSyntax, hasHeredoc,
   hasUndecodedSyntax, heredocMarkers, isReadOnlyInvocation, logicalLines, normalizeContinuations, parseShell,
   rawHeredocScript, resolveExecutable, stripDescriptorPrefixes,
 } from "./shell-policy.js";
 
 const MAX_COMMAND_CHARS = 4096;
 const MAX_COMMAND_BYTES = 65_536;
-const BALANCED_QUOTES = /^(?:[^'"\\]|\\[^\r\n]|'[^']*'|"(?:[^"\\]|\\[^\r\n])*")*$/;
 const WRITE_OPERATORS = new Set([">", ">>", ">|", "&>", "&>>", "<>"]);
 const DYNAMIC_SYNTAX = /\$\(|`|\$\(\s*\(|[<>]\(|\$\[/;
 const FORK_BOMB = /:\s*\(\s*\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:/;
@@ -343,10 +342,15 @@ function analyze(command: string): Verdict {
   }
   // Normalization removes `\`-newlines, so the shell can parse an unsupported
   // form the raw check above could not see: `sort $`+newline+`'\x2doout'` is
-  // `sort -oout` to Bash once the pair is gone. Repeat the whole gate on the text
-  // that is actually routed and parsed, still before any heredoc routing.
+  // `sort -oout` to Bash once the pair is gone. The marker itself is never parsed.
+  // A deny in the clean prefix before it is still mandatory, so check that first;
+  // only then repeat the gate and fail closed before heredoc routing.
   const normalized = normalizeContinuations(command);
-  if (hasUndecodedSyntax(normalized)) return { decision: "ask" };
+  if (hasUndecodedSyntax(normalized)) {
+    const blocked = denyCleanPrefix(normalized);
+    if (blocked !== undefined) return { decision: "deny", reason: blocked };
+    return { decision: "ask" };
+  }
   // `logicalLines` must split on the newlines the shell actually treats as
   // separators, and heredoc bodies stay untouched.
   if (hasHeredoc(normalized)) return analyzeHeredoc(normalized);

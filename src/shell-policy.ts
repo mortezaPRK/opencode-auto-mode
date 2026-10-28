@@ -46,6 +46,15 @@ export function hasUndecodedSyntax(text: string): boolean {
 }
 
 /**
+ * Matches text whose quotes are balanced and whose backslashes escape a character
+ * on the same line.
+ *
+ * A prefix cut before an undecoded opener is only a complete command when this
+ * matches; otherwise an open quote could turn quoted data into commands.
+ */
+export const BALANCED_QUOTES = /^(?:[^'"\\]|\\[^\r\n]|'[^']*'|"(?:[^"\\]|\\[^\r\n])*")*$/;
+
+/**
  * True when removing `\`-newlines would assemble syntax this policy does not
  * decode. Parsing such a line can place a quote or word boundary differently
  * from the shell, so callers must not take a deny from it.
@@ -1027,6 +1036,48 @@ function invocations(command: string): string[][] {
   return result;
 }
 
+/** Offset of the first `$'`, `$"`, or `$[` in the normalized text. */
+function undecodedSyntaxIndex(text: string): number | undefined {
+  let earliest: number | undefined;
+  for (const opener of ["$'", '$"', "$["]) {
+    const index = text.indexOf(opener);
+    if (index !== -1 && (earliest === undefined || index < earliest)) earliest = index;
+  }
+  return earliest;
+}
+
+/**
+ * Code whose contents this prefix parse does not project. A line containing one of
+ * these forms is skipped rather than guessed at, because the words inside it are
+ * commands or data that this scan cannot place.
+ */
+const NESTED_DYNAMIC_SYNTAX = /\$\(|`|[<>]\(/;
+
+/**
+ * Deny reason visible in the clean prefix before the first syntax this policy
+ * refuses to decode, or undefined when that prefix has no mandatory deny.
+ *
+ * The marker and everything after it are never parsed: an undecoded quote can
+ * move word and line boundaries, and normalization may have assembled it from a
+ * `\`-newline. The prefix is projected with the shared `logicalLines` scan, so
+ * heredoc bodies stay data. A line whose quotes are not balanced at the cut, or
+ * that still contains nested dynamic syntax, is skipped instead of guessed at.
+ * Callers use this before falling back to ask.
+ */
+export function denyCleanPrefix(normalized: string, depth = 0): string | undefined {
+  const cut = undecodedSyntaxIndex(normalized);
+  if (cut === undefined) return undefined;
+  const { lines, certain } = logicalLines(normalized.slice(0, cut));
+  for (const line of lines.slice(0, certain)) {
+    if (NESTED_DYNAMIC_SYNTAX.test(line) || !BALANCED_QUOTES.test(line)) continue;
+    for (const words of invocations(line)) {
+      const reason = denyInvocation(words, depth);
+      if (reason !== undefined) return reason;
+    }
+  }
+  return undefined;
+}
+
 /**
  * Deny reason for a nested script (`sh -c`, `eval`), or undefined when nothing in
  * it is a dangerous operation.
@@ -1063,9 +1114,11 @@ function denyScript(command: string, depth: number): string | undefined {
     return undefined;
   }
   // Normalization can assemble quoting this reader does not decode. The inner
-  // shell could then run a command the projection does not place, so deny
-  // detection stands down; the caller already asks for the surrounding shell.
-  if (hasAssembledUndecodedSyntax(command)) return undefined;
+  // shell could then run a command the projection does not place, so the rest of
+  // the projection stands down; a deny already visible in the clean prefix still
+  // keeps its precedence, and the caller asks when there is none.
+  if (!hasUndecodedSyntax(command) && hasUndecodedSyntax(normalized))
+    return denyCleanPrefix(normalized, depth);
   const { lines, certain } = logicalLines(normalized);
   for (const line of lines.slice(0, certain)) {
     for (const words of invocations(line)) {

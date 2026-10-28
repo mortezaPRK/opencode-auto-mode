@@ -362,6 +362,29 @@ describe("shell approval guard", () => {
     assert.equal(guardShell(["sort $ '\\x2doout' input"]), undefined);
     assert.equal(guardShell(["sort '\\x2doout' input ; sudo id"])?.decision, "deny");
   });
+  it("keeps a clean-code deny before assembled syntax", () => {
+    // `sudo id` is complete, clean script before the later `$`+`\`-newline+`'`
+    // form is assembled by normalization. The assembled quote itself is never
+    // parsed, but the deny already visible in the prefix is mandatory.
+    const assembled = "sort $\\\n'\\x2doout' input";
+    assert.equal(guardShell([`sudo id\n${assembled}`])?.decision, "deny");
+    assert.equal(guardShell([`rm -rf /\n${assembled}`])?.decision, "deny");
+    assert.equal(guardShell([`sudo id ; ${assembled}`])?.decision, "deny");
+    assert.equal(guardShell([`sudo id && ${assembled}`])?.decision, "deny");
+    // A deny after a stable heredoc body is still clean script, so it keeps its
+    // precedence even when the tail contains the assembled form.
+    assert.equal(guardShell([`cat <<'EOF'\nx\nEOF\nsudo id\n${assembled}`])?.decision, "deny");
+    assert.equal(guardShell([`cat <<'EOF'\nsudo id\nEOF\n${assembled}`])?.decision, "ask");
+    // A quoted heredoc body is data, not clean code, so it never becomes a deny.
+    assert.equal(guardShell([`cat <<'EOF'\n${assembled}\nsudo id\nEOF`])?.decision, "allow");
+    // Nested scripts must not lose the same deny at the deny-pass early return.
+    assert.equal(guardShell(['sh -c \'sudo id\nsort $\\\n"x"\''])?.decision, "deny");
+    assert.equal(guardShell(['sh -c \'rm -rf /\nsort $\\\n"x"\''])?.decision, "deny");
+    assert.equal(guardShell(['sh -c \'sudo id ; sort $\\\n"x"\''])?.decision, "deny");
+    // The two reported bypasses keep asking; only the clean prefix can deny.
+    assert.equal(guardShell(["cat <<'A'\na\nA\ncat <<\\\n'EOF'\nx\\\nEOF\nsudo id\nEOF"])?.decision, "ask");
+    assert.equal(guardShell([assembled])?.decision, "ask");
+  });
   it("keeps a continued command exactly as dangerous as the command it joins", () => {
     const insert = (command: string, index: number) => `${command.slice(0, index)}\\\n${command.slice(index)}`;
     for (const command of ["sudo id", "su root", "rm -rf /", "rm -r / --no-preserve-root", "chmod 777 secret",
