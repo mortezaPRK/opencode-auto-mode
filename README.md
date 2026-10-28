@@ -177,7 +177,7 @@ review stays visible until it resolves.
 ## Desktop app (preview)
 
 OpenCode 2.2.0+ can load the plugin's GUI entry in the desktop app. It adds a
-composer pill and a **Auto-mode** side panel showing whether the current session
+composer pill and an **Auto-mode** side panel showing whether the current session
 is being reviewed and how recent actions were decided, plus a command-palette
 entry to open the panel.
 
