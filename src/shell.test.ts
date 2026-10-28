@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { compositeDecision } from "./classifier.js";
-import { stripDescriptorPrefixes } from "./shell-policy.js";
+import { hasAmbiguousDescriptorClose, stripDescriptorPrefixes } from "./shell-policy.js";
 import { guardShell, shellWords } from "./shell.js";
 
 const unused = async () => { throw new Error("unexpected reviewer call"); };
@@ -284,6 +284,37 @@ describe("shell policy edge cases", () => {
     for (const command of ["true &2>2 chmod777 secret", "true &2>/dev/null bat --generate-config-file",
       "true &2>>/dev/null bat --generate-config-file"])
       assert.equal(guardShell([command]), undefined, command);
+  });
+
+  it("asks when an fd close is concatenated with a command word", () => {
+    for (const command of ["true;2>&-sudo id", "true&&2>&-sudo id", "true||2>&-sudo id",
+      "true|2>&-sudo id", "true&2>&-sudo id", "true\n2>&-sudo id", "true;2<&-sudo id",
+      'true;2>&-"sudo" id', "true;2>&-'sudo' id", "true;2>&-\\sudo id",
+      "true;2>&-chmod 777 secret", "true;2>&-rm -rf /", "true;2>&-bat --generate-config-file",
+      "2>&-sudo id", ">&-sudo id", "sh -c 'true;2>&-sudo id'", "eval 'true;2>&-rm -rf /'"])
+      assert.equal(guardShell([command])?.decision, "ask", command);
+    assert.equal(hasAmbiguousDescriptorClose("true;2>&-sudo id"), true);
+    assert.equal(hasAmbiguousDescriptorClose('true;2>&-"sudo" id'), true);
+    assert.equal(hasAmbiguousDescriptorClose("true;2>&-\\sudo id"), true);
+    assert.equal(hasAmbiguousDescriptorClose("true;2<&-sudo id"), true);
+
+    // A delimited close keeps its meaning: `2>&-` closes the descriptor.
+    for (const command of ["pwd;2>&-", "pwd;2<&-", "pwd;2>&- ls", "pwd;2<&- ls", "pwd;2>&-&&ls",
+      "pwd;2>&-||ls", "pwd;2>&-|cat", "pwd;2>&-&", "pwd;2>&->/dev/null", "echo 2>&- done",
+      "pwd\n2>&-"])
+      assert.equal(guardShell([command])?.decision, "allow", command);
+    assert.equal(hasAmbiguousDescriptorClose("true;2>&- id"), false);
+    assert.equal(hasAmbiguousDescriptorClose("true;2>&-;id"), false);
+    assert.equal(hasAmbiguousDescriptorClose("true;2>&-&&id"), false);
+    assert.equal(hasAmbiguousDescriptorClose("true;2>&-|id"), false);
+
+    // Quoted or escaped text is data, not a descriptor or a command.
+    for (const command of ['echo "2>&-sudo"', "echo '2>&-sudo'", "echo $'2>&-sudo'",
+      "echo 2\\>\\&-sudo", "pwd # 2>&-sudo"])
+      assert.equal(guardShell([command])?.decision, "allow", command);
+    assert.equal(hasAmbiguousDescriptorClose('echo "2>&-sudo"'), false);
+    assert.equal(hasAmbiguousDescriptorClose("echo '2>&-sudo'"), false);
+    assert.equal(hasAmbiguousDescriptorClose("echo 2\\>\\&-sudo"), false);
   });
 
   it("denies identifiable commands before asking about dynamic arguments", () => {

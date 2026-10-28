@@ -308,6 +308,57 @@ export function parseShell(command: string): ParseEntry[] {
   return parse(stripDescriptorPrefixes(command));
 }
 
+/**
+ * True when a descriptor close (`>&-` or `<&-`) is immediately followed by more
+ * word characters.
+ *
+ * Bash reads `2>&-sudo id` as closing file descriptor 2 and then running
+ * `sudo id`, while shell-quote and other shells read `-sudo` as the redirection
+ * word and drop the command. The two readings disagree about which command
+ * runs, so ambiguous invocations must not be approved automatically.
+ */
+export function hasAmbiguousDescriptorClose(command: string): boolean {
+  const delimiter = /[\s;|&()<>]/;
+  let boundary = true;
+  let index = 0;
+  while (index < command.length) {
+    const character = command[index];
+    if (character === "\\") { index += 2; boundary = false; continue; }
+    if (character === "'") {
+      const end = command.indexOf("'", index + 1);
+      index = end === -1 ? command.length : end + 1;
+      boundary = false;
+      continue;
+    }
+    if (character === "$" && command[index + 1] === "'") {
+      let cursor = index + 2;
+      while (cursor < command.length && command[cursor] !== "'") cursor += command[cursor] === "\\" ? 2 : 1;
+      index = Math.min(cursor + 1, command.length);
+      boundary = false;
+      continue;
+    }
+    if (character === '"') {
+      let cursor = index + 1;
+      while (cursor < command.length && command[cursor] !== '"') cursor += command[cursor] === "\\" ? 2 : 1;
+      index = Math.min(cursor + 1, command.length);
+      boundary = false;
+      continue;
+    }
+    if (boundary && character === "#") {
+      const end = command.indexOf("\n", index);
+      index = end === -1 ? command.length : end;
+      continue;
+    }
+    if ((character === ">" || character === "<") && command[index + 1] === "&" && command[index + 2] === "-") {
+      const next = command[index + 3];
+      if (next !== undefined && !delimiter.test(next)) return true;
+    }
+    boundary = delimiter.test(character);
+    index++;
+  }
+  return false;
+}
+
 /** Splits a script into simple commands, dropping redirection targets. */
 function invocations(command: string): string[][] {
   let tokens;

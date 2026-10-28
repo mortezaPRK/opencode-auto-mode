@@ -1,7 +1,7 @@
 import type { ReviewResult } from "./reviewer.js";
 import {
   CONTROL_OPERATORS, DYNAMIC, REDIRECT_OPERATORS, SCRIPT_HOSTS, SHELLS, STATEFUL,
-  denyInvocation, isReadOnlyInvocation, parseShell, resolveExecutable,
+  denyInvocation, hasAmbiguousDescriptorClose, isReadOnlyInvocation, parseShell, resolveExecutable,
 } from "./shell-policy.js";
 
 const MAX_COMMAND_CHARS = 4096;
@@ -162,6 +162,10 @@ function analyzeLine(command: string): Verdict {
     const blocked = denyInvocation(segment.words);
     if (blocked !== undefined) return { decision: "deny", reason: blocked };
   }
+  // Bash closes the descriptor and runs the rest of the word as a command
+  // (`2>&-sudo id` runs sudo), while shell-quote reads `-sudo` as the redirect
+  // target. Neither reading may approve the invocation.
+  if (hasAmbiguousDescriptorClose(command)) return { decision: "ask" };
   if (!complete || DYNAMIC_SYNTAX.test(command)) return { decision: "ask" };
 
   let ask = false;
