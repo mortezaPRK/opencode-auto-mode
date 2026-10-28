@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { ReviewErrorKind } from "./errors.js";
 
 export interface AuditRecord {
   ts: string;
@@ -15,6 +16,7 @@ export interface AuditRecord {
   reason: string;
   durationMs: number;
   error?: boolean;
+  errorKind?: ReviewErrorKind;
   errorDetail?: string;
   traceID?: string;
   spanID?: string;

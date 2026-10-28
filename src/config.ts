@@ -27,7 +27,12 @@ export interface AutoModeOptions {
   tui?: boolean;
   auditLog?: boolean | string;
   otlp?: boolean | OtlpOptions;
+  reviewTimeoutMs?: number;
 }
+
+/** Longest a single review may block the permission prompt, across every stage. */
+export const DEFAULT_REVIEW_TIMEOUT_MS = 60_000;
+export const MAX_REVIEW_TIMEOUT_MS = 120_000;
 
 export function object(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -115,9 +120,13 @@ function stage(value: unknown): value is ClassifierStage {
 
 export function parseOptions(value: unknown): AutoModeOptions {
   if (!object(value)) throw new Error("Invalid auto-mode options");
-  if (!only(value, ["classifiers", "tui", "auditLog", "otlp"]))
+  if (!only(value, ["classifiers", "tui", "auditLog", "otlp", "reviewTimeoutMs"]))
     throw new Error("Unknown auto-mode option");
   if (value.tui !== undefined && typeof value.tui !== "boolean") throw new Error("Invalid TUI setting");
+  if (value.reviewTimeoutMs !== undefined &&
+      (typeof value.reviewTimeoutMs !== "number" || !Number.isInteger(value.reviewTimeoutMs) ||
+       value.reviewTimeoutMs < 1_000 || value.reviewTimeoutMs > MAX_REVIEW_TIMEOUT_MS))
+    throw new Error("Invalid review timeout");
   if (value.auditLog !== undefined && typeof value.auditLog !== "boolean" && !text(value.auditLog))
     throw new Error("Invalid audit log");
   if (value.otlp !== undefined && typeof value.otlp !== "boolean" && !otlp(value.otlp)) throw new Error("Invalid OTLP options");

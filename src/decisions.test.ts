@@ -66,6 +66,17 @@ describe("typed decisions", () => {
     assert.equal((await decisionStage({ type: "decision", model: "laya/local" }, request, defaultPolicy(), mock({ text: "x".repeat(70_000) }))).decision, "abstain");
     assert.equal((await decisionStage({ type: "decision", model: "laya/local" }, { ...request, resources: ["x".repeat(70_000)] }, defaultPolicy(), () => { throw new Error("must not fetch"); })).decision, "abstain");
   });
+  it("reports malformed responses as invalid-output and provider failures as provider", async () => {
+    const malformed = await decisionStage({ type: "decision", model: "laya/local" }, request, defaultPolicy(), mock(systemone({ ...decision, confidence: 2 })));
+    assert.equal(malformed.decision, "abstain");
+    assert.equal(malformed.errorKind, "invalid-output");
+    const oversized = await decisionStage({ type: "decision", model: "laya/local" }, request, defaultPolicy(), mock({ text: "x".repeat(70_000) }));
+    assert.equal(oversized.errorKind, "invalid-output");
+    const unauthorized = await decisionStage({ type: "decision", model: "laya/local" }, request, defaultPolicy(),
+      (async () => { throw new Error("Invalid API key"); }) as typeof fetch);
+    assert.equal(unauthorized.decision, "abstain");
+    assert.equal(unauthorized.errorKind, "provider");
+  });
   it("abstains on low-confidence allows and asks on low-confidence denies", async () => {
     assert.equal((await decisionStage({ type: "decision", model: "laya/local" }, request, defaultPolicy(), mock(systemone({ ...decision, confidence: 0.5 })))).decision, "abstain");
     const lowConfidenceDeny = { type: "choice", choice: "deny", confidence: 0.5, probabilities: { deny: 0.5, allow: 0.25, ask: 0.25 } };
@@ -77,9 +88,11 @@ describe("typed decisions", () => {
     const key = process.env.TYPESAFE_API_KEY;
     delete process.env.TYPESAFE_API_KEY;
     try {
-      assert.equal((await decisionStage({ type: "decision", model: "typesafe-ai/jev-latest" }, request, defaultPolicy(), () => {
+      const result = await decisionStage({ type: "decision", model: "typesafe-ai/jev-latest" }, request, defaultPolicy(), () => {
         throw new Error("must not fetch");
-      })).decision, "abstain");
+      });
+      assert.equal(result.decision, "abstain");
+      assert.equal(result.errorKind, "provider");
     } finally {
       if (key !== undefined) process.env.TYPESAFE_API_KEY = key;
     }

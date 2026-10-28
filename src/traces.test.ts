@@ -15,6 +15,22 @@ describe("review traces", () => {
     assert.equal(tracesUrl("http://collector:4318/prefix/v1/logs"), "http://collector:4318/prefix/v1/traces");
     assert.throws(() => tracesUrl("file:///x"));
   });
+  it("marks failed attempts as errors on the child span", () => {
+    const original = globalThis.fetch;
+    let payload = "";
+    globalThis.fetch = (async (_url, init) => { payload = String(init?.body); return new Response(); }) as typeof fetch;
+    try {
+      const trace = createTraceExporter(true, { OPENCODE_OTLP_ENDPOINT: "http://collector:4318" })!.begin(1000);
+      trace.attempts.push({ index: 0, type: "llm", startedAt: 1000, durationMs: 20,
+        result: { decision: "abstain", reason: "reviewer unavailable", errorKind: "timeout" } });
+      trace.finish({ ...record, error: true, errorKind: "timeout" });
+      const spans = JSON.parse(payload).resourceSpans[0].scopeSpans[0].spans;
+      const child = spans[1];
+      assert.equal(child.status.code, 2);
+      assert.equal(child.attributes.find((x: { key: string }) => x.key === "error.kind").value.stringValue, "timeout");
+      assert.equal(spans[0].attributes.find((x: { key: string }) => x.key === "error.kind").value.stringValue, "timeout");
+    } finally { globalThis.fetch = original; }
+  });
   it("exports a root and fallback children with correlated log IDs", () => {
     const original = globalThis.fetch;
     let payload = "";
@@ -33,8 +49,7 @@ describe("review traces", () => {
       assert.equal(spans[1].parentSpanId, trace.spanID);
       assert.equal(spans[2].traceId, trace.traceID);
       assert.equal(spans[1].attributes.find((x: { key: string }) => x.key === "decision").value.stringValue, "abstain");
-      assert.doesNotMatch(payload, /PRIVATE_/);
-      const log = toLogRecord({ ...record, traceID: trace.traceID, spanID: trace.spanID });
+      assert.doesNotMatch(payload, /PRIVATE_/);      const log = toLogRecord({ ...record, traceID: trace.traceID, spanID: trace.spanID });
       assert.equal(log.traceId, trace.traceID);
       assert.equal(log.spanId, trace.spanID);
     } finally { globalThis.fetch = original; }
