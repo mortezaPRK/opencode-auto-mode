@@ -410,9 +410,21 @@ function heredocMarkerAt(line: string, index: number): { marker: HeredocMarker; 
   return delimiter ? { marker: { delimiter, quoted, stripTabs }, end: cursor } : undefined;
 }
 
-/** Reads heredoc markers on one line, ignoring markers inside quoted strings and comments. */
-export function heredocMarkers(line: string): HeredocMarker[] {
+interface HeredocScan { markers: HeredocMarker[]; unsupported: boolean }
+
+/**
+ * Scans one command line for here-document markers, ignoring markers inside
+ * quoted strings and comments.
+ *
+ * `unsupported` reports a marker this parser cannot track: an escaped or
+ * expanded delimiter (`<<\EOF`, `<<$name`) or a delimiter word assembled from
+ * quoted and unquoted parts (`<<E'OF'`, `<<'EOF'x`). A shorter delimiter would
+ * move the body boundary, so callers fail closed instead.
+ */
+function scanHeredoc(line: string): HeredocScan {
   const markers: HeredocMarker[] = [];
+  let unsupported = false;
+  let wordStart = true;
   let quote: "'" | '"' | undefined;
   for (let index = 0; index < line.length; index++) {
     const character = line[index];
@@ -422,16 +434,103 @@ export function heredocMarkers(line: string): HeredocMarker[] {
       if (character === '"') quote = undefined;
       continue;
     }
+    if (character === "'" || character === '"') { quote = character; wordStart = false; continue; }
+    if (character === "\\") { index++; wordStart = false; continue; }
+    if (character === "#" && wordStart) break;
+    if (character === "<") {
+      const parsed = heredocMarkerAt(line, index);
+      if (parsed !== undefined) {
+        if (parsed.end < line.length && !WORD_BREAK.test(line[parsed.end])) unsupported = true;
+        markers.push(parsed.marker);
+        index = parsed.end - 1;
+        wordStart = false;
+        continue;
+      }
+      if (line[index + 1] === "<" && line[index + 2] !== "<" && line[index - 1] !== "<") unsupported = true;
+    }
+    wordStart = WORD_BREAK.test(character);
+  }
+  return { markers, unsupported };
+}
+
+/** Reads heredoc markers on one line, ignoring markers inside quoted strings and comments. */
+export function heredocMarkers(line: string): HeredocMarker[] {
+  return scanHeredoc(line).markers;
+}
+
+/**
+ * True when the text contains a here-document operator outside quotes.
+ * Heredoc bodies are data, so callers that already located a body scan only
+ * the command line.
+ */
+export function hasHeredoc(text: string): boolean {
+  let quote: "'" | '"' | undefined;
+  for (let index = 0; index < text.length; index++) {
+    const character = text[index];
+    if (quote === "'") { if (character === "'") quote = undefined; continue; }
+    if (quote === '"') {
+      if (character === "\\") { index++; continue; }
+      if (character === '"') quote = undefined;
+      continue;
+    }
     if (character === "'" || character === '"') { quote = character; continue; }
     if (character === "\\") { index++; continue; }
-    if (character === "#" && (index === 0 || WORD_BREAK.test(line[index - 1]))) break;
-    if (character !== "<") continue;
-    const parsed = heredocMarkerAt(line, index);
-    if (parsed === undefined) continue;
-    markers.push(parsed.marker);
-    index = parsed.end - 1;
+    if (character === "<" && text[index + 1] === "<" && text[index + 2] !== "<" &&
+        text[index - 1] !== "<") return true;
   }
-  return markers;
+  return false;
+}
+
+/**
+ * The raw command line, up to the newline a shell would treat as its end.
+ * Quoted newlines and `\`-newlines stay inside the line; a comment's newline
+ * ends it.
+ */
+function commandLine(command: string): string {
+  let quote: "'" | '"' | "$'" | undefined;
+  let wordStart = true;
+  for (let index = 0; index < command.length; index++) {
+    const character = command[index];
+    if (quote === "'") { if (character === "'") quote = undefined; continue; }
+    if (quote === "$'") {
+      if (character === "\\") index++;
+      else if (character === "'") quote = undefined;
+      continue;
+    }
+    if (quote === '"') {
+      if (character === "\\") index++;
+      else if (character === '"') quote = undefined;
+      continue;
+    }
+    if (character === "\\") { index++; continue; }
+    if (character === "'" || character === '"') { quote = character; wordStart = false; continue; }
+    if (character === "$" && command[index + 1] === "'") { quote = "$'"; index++; wordStart = false; continue; }
+    if (character === "#" && wordStart) {
+      const end = command.indexOf("\n", index);
+      return end === -1 ? command : command.slice(0, end);
+    }
+    if (character === "\n") return command.slice(0, index);
+    wordStart = WORD_BREAK.test(character);
+  }
+  return command;
+}
+
+/**
+ * True when a here-document header cannot be tracked reliably from the raw
+ * source, so the guard must fail closed instead of normalizing bytes it cannot
+ * place.
+ *
+ * Deleting a `\`-newline is only safe once the marker and its delimiter are
+ * visible: a continuation in the header can split `<`+`<`, split the delimiter
+ * (`<<`+newline+`EOF`, `<<E`+newline+`OF`), or hide the entire marker
+ * (`cat <<`+newline+`'EOF'`). Guessing there can move the body boundary past a
+ * trailing command, so these and unsupported delimiters require approval.
+ */
+export function hasAmbiguousHeredoc(command: string): boolean {
+  const header = commandLine(command);
+  if (!hasHeredoc(header) && !hasHeredoc(normalizeContinuations(header))) return false;
+  if (header.includes("\\\n")) return true;
+  return scanHeredoc(header).unsupported;
 }
 
 /**
@@ -454,49 +553,6 @@ function heredocBodies(command: string, start: number, markers: readonly Heredoc
     if (!closed) break;
   }
   return { text, end: index };
-}
-
-/**
- * The text an unquoted here-document body expands to.
- *
- * A body is not shell syntax, so the only escapes are `\` before `\`, `$`, a
- * backtick, or a newline. An escaped newline is removed, while an escaped
- * backslash leaves the newline that follows it in place.
- */
-function heredocBodyText(body: string): string {
-  let text = "";
-  for (let index = 0; index < body.length; index++) {
-    const character = body[index];
-    if (character !== "\\") { text += character; continue; }
-    const next = body[index + 1];
-    if (next === undefined) { text += character; continue; }
-    if (next === "\n") { index++; continue; }
-    text += character + next;
-    index++;
-  }
-  return text;
-}
-
-/**
- * True when an unquoted here-document body contains a substitution the guard
- * must not approve automatically.
- *
- * A body is not shell syntax: `'` and `"` are data and give no quoting power,
- * so a substitution written inside them still runs. Only `\` escapes the next
- * character, and `\`+newline joins lines, so `$`+`\`+newline+`(` is the same
- * `$(` a plain text scan cannot see. Process-substitution text stays
- * conservative even where the shell leaves it literal. Quoted here-document
- * bodies are data and are never scanned.
- */
-export function hasHeredocExpansion(body: string): boolean {
-  const text = heredocBodyText(body);
-  for (let index = 0; index < text.length; index++) {
-    const character = text[index];
-    if (character === "\\") { index++; continue; }
-    if (character === "`") return true;
-    if ((character === "$" || character === "<" || character === ">") && text[index + 1] === "(") return true;
-  }
-  return false;
 }
 
 /**

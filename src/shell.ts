@@ -1,8 +1,8 @@
 import type { ReviewResult } from "./reviewer.js";
 import {
   CONTROL_OPERATORS, DYNAMIC, REDIRECT_OPERATORS, SCRIPT_HOSTS, SHELLS, STATEFUL,
-  denyInvocation, hasAmbiguousDescriptorClose, hasHeredocExpansion, heredocMarkers, isReadOnlyInvocation,
-  normalizeContinuations, parseShell, resolveExecutable, stripDescriptorPrefixes,
+  denyInvocation, hasAmbiguousDescriptorClose, hasAmbiguousHeredoc, hasHeredoc, heredocMarkers,
+  isReadOnlyInvocation, normalizeContinuations, parseShell, resolveExecutable, stripDescriptorPrefixes,
 } from "./shell-policy.js";
 
 const MAX_COMMAND_CHARS = 4096;
@@ -23,25 +23,6 @@ export function shellWords(command: string): string[] | undefined {
 
 interface Segment { words: string[]; globs: boolean[]; write: boolean }
 type Verdict = { decision: "deny"; reason: string } | { decision: "allow" | "review" | "ask" };
-
-/** True when the command contains a heredoc marker outside quotes. Heredoc bodies are data. */
-function hasHeredoc(command: string): boolean {
-  let quote: "'" | '"' | undefined;
-  for (let index = 0; index < command.length; index++) {
-    const character = command[index];
-    if (quote === "'") { if (character === "'") quote = undefined; continue; }
-    if (quote === '"') {
-      if (character === "\\") { index++; continue; }
-      if (character === '"') quote = undefined;
-      continue;
-    }
-    if (character === "'" || character === '"') { quote = character; continue; }
-    if (character === "\\") { index++; continue; }
-    if (character === "<" && command[index + 1] === "<" && command[index + 2] !== "<" &&
-        command[index - 1] !== "<") return true;
-  }
-  return false;
-}
 
 /** True when the effective executable is a shell, a dynamic builtin, or a stateful builtin. */
 function dynamicExecution(words: string[]): boolean {
@@ -337,13 +318,15 @@ function analyzeHeredoc(command: string): Verdict {
   let ask = script.decision === "ask";
   const review = script.decision === "review";
   for (const body of bodies) {
-    // An unquoted body expands like a double-quoted string but is not shell
-    // syntax: quotes are data, and `\`+newline joins lines. Scan the
-    // expansion-normalized text so `$`+`\`+newline+`(` cannot hide a
-    // substitution the shell would run; the plain scan stays as a conservative
-    // catch for escaped forms. Quoted bodies are data and stay allowed.
     const text = body.lines.join("\n");
-    if (!body.quoted && (DYNAMIC_SYNTAX.test(text) || hasHeredocExpansion(text))) return { decision: "ask" };
+    // A quoted body is data and its header was unambiguous, so a continuation
+    // there stays literal. An unquoted body is matched against its terminator
+    // after the shell removes continuations, so any `\`-newline can move the
+    // body boundary and must fail closed even when the body looks benign.
+    if (body.quoted) continue;
+    if (text.includes("\\\n")) return { decision: "ask" };
+    // Unquoted heredoc bodies undergo command and parameter expansion.
+    if (DYNAMIC_SYNTAX.test(text)) return { decision: "ask" };
   }
   try {
     const words = parseShell(firstLine).filter((token): token is string => typeof token === "string");
@@ -356,6 +339,9 @@ function analyzeHeredoc(command: string): Verdict {
 }
 
 function analyze(command: string): Verdict {
+  // Fail closed on a heredoc header that normalization cannot be trusted on:
+  // the raw source is the only place its marker and delimiter are still intact.
+  if (hasAmbiguousHeredoc(command)) return { decision: "ask" };
   // Normalize once, before routing: `logicalLines` must split on the newlines
   // the shell actually treats as separators, and heredoc bodies stay untouched.
   const normalized = normalizeContinuations(command);
