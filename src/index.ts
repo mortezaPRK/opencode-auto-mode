@@ -317,8 +317,16 @@ export default Plugin.define({
         } catch { log.log("Output screening failed"); }
       }),
       async () => {
-        await permissionRegistration.dispose().catch(() => {});
-        await abandonSetup();
+        // Begin abandoning before awaiting either cleanup: a stalled permission
+        // disposal must not leave the event subscription and active reviews
+        // running, where an in-flight review could deliver an allow instead of
+        // the cancellation that normalizes to `ask`. Both cleanups start here
+        // and settle together; their failures must not replace the original
+        // registration error.
+        await Promise.allSettled([
+          abandonSetup(),
+          Promise.resolve().then(() => permissionRegistration.dispose()),
+        ]);
       },
     );
     log.log("Auto-mode loaded");
@@ -339,7 +347,9 @@ async function registerHook<T>(register: () => Promise<T>, undo: () => Promise<v
   try {
     return await register();
   } catch (error) {
-    await undo();
+    // A cleanup failure or rejection must not mask the registration error the
+    // caller has to see, and must not be reported as an unhandled rejection.
+    await Promise.allSettled([undo()]);
     throw error;
   }
 }

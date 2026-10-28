@@ -2,7 +2,7 @@
 import { createSignal, For, onCleanup } from "solid-js";
 import { Command, ComposerPill, Panel, Plugin, createKeyed, type PanelTab } from "@opencode/plugin/gui";
 import { AutoMode, type AutoModeStatus } from "./rpc.js";
-import { createStatusLoader, latest, panelView, pillLabel, statusTarget } from "./gui-state.js";
+import { createStatusLoader, latest, noticeExpired, panelView, pillLabel, statusTarget } from "./gui-state.js";
 
 const POLL_MS = 3_000;
 const NOTICE_MS = 30_000;
@@ -34,7 +34,15 @@ export default Plugin.define({
     // has no status here; `session.key` keeps the same session id on two
     // servers apart.
     const target = () => statusTarget(ctx.sessions.current());
-    const poll = () => { void refresh(target()); };
+    // The pill's notice expiry needs a clock of its own: the loader keeps the
+    // previous snapshot when a poll fails without applying it, so a clock read
+    // only when the snapshot changes would leave an expired decision on screen
+    // while the server is unreachable. Advance it on every tick regardless.
+    const [now, setNow] = createSignal(Date.now());
+    const poll = () => {
+      setNow(Date.now());
+      void refresh(target());
+    };
 
     createKeyed(() => target()?.key, poll, { otherwise: poll });
     const timer = setInterval(poll, POLL_MS);
@@ -100,12 +108,13 @@ export default Plugin.define({
         const snapshot = status();
         const label = pillLabel(snapshot);
         if (label === undefined) return undefined;
-        const last = latest(snapshot);
+        // `now()` is tracked, so the pill disappears on the tick that passes
+        // the notice window even if no snapshot arrives after it.
+        if (noticeExpired(snapshot, now(), NOTICE_MS)) return undefined;
         const reviewing = (snapshot?.reviewing.length ?? 0) > 0;
-        if (!reviewing && last !== undefined && Date.now() - last.at > NOTICE_MS) return undefined;
         return {
           label,
-          tone: reviewing ? "warning" : TONE[last?.decision ?? "allow"],
+          tone: reviewing ? "warning" : TONE[latest(snapshot)?.decision ?? "allow"],
           title: ctx.t("pill.title"),
           rows: (snapshot?.recent ?? []).slice(-5).reverse().map((entry) => ({
             id: entry.reviewID,

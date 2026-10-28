@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { createStatusGuard, createStatusLoader, panelView, pillLabel, statusTarget, type StatusTarget } from "./gui-state.js";
+import { createStatusGuard, createStatusLoader, noticeExpired, panelView, pillLabel, statusTarget, type StatusTarget } from "./gui-state.js";
 import type { AutoModeDecision, AutoModeStatus } from "./rpc.js";
 
 const OWN = "sidecar";
@@ -290,5 +290,39 @@ describe("status pill", () => {
       "auto-mode reviewing…");
     assert.equal(pillLabel(status({ recent: [decision("deny")] })), "auto-mode deny");
     assert.equal(pillLabel(status({ recent: [decision("deny", { errorKind: "provider" })] })), "auto-mode deny: provider");
+  });
+  it("expires the notice after the decision, but never while reviewing", () => {
+    const recordedAt = 1_000;
+    const decided = status({ recent: [decision("allow", { at: recordedAt })] });
+    assert.equal(noticeExpired(undefined, recordedAt + 60_000, 30_000), false);
+    assert.equal(noticeExpired(status(), recordedAt + 60_000, 30_000), false);
+    assert.equal(noticeExpired(decided, recordedAt, 30_000), false);
+    assert.equal(noticeExpired(decided, recordedAt + 30_000, 30_000), false);
+    assert.equal(noticeExpired(decided, recordedAt + 30_001, 30_000), true);
+    // An active review keeps the pill up regardless of the last decision's age.
+    const reviewing = status({
+      reviewing: [{ sessionID: "a", reviewID: "review-2", startedAt: recordedAt + 60_000 }],
+      recent: decided.recent,
+    });
+    assert.equal(noticeExpired(reviewing, recordedAt + 60_000, 30_000), false);
+  });
+  it("expires a snapshot a failed poll keeps on screen", async () => {
+    const applied: (AutoModeStatus | undefined)[] = [];
+    let failing = false;
+    const refresh = createStatusLoader(async () => {
+      if (failing) throw new Error("status unavailable");
+      return status({ recent: [decision("allow", { at: 1_000 })] });
+    }, (next) => applied.push(next));
+
+    await refresh(target("a"));
+    failing = true;
+    await refresh(target("a"));
+
+    // The failed poll preserved the snapshot instead of applying a new one, so
+    // only the reactive clock can retire its notice.
+    const kept = applied.at(-1);
+    assert.equal(kept?.recent.at(-1)?.decision, "allow");
+    assert.equal(noticeExpired(kept, 1_000 + 30_000, 30_000), false);
+    assert.equal(noticeExpired(kept, 1_000 + 30_001, 30_000), true);
   });
 });

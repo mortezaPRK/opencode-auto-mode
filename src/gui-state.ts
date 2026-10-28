@@ -141,3 +141,20 @@ export function pillLabel(status: AutoModeStatus | undefined): string | undefine
   if (last.errorKind !== undefined) return `auto-mode ${last.decision}: ${last.errorKind}`;
   return `auto-mode ${last.decision}`;
 }
+
+/**
+ * Whether the pill's notice for the latest decision has expired. A review in
+ * progress is always shown; a finished decision stays visible for `noticeMs`
+ * after it was recorded.
+ *
+ * `now` must come from a clock the caller reads reactively and advances on
+ * every polling tick, including failed ones: the status loader keeps its
+ * previous snapshot when a request fails without applying it, so a notice
+ * expired against wall-clock time read only on snapshot changes would never
+ * disappear while the server is unreachable.
+ */
+export function noticeExpired(status: AutoModeStatus | undefined, now: number, noticeMs: number): boolean {
+  if (status === undefined || status.reviewing.length > 0) return false;
+  const last = latest(status);
+  return last !== undefined && now - last.at > noticeMs;
+}

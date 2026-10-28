@@ -13,6 +13,8 @@ interface Evaluation {
 async function setup(options: unknown = {}, messages: unknown[] = [{ type: "user", text: "Create a file named a" }], answers = ["BLOCK", "ALLOW: authorized"]) {
   let evaluate!: (event: Evaluation) => Promise<void>;
   let disposed = 0;
+  const disposals: string[] = [];
+  let permissionDispose: (() => Promise<void>) | undefined;
   const prompts: string[] = [];
   const models: ({ id: string; providerID: string; variant?: string } | null | undefined)[] = [];
   const interrupts: { data: { sessionID: string } }[] = [];
@@ -43,14 +45,14 @@ async function setup(options: unknown = {}, messages: unknown[] = [{ type: "user
   }
   const ctx = {
     options,
-    permission: { hook: async (_: string, handler: typeof evaluate) => { evaluate = handler; return { dispose: async () => { disposed++; } }; } },
-    tool: { hook: async () => ({ dispose: async () => { disposed++; } }) },
+    permission: { hook: async (_: string, handler: typeof evaluate) => { evaluate = handler; return { dispose: async () => { disposed++; disposals.push("permission"); await permissionDispose?.(); } }; } },
+    tool: { hook: async () => ({ dispose: async () => { disposed++; disposals.push("tool"); } }) },
     session: { get: async () => ({ location: { directory: "/repo" }, model: { providerID: "session-provider", id: "session-model", variant: "high" } }), context: async () => messages },
     event: { subscribe },
     rpc: {
       register: async (_definition: unknown, handlers: typeof rpcHandlers) => {
         rpcHandlers = handlers;
-        return { events: delivery, dispose: async () => { disposed++; } };
+        return { events: delivery, dispose: async () => { disposed++; disposals.push("rpc"); } };
       },
     },
     generate: { text: async ({ prompt, model }: { prompt: string; model?: { id: string; providerID: string; variant?: string } | null }) => { prompts.push(prompt); models.push(model); return { text: answers.shift() ?? "ASK: unclear" }; } },
@@ -58,7 +60,9 @@ async function setup(options: unknown = {}, messages: unknown[] = [{ type: "user
   const cleanup = await plugin.setup(ctx as unknown as Parameters<typeof plugin.setup>[0]);
   return {
     evaluate: (evaluation: Evaluation) => evaluate(evaluation),
-    prompts, models, ctx, disposed: () => disposed, rpcEvents, delivery, subscriptions,
+    prompts, models, ctx, disposed: () => disposed, disposals, rpcEvents, delivery, subscriptions,
+    /** Holds every permission-hook disposal open on the given gate. */
+    stallPermissionDispose: (gate: () => Promise<void>) => { permissionDispose = gate; },
     status: async (input: unknown = {}) => rpcHandlers.status!(input),
     interrupt: (sessionID = "session-test") => { interrupts.push({ data: { sessionID } }); wake?.(); },
     cleanup: async () => { await cleanup?.(); },
@@ -719,6 +723,52 @@ describe("OpenCode permission hook", () => {
     await assert.rejects(Promise.resolve(setupRun));
     assert.equal(host.subscriptions[1]!.aborted, true);
     await waitFor(() => providerSignal!.aborted);
+    await reviewRun;
+    assert.equal(pending.effect, "ask");
+    assert.match(pending.message!, /interrupted/i);
+    await host.cleanup();
+  });
+  it("abandons reviews and subscriptions before a stalled cleanup settles", async () => {
+    const host = await setup({ classifiers: [{ type: "llm" }] });
+    let rejectTool!: (error: Error) => void;
+    let toolStarted!: () => void;
+    const toolRegistration = new Promise<void>((resolve) => { toolStarted = resolve; });
+    host.ctx.tool.hook = (() => {
+      toolStarted();
+      return new Promise((_resolve, reject) => { rejectTool = reject; });
+    }) as typeof host.ctx.tool.hook;
+    // Hold the permission hook's disposal open: abandonment must not wait for it.
+    let disposalStarted!: () => void;
+    const started = new Promise<void>((resolve) => { disposalStarted = resolve; });
+    let releaseDisposal!: () => void;
+    const disposalGate = new Promise<void>((resolve) => { releaseDisposal = resolve; });
+    host.stallPermissionDispose(() => { disposalStarted(); return disposalGate; });
+
+    const setupRun = plugin.setup(host.ctx as unknown as Parameters<typeof plugin.setup>[0]);
+    await toolRegistration;
+    let providerSignal: AbortSignal | undefined;
+    host.ctx.generate.text = ((_input: { prompt: string }, request?: { signal?: AbortSignal }) => {
+      providerSignal = request?.signal;
+      return new Promise<{ text: string }>(() => {});
+    }) as typeof host.ctx.generate.text;
+    const pending = event();
+    const reviewRun = host.evaluate(pending);
+    await waitFor(() => providerSignal !== undefined);
+
+    rejectTool(new Error("tool registration failed"));
+    await started;
+
+    // Disposal is still stalled, yet the event stream, the active review, and
+    // the status RPC are already abandoned and both cleanups have started.
+    assert.equal(host.subscriptions.length, 2);
+    assert.equal(host.subscriptions[1]!.aborted, true);
+    await waitFor(() => providerSignal!.aborted);
+    assert.ok(host.disposals.includes("permission"));
+    assert.ok(host.disposals.includes("rpc"));
+
+    releaseDisposal();
+    // The stalled disposal must not replace the registration error.
+    await assert.rejects(Promise.resolve(setupRun), /tool registration failed/);
     await reviewRun;
     assert.equal(pending.effect, "ask");
     assert.match(pending.message!, /interrupted/i);
