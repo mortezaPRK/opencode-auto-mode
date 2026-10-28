@@ -134,9 +134,13 @@ describe("shell approval guard", () => {
     assert.equal(guardShell(["cat <<< 'x' ; sudo id"])?.decision, "deny");
     for (const command of ["sudo \\\nid", "echo 'a \\\nb'", "cat <<EOF\na \\\nb\nEOF", "touch 'unclosed \\\nword"])
       assert.equal(normalizeContinuations(normalizeContinuations(command)), normalizeContinuations(command), command);
-    for (const command of ["echo a \\\nb", 'echo "a \\\nb"', "echo 'a \\\nb'", "echo $'a \\\nb'",
+    for (const command of ["echo a \\\nb", 'echo "a \\\nb"', "echo 'a \\\nb'",
       "cat <<'EOF'\nsudo \\\nid\nEOF", "cat <<'A' <<'B'\na \\\nb\nA\nc \\\nd\nB"])
       assert.equal(guardShell([command])?.decision, "allow", command);
+    // ANSI-C quoting keeps the continuation literal too, but the guard asks
+    // because it does not decode the quoting.
+    assert.equal(normalizeContinuations("echo $'a \\\nb'"), "echo $'a \\\nb'");
+    assert.equal(guardShell(["echo $'a \\\nb'"])?.decision, "ask");
     // `a\\`+newline leaves a real newline, so the next line is its own command.
     assert.equal(guardShell(["echo a\\\\\nb"]), undefined);
   });
@@ -228,12 +232,13 @@ describe("shell approval guard", () => {
     assert.equal(guardShell(["cat <<'E\\OF'\nx\nE\\OF\nsudo id"])?.decision, "deny");
     assert.equal(guardShell(["cat <<'E\\OF'\nx\nE\\OF\npwd"])?.decision, "allow");
     // The supported grammar stays read-only: bare words, one quoted word, and a
-    // double-quoted word whose text needs no decoding.
+    // double-quoted word whose text needs no decoding. `$'...'` text asks.
     for (const command of ["cat <<'EOF'\nx\nEOF", "cat <<\"EOF\"\nx\nEOF",
       "cat <<\"$x\"\nbody\n$x\npwd", "cat <<_EOF_1\nx\n_EOF_1\npwd", "cat <<2\nx\n2\npwd",
       "cat <<- 'EOF'\n\tx\n\tEOF\npwd", "cat <<'A B'\nx\nA B\npwd",
-      "cat <<\"'EOF'\"\nx\n'EOF'\npwd", "cat <<\"$'EOF'\"\nx\n$'EOF'\npwd"])
+      "cat <<\"'EOF'\"\nx\n'EOF'\npwd"])
       assert.equal(guardShell([command])?.decision, "allow", command);
+    assert.equal(guardShell(["cat <<\"$'EOF'\"\nx\n$'EOF'\npwd"])?.decision, "ask");
   });
   it("asks for whitespace a shell does not treat as a word separator", () => {
     // CR, FF, VT, NBSP, U+2028/U+2029, and em space are ordinary word characters
@@ -261,6 +266,40 @@ describe("shell approval guard", () => {
     for (const command of ["echo a b", "echo a\tb", "pwd\nls"])
       assert.equal(guardShell([command])?.decision, "allow", command);
   });
+  it("asks for legacy $[ arithmetic before heredoc routing", () => {
+    // The exact report: the `<<` in `$[ 1 << 2 ]` is a left shift, so `2` is not
+    // a heredoc terminator and the tail runs. Nothing here may auto-allow.
+    for (const command of ["echo $[ 1 << 2 ]\nsudo id\n2", "echo $[ 1 << 2 ]",
+      "pwd\necho $[ 1 << 2 ]\nsudo id\n2", "sh -c 'echo $[ 1 << 2 ]'",
+      "bash -c 'echo $[ 1 << 2 ]\nsudo id\n2'", "eval 'echo $[ 1 << 2 ]'",
+      // Pre-quoted occurrences are conservative too: `$[` never auto-allows.
+      "echo '$[ 1 + 1 ]'", "echo \"$[ 1 + 1 ]\"", "echo \\$[ 1 + 1 ]",
+      "cat <<'EOF'\n$[ 1 + 1 ]\nEOF", "cat <<EOF\n$[ 1 + 1 ]\nEOF"])
+      assert.equal(guardShell([command])?.decision, "ask", command);
+    assert.notEqual(guardShell(["echo $[ 1 << 2 ]\nsudo id\n2"])?.decision, "allow");
+  });
+  it("asks for extended quoting the scanner does not decode", () => {
+    // `$'...'` lets a backslash escape its own quote, so the `<<EOF` below is
+    // string data and the tail runs; a quote scan that ended the string at the
+    // escaped quote read it as a heredoc and swallowed the tail.
+    for (const command of ["echo $'a\\\\\\'<<EOF\nx'\nsudo id\nEOF",
+      "echo $'a\\\\\\'<<EOF\nx'\npwd\nEOF",
+      // A locale quote has the same shape and is not decoded either.
+      "echo $\"a<<EOF b\"\nsudo id\nEOF",
+      // Ordinary extended quoting asks too, and quoted or heredoc data is
+      // conservatively included.
+      "echo $'a b'", "echo $'a\\nb'", "echo $\"a b\"", "echo \\$'a b'",
+      "cat <<'EOF'\n$'a b'\nEOF", "cat <<EOF\n$'a b'\nEOF"])
+      assert.equal(guardShell([command])?.decision, "ask", command);
+    // A nested shell form reaches the same raw gate.
+    for (const command of ["sh -c \"echo $'a b'\"",
+      "bash -c \"echo $'a\\\\\\'<<EOF\nx'\nsudo id\nEOF\""])
+      assert.equal(guardShell([command])?.decision, "ask", command);
+    assert.equal(guardShell(["sh -c \"echo $'a b'\"", "sudo id"])?.decision, "deny");
+    // The same text without extended quoting stays read-only.
+    for (const command of ["echo a b", "echo 'a b'", 'echo "a b"'])
+      assert.equal(guardShell([command])?.decision, "allow", command);
+  });
   it("keeps a continued command exactly as dangerous as the command it joins", () => {
     const insert = (command: string, index: number) => `${command.slice(0, index)}\\\n${command.slice(index)}`;
     for (const command of ["sudo id", "su root", "rm -rf /", "rm -r / --no-preserve-root", "chmod 777 secret",
@@ -281,7 +320,7 @@ describe("shell approval guard", () => {
     for (const command of ["echo a#b ; sudo id", "echo a#b; sudo id", "echo a#b && sudo id",
       "echo a#b | sudo id", "echo a#b\nsudo id", "echo 'a\nb'#c ; sudo id",
       'echo "a\nb"#c ; sudo id', "echo a\\ #b ; sudo id", "echo ''#c ; sudo id",
-      'echo ""#c ; sudo id', "echo $'a#b' ; sudo id", "echo '#' ; sudo id", 'echo "#" ; sudo id',
+      'echo ""#c ; sudo id', "echo '#' ; sudo id", 'echo "#" ; sudo id',
       "echo \\# ; sudo id", "VAR=#x sudo id", "echo ${x#y} ; sudo id", "echo $# ; sudo id",
       "echo ${#var} ; sudo id", 'echo "${x#y}" ; sudo id', "echo ${x##*/} ; sudo id",
       "sh -c 'echo a#b ; sudo id'", "eval 'echo a#b ; sudo id'", "bash -c 'echo a#b ; sudo id'",
@@ -289,8 +328,11 @@ describe("shell approval guard", () => {
       assert.equal(guardShell([command])?.decision, "deny", command);
     // Quoted, escaped, and quoted-newline hashes stay literal.
     for (const command of ["echo '#'", 'echo "#"', "echo \\#", "echo a#b", "echo 'a#b'", 'echo "a#b"',
-      "echo $'a#b'", "echo 'a\nb#c'"])
+      "echo 'a\nb#c'"])
       assert.equal(guardShell([command])?.decision, "allow", command);
+    // ANSI-C quoting is not decoded, so it asks instead of taking a deny.
+    assert.equal(guardShell(["echo $'a#b' ; sudo id"])?.decision, "ask");
+    assert.equal(guardShell(["echo $'a#b'"])?.decision, "ask");
     // A real word-start comment still discards the rest of its line.
     for (const command of ["echo a # comment ; sudo id", "echo a#b # comment ; sudo id",
       "echo 'a\nb' #comment ; sudo id"])
@@ -556,9 +598,11 @@ describe("shell policy edge cases", () => {
     assert.equal(hasAmbiguousDescriptorClose("true;2>&-|id"), false);
 
     // Quoted or escaped text is data, not a descriptor or a command.
-    for (const command of ['echo "2>&-sudo"', "echo '2>&-sudo'", "echo $'2>&-sudo'",
+    for (const command of ['echo "2>&-sudo"', "echo '2>&-sudo'",
       "echo 2\\>\\&-sudo", "pwd # 2>&-sudo"])
       assert.equal(guardShell([command])?.decision, "allow", command);
+    // ANSI-C quoting asks before the descriptor scan can disagree with the shell.
+    assert.equal(guardShell(["echo $'2>&-sudo'"])?.decision, "ask");
     assert.equal(hasAmbiguousDescriptorClose('echo "2>&-sudo"'), false);
     assert.equal(hasAmbiguousDescriptorClose("echo '2>&-sudo'"), false);
     assert.equal(hasAmbiguousDescriptorClose("echo 2\\>\\&-sudo"), false);

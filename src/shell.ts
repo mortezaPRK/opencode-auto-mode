@@ -10,7 +10,7 @@ const MAX_COMMAND_CHARS = 4096;
 const MAX_COMMAND_BYTES = 65_536;
 const BALANCED_QUOTES = /^(?:[^'"\\]|\\[^\r\n]|'[^']*'|"(?:[^"\\]|\\[^\r\n])*")*$/;
 const WRITE_OPERATORS = new Set([">", ">>", ">|", "&>", "&>>", "<>"]);
-const DYNAMIC_SYNTAX = /\$\(|`|\$\(\s*\(|[<>]\(/;
+const DYNAMIC_SYNTAX = /\$\(|`|\$\(\s*\(|[<>]\(|\$\[/;
 const FORK_BOMB = /:\s*\(\s*\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:/;
 
 export function shellWords(command: string): string[] | undefined {
@@ -345,6 +345,16 @@ function analyze(command: string): Verdict {
   // can move a heredoc boundary or turn a midword hash into a comment, so any of
   // them fails closed before normalization, the deny pass, or parsing.
   if (hasNonShellWhitespace(command)) return { decision: "ask" };
+  // `$[` is the legacy arithmetic expansion: the `<<` inside it is a shift, not
+  // a heredoc, so heredoc routing would treat the rest of the script as a body
+  // and swallow a trailing command. Extended quoting has the same problem from
+  // the other side: `$'...'` lets a backslash escape its own quote, so a quote
+  // scan can end the string early and read `<<EOF` as a heredoc, and `$"..."`
+  // is a locale quote this parser does not decode. Reject all three on the raw
+  // source before normalization or heredoc routing, conservatively including
+  // quoted and heredoc data.
+  if (command.includes("$[") || command.includes("$'") || command.includes('$"'))
+    return { decision: "ask" };
   // Fail closed on a heredoc header that normalization cannot be trusted on:
   // the raw source is the only place its marker and delimiter are still intact.
   if (hasAmbiguousHeredoc(command)) return { decision: "ask" };
