@@ -284,6 +284,10 @@ export function stripDescriptorPrefixes(command: string): string {
       let cursor = index;
       while (cursor < command.length && /\d/.test(command[cursor])) cursor++;
       if (command[cursor] === ">" || command[cursor] === "<") {
+        // Replace the run with a space instead of deleting it: `&2>` is `&`
+        // followed by a redirect, and deleting the `2` would fuse `&` and `>`
+        // into the different `&>` operator.
+        result += " ";
         index = cursor;
         continue;
       }

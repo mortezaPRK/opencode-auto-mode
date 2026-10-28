@@ -253,9 +253,11 @@ describe("shell policy edge cases", () => {
 
   it("drops only descriptor prefixes that are adjacent in the source", () => {
     assert.equal(stripDescriptorPrefixes("chmod 777 > /dev/null secret"), "chmod 777 > /dev/null secret");
-    assert.equal(stripDescriptorPrefixes("echo 2>/dev/null"), "echo >/dev/null");
-    assert.equal(stripDescriptorPrefixes("echo 12>&1"), "echo >&1");
-    assert.equal(stripDescriptorPrefixes("pwd;2>/dev/null"), "pwd;>/dev/null");
+    assert.equal(stripDescriptorPrefixes("echo 2>/dev/null"), "echo  >/dev/null");
+    assert.equal(stripDescriptorPrefixes("echo 12>&1"), "echo  >&1");
+    assert.equal(stripDescriptorPrefixes("pwd;2>/dev/null"), "pwd; >/dev/null");
+    assert.equal(stripDescriptorPrefixes("true&2>/dev/null sudo id"), "true& >/dev/null sudo id");
+    assert.equal(stripDescriptorPrefixes("true &2>>/dev/null rm -r /"), "true & >>/dev/null rm -r /");
     assert.equal(stripDescriptorPrefixes("echo 2 >/dev/null"), "echo 2 >/dev/null");
     assert.equal(stripDescriptorPrefixes('echo "2">/dev/null'), 'echo "2">/dev/null');
     assert.equal(stripDescriptorPrefixes("echo $'2>file'"), "echo $'2>file'");
@@ -270,6 +272,18 @@ describe("shell policy edge cases", () => {
     // A quoted or escaped digit is an argument, not a changed file descriptor.
     for (const command of ['chmod 600 "2">/dev/null secret', "chmod 600 \\2>/dev/null secret"])
       assert.notEqual(guardShell([command])?.decision, "deny", command);
+  });
+
+  it("keeps background operators separate from descriptor prefixes", () => {
+    for (const command of ["true&2>/dev/null sudo -n id", "true&2>&1 sudo -n id",
+      "true &2>>/dev/null rm -r /", "true &1>/dev/null sudo -n id", "true &2>2 chmod 777 secret",
+      "true&2>2 chmod 777 secret", "sh -c 'true &2>/dev/null sudo -n id'",
+      "eval 'true &2>/dev/null rm -r /'"])
+      assert.equal(guardShell([command])?.decision, "deny", command);
+    // The background helper must still reach review, never a static allow.
+    for (const command of ["true &2>2 chmod777 secret", "true &2>/dev/null bat --generate-config-file",
+      "true &2>>/dev/null bat --generate-config-file"])
+      assert.equal(guardShell([command]), undefined, command);
   });
 
   it("denies identifiable commands before asking about dynamic arguments", () => {
