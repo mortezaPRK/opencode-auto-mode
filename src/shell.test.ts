@@ -1,6 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { compositeDecision } from "./classifier.js";
+import { stripDescriptorPrefixes } from "./shell-policy.js";
 import { guardShell, shellWords } from "./shell.js";
 
 const unused = async () => { throw new Error("unexpected reviewer call"); };
@@ -129,11 +130,13 @@ describe("shell approval guard", () => {
       "file -C -m /tmp/magic",
       "bat --pager='sh -c id' file",
       "bat --config-file=./evil.toml file",
+      "bat --generate-config-file",
+      "bat --gen",
       "hostname evil",
       "uniq in.txt out.txt",
     ]) assert.equal(guardShell([command]), undefined, command);
     for (const command of ["rg -n sudo src", "sort -u file", "tree -L 2", "file package.json", "bat README.md",
-      "hostname -s", "uniq -c file"])
+      "bat --style=numbers README.md", "hostname -s", "uniq -c file"])
       assert.equal(guardShell([command])?.decision, "allow", command);
   });
 
@@ -148,7 +151,7 @@ describe("shell approval guard", () => {
 
   it("still denies dangerous operations hidden in nested shells", () => {
     for (const command of ["bash -c 'rm -rf /'", "sh -lc 'sudo id'", "eval 'chmod 777 x'", "rm -fr /",
-      "sudo -n id", "mkfs.ext4 /dev/sda1"])
+      "sh -c 'rm -r / --no-preserve-root'", "sudo -n id", "mkfs.ext4 /dev/sda1"])
       assert.equal(guardShell([command])?.decision, "deny", command);
     // Subshell syntax is not parsed into segments, so it stays a manual approval.
     assert.equal(guardShell(["( sudo id )"])?.decision, "ask");
@@ -207,9 +210,10 @@ describe("shell policy edge cases", () => {
 
   it("denies rm when any target is the filesystem root", () => {
     for (const command of ["rm -rf / /tmp/scratch --no-preserve-root", "rm -rf /tmp/scratch /",
-      "rm -rf /* /tmp/scratch", "rm -rf /. /tmp"])
+      "rm -rf /* /tmp/scratch", "rm -rf /. /tmp", "rm -r /", "rm -r / --no-preserve-root",
+      "rm --recursive /", "rm -R /*"])
       assert.equal(guardShell([command])?.decision, "deny", command);
-    for (const command of ["rm -rf /tmp/scratch", "rm -rf ./build", "rm -rf /tmp/*"])
+    for (const command of ["rm -rf /tmp/scratch", "rm -rf ./build", "rm -rf /tmp/*", "rm -f /", "rm /tmp/file"])
       assert.notEqual(guardShell([command])?.decision, "deny", command);
   });
 
@@ -228,6 +232,44 @@ describe("shell policy edge cases", () => {
     assert.equal(guardShell(["sh -c '2>&1 sudo id'"])?.decision, "deny");
     assert.equal(guardShell(["bash -c 'echo >/dev/null sudo'"])?.decision, "ask");
     assert.equal(guardShell(["bash -c 'echo 2>/dev/null sudo id'"])?.decision, "ask");
+  });
+
+  it("parses each wrapper's options before resolving the executable", () => {
+    for (const command of ["stdbuf -o L sudo id", "stdbuf -oL sudo id", "stdbuf --output=L sudo id",
+      "stdbuf --output L sudo id", "stdbuf --out L sudo id", "stdbuf --o=L sudo id",
+      "ionice -c 3 sudo id", "ionice -c3 sudo id", "ionice --class=3 sudo id", "ionice -n 7 sudo id",
+      "nice -n 5 sudo id", "nice -5 sudo id", "nice --adjustment=5 sudo id", "timeout -s KILL 5 sudo id",
+      "timeout --kill-after=1 5 sudo id", "timeout 5 sudo id", "env -u HOME sudo id", "env --unset=HOME sudo id",
+      "env -C /tmp sudo id", "time -f %E sudo id", "setsid -f sudo id", "exec -a name sudo id",
+      "sh -c 'stdbuf -o L sudo id'"])
+      assert.equal(guardShell([command])?.decision, "deny", command);
+    for (const command of ["stdbuf -o0 pwd", "ionice -c3 pwd", "nice -n 5 pwd", "timeout -s KILL 5 pwd",
+      "env -u HOME pwd", "time -p pwd", "setsid -w pwd", "nice -5 pwd"])
+      assert.equal(guardShell([command]), undefined, command);
+    // An unknown wrapper option could consume the executable, so a human decides.
+    for (const command of ["stdbuf --unknown sudo id", "env -Q sudo id"])
+      assert.equal(guardShell([command])?.decision, "ask", command);
+  });
+
+  it("drops only descriptor prefixes that are adjacent in the source", () => {
+    assert.equal(stripDescriptorPrefixes("chmod 777 > /dev/null secret"), "chmod 777 > /dev/null secret");
+    assert.equal(stripDescriptorPrefixes("echo 2>/dev/null"), "echo >/dev/null");
+    assert.equal(stripDescriptorPrefixes("echo 12>&1"), "echo >&1");
+    assert.equal(stripDescriptorPrefixes("pwd;2>/dev/null"), "pwd;>/dev/null");
+    assert.equal(stripDescriptorPrefixes("echo 2 >/dev/null"), "echo 2 >/dev/null");
+    assert.equal(stripDescriptorPrefixes('echo "2">/dev/null'), 'echo "2">/dev/null');
+    assert.equal(stripDescriptorPrefixes("echo $'2>file'"), "echo $'2>file'");
+    assert.equal(stripDescriptorPrefixes("echo $'it\\'s 2>file'"), "echo $'it\\'s 2>file'");
+    assert.equal(stripDescriptorPrefixes("echo \\2>/dev/null"), "echo \\2>/dev/null");
+    assert.equal(stripDescriptorPrefixes("echo x2>/dev/null"), "echo x2>/dev/null");
+    assert.equal(stripDescriptorPrefixes("echo a=2>/dev/null"), "echo a=2>/dev/null");
+    for (const command of ["chmod 777 > /dev/null secret", "sh -c 'chmod 777 > /dev/null secret'",
+      "eval 'chmod 777 > /dev/null secret'", "chmod 777 >> log secret", "chmod 0777 2>/dev/null secret",
+      "chmod 777 < /dev/null secret", "bash -c 'chmod 777 2>/dev/null secret'"])
+      assert.equal(guardShell([command])?.decision, "deny", command);
+    // A quoted or escaped digit is an argument, not a changed file descriptor.
+    for (const command of ['chmod 600 "2">/dev/null secret', "chmod 600 \\2>/dev/null secret"])
+      assert.notEqual(guardShell([command])?.decision, "deny", command);
   });
 
   it("denies identifiable commands before asking about dynamic arguments", () => {

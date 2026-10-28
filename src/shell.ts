@@ -1,8 +1,7 @@
-import { parse } from "shell-quote";
 import type { ReviewResult } from "./reviewer.js";
 import {
   CONTROL_OPERATORS, DYNAMIC, REDIRECT_OPERATORS, SCRIPT_HOSTS, SHELLS, STATEFUL,
-  denyInvocation, isReadOnlyInvocation, resolveExecutable,
+  denyInvocation, isReadOnlyInvocation, parseShell, resolveExecutable,
 } from "./shell-policy.js";
 
 const MAX_COMMAND_CHARS = 4096;
@@ -16,7 +15,7 @@ export function shellWords(command: string): string[] | undefined {
   if (!command || command.length > MAX_COMMAND_CHARS || /[$`~\r\n\0{}[\]]/.test(command) ||
       /[^\S \t]/.test(command) || !BALANCED_QUOTES.test(command)) return undefined;
   try {
-    const words = parse(command);
+    const words = parseShell(command);
     return words.length && words.every((word) => typeof word === "string") ? words as string[] : undefined;
   } catch { return undefined; }
 }
@@ -137,7 +136,8 @@ function lineSegments(tokens: readonly Token[]): ParsedLine {
       continue;
     }
     if (REDIRECT_OPERATORS.has(token.op)) {
-      if (current.words.length && /^\d+$/.test(current.words[current.words.length - 1])) current.words.pop();
+      // Descriptor prefixes (`2>` in `2>/dev/null`) are stripped from the source
+      // before parsing, so a numeric word here is an operand and must survive.
       redirect = { write: WRITE_OPERATORS.has(token.op) };
       continue;
     }
@@ -152,7 +152,7 @@ function analyzeLine(command: string): Verdict {
   if (FORK_BOMB.test(command)) return { decision: "deny", reason: "dangerous shell operation" };
 
   let tokens;
-  try { tokens = parse(command); }
+  try { tokens = parseShell(command); }
   catch { return { decision: "ask" }; }
 
   const { segments, complete } = lineSegments(tokens);
@@ -210,7 +210,7 @@ function analyzeHeredoc(command: string): Verdict {
     if (!body.quoted && DYNAMIC_SYNTAX.test(body.lines.join("\n"))) return { decision: "ask" };
   }
   try {
-    const words = parse(firstLine).filter((token): token is string => typeof token === "string");
+    const words = parseShell(firstLine).filter((token): token is string => typeof token === "string");
     const executable = resolveExecutable(words);
     if (executable === undefined || SHELLS.has(executable.name) || SCRIPT_HOSTS.has(executable.name) ||
         DYNAMIC.has(executable.name) || STATEFUL.has(executable.name)) return { decision: "ask" };

@@ -1,5 +1,5 @@
 import { basename, posix } from "node:path";
-import { parse } from "shell-quote";
+import { parse, type ParseEntry } from "shell-quote";
 
 /**
  * Command vocabulary and per-command safety policy for shell approval.
@@ -14,14 +14,63 @@ export const SCRIPT_HOSTS = new Set(["python", "python3", "node", "perl", "ruby"
 export const STATEFUL = new Set(["alias", "unalias", "export", "unset", "set", "shopt", "trap", "umask",
   "readonly", "declare", "typeset", "local", "function"]);
 export const DYNAMIC = new Set(["eval", "source", ".", "exec", "xargs"]);
-export const WRAPPERS = new Set(["env", "command", "builtin", "exec", "time", "!", "nohup", "setsid", "nice",
-  "ionice", "stdbuf", "timeout"]);
 export const ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/;
 export const CONTROL_OPERATORS = new Set([";", "&&", "||", "|", "|&", "&"]);
 export const REDIRECT_OPERATORS = new Set([">", ">>", ">&", "<&", "<", "<<", "<<-", "<<<", "<>", ">|", "&>", "&>>"]);
 
-const VALUE_OPTIONS = new Set(["-u", "--unset", "-C", "--chdir", "-S", "--split-string", "-a", "--argv0",
-  "-n", "--adjustment", "-s", "--signal", "-k", "--kill-after"]);
+type OptionArity = "flag" | "value";
+
+interface WrapperGrammar {
+  short: Readonly<Record<string, OptionArity>>;
+  long: Readonly<Record<string, OptionArity>>;
+  /** A bare `-N` adjustment (`nice -5 cmd`) is an option rather than a command word. */
+  numeric?: boolean;
+}
+
+/** Parses a short-option spec; a letter followed by `:` takes a value. */
+function shortOptions(spec: string): Record<string, OptionArity> {
+  const options: Record<string, OptionArity> = {};
+  for (let index = 0; index < spec.length; index++) {
+    if (spec[index] === ":") continue;
+    options[spec[index]] = spec[index + 1] === ":" ? "value" : "flag";
+  }
+  return options;
+}
+
+/** Parses a whitespace-separated long-option spec; a trailing `:` takes a value. */
+function longOptions(spec: string): Record<string, OptionArity> {
+  const options: Record<string, OptionArity> = {};
+  for (const option of spec.split(/\s+/).filter(Boolean)) {
+    const takesValue = option.endsWith(":");
+    options[takesValue ? option.slice(0, -1) : option] = takesValue ? "value" : "flag";
+  }
+  return options;
+}
+
+/**
+ * Option grammar for every command wrapper. Options that take a value consume
+ * the following word, so `stdbuf -o L sudo id` and `ionice -c 3 sudo id` resolve
+ * to `sudo` rather than to the option value.
+ */
+const WRAPPER_GRAMMARS: Record<string, WrapperGrammar> = {
+  env: { short: shortOptions("u:S:C:i0v"), long: longOptions(
+    "--unset: --chdir: --split-string: --ignore-environment --null --debug --block-signal --default-signal --ignore-signal") },
+  command: { short: shortOptions("pvV"), long: longOptions("") },
+  builtin: { short: shortOptions(""), long: longOptions("") },
+  exec: { short: shortOptions("a:cl"), long: longOptions("") },
+  time: { short: shortOptions("f:o:pavql"), long: longOptions("--format: --output: --verbose --quiet --portability --append") },
+  "!": { short: shortOptions(""), long: longOptions("") },
+  nohup: { short: shortOptions(""), long: longOptions("--help --version") },
+  setsid: { short: shortOptions("fwc"), long: longOptions("--fork --wait --ctty --help --version") },
+  nice: { short: shortOptions("n:"), long: longOptions("--adjustment: --help --version"), numeric: true },
+  ionice: { short: shortOptions("c:n:p:P:u:t"), long: longOptions(
+    "--class: --classdata: --pid: --pgid: --uid: --ignore --help --version") },
+  stdbuf: { short: shortOptions("i:o:e:"), long: longOptions("--input: --output: --error: --help --version") },
+  timeout: { short: shortOptions("s:k:"), long: longOptions(
+    "--signal: --kill-after: --foreground --preserve-status --verbose --help --version") },
+};
+
+export const WRAPPERS = new Set(Object.keys(WRAPPER_GRAMMARS));
 
 const DANGEROUS = "dangerous shell operation";
 const FORK_BOMB = /:\s*\(\s*\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:/;
@@ -29,33 +78,73 @@ const MAX_NESTING = 2;
 
 const DENY_EXECUTABLES = new Set(["sudo", "doas", "su", "shutdown", "reboot", "halt", "poweroff"]);
 
+/**
+ * The arity of a long option, accepting the unambiguous abbreviations GNU
+ * option parsing allows (`stdbuf --out=L` means `--output`). An abbreviation
+ * that could name options of different arity is unknowable.
+ */
+function longOptionArity(grammar: WrapperGrammar, option: string): OptionArity | undefined {
+  if (Object.hasOwn(grammar.long, option)) return grammar.long[option];
+  const arities = new Set(Object.keys(grammar.long)
+    .filter((name) => name.startsWith(option))
+    .map((name) => grammar.long[name]));
+  return arities.size === 1 ? [...arities][0] : undefined;
+}
+
+/**
+ * Index of the first word after a wrapper's options, or undefined when an
+ * unknown option makes its arity — and therefore the effective executable —
+ * unknowable. Unknown options fail closed to manual approval.
+ */
+function wrapperCommand(grammar: WrapperGrammar, words: readonly string[], start: number): number | undefined {
+  let index = start;
+  while (index < words.length) {
+    const word = words[index];
+    if (word === "--") return index + 1;
+    if (word.startsWith("--")) {
+      const separator = word.indexOf("=");
+      const arity = longOptionArity(grammar, separator === -1 ? word : word.slice(0, separator));
+      if (arity === undefined) return undefined;
+      index += arity === "value" && separator === -1 ? 2 : 1;
+      continue;
+    }
+    if (word.startsWith("-") && word.length > 1) {
+      const letters = word.slice(1);
+      if (grammar.numeric && /^\d+$/.test(letters)) { index++; continue; }
+      let separateValue = false;
+      for (let position = 0; position < letters.length; position++) {
+        const arity = grammar.short[letters[position]];
+        if (arity === undefined) return undefined;
+        if (arity === "flag") continue;
+        // Any remaining letters are the attached value (`-n5`).
+        separateValue = position === letters.length - 1;
+        break;
+      }
+      index += separateValue ? 2 : 1;
+      continue;
+    }
+    return index;
+  }
+  return index;
+}
+
 /** Resolves leading assignments and wrapper options to the effective executable. */
 export function resolveExecutable(words: readonly string[]): { name: string; index: number } | undefined {
   let index = 0;
   while (index < words.length && ASSIGNMENT.test(words[index])) index++;
   while (index < words.length) {
     const name = basename(words[index]);
-    if (!WRAPPERS.has(name)) break;
-    index++;
+    const grammar = WRAPPERS.has(name) ? WRAPPER_GRAMMARS[name] : undefined;
+    if (grammar === undefined) break;
+    const command = wrapperCommand(grammar, words, index + 1);
+    if (command === undefined) return undefined;
+    index = command;
+    // `timeout DURATION COMMAND` consumes the duration before the command.
     if (name === "timeout") {
-      while (index < words.length && words[index].startsWith("-") && words[index] !== "-") {
-        const option = words[index].split("=", 1)[0];
-        index += VALUE_OPTIONS.has(option) && !words[index].includes("=") ? 2 : 1;
-      }
-      if (index < words.length) index++;
-      continue;
+      if (index >= words.length) return undefined;
+      index++;
     }
-    while (index < words.length) {
-      const word = words[index];
-      if (word === "--") { index++; break; }
-      if (word.startsWith("-") && word !== "-") {
-        const option = word.split("=", 1)[0];
-        index += VALUE_OPTIONS.has(option) && !word.includes("=") ? 2 : 1;
-        continue;
-      }
-      if (ASSIGNMENT.test(word)) { index++; continue; }
-      break;
-    }
+    while (index < words.length && ASSIGNMENT.test(words[index])) index++;
   }
   return index < words.length ? { name: basename(words[index]), index } : undefined;
 }
@@ -108,26 +197,26 @@ function isFilesystemRoot(target: string): boolean {
   return trimmed === "" || posix.normalize(trimmed) === "/";
 }
 
-/** True when `rm` is invoked recursively and forcibly against the filesystem root. */
-function isRootWipe(args: readonly string[]): boolean {
+/**
+ * True when `rm` removes the filesystem root recursively. Force is irrelevant:
+ * a writable root is already destroyed by `rm -r / --no-preserve-root`.
+ */
+function isRecursiveRootRemoval(args: readonly string[]): boolean {
   let recursive = false;
-  let force = false;
   const targets: string[] = [];
   for (const arg of args) {
     if (arg === "--") continue;
     if (arg.startsWith("--")) {
       if (arg === "--recursive") recursive = true;
-      if (arg === "--force") force = true;
       continue;
     }
     if (arg.startsWith("-") && arg.length > 1) {
       if (arg.includes("r") || arg.includes("R")) recursive = true;
-      if (arg.includes("f")) force = true;
       continue;
     }
     targets.push(arg);
   }
-  if (!recursive || !force || targets.length === 0) return false;
+  if (!recursive || targets.length === 0) return false;
   return targets.some(isFilesystemRoot);
 }
 
@@ -143,10 +232,82 @@ function scriptArgument(name: string, args: readonly string[]): string | undefin
   return undefined;
 }
 
+/**
+ * Removes file-descriptor prefixes (`2` in `2>/dev/null`) that are adjacent to
+ * the redirection operator in the source.
+ *
+ * Only an unquoted, unescaped digit run that starts a word is a descriptor. A
+ * numeric operand separated by whitespace (`chmod 777 > /dev/null secret`) is
+ * preserved, as is a quoted (`"2">file`) or escaped (`\2>file`) digit argument.
+ */
+export function stripDescriptorPrefixes(command: string): string {
+  let result = "";
+  let boundary = true;
+  let index = 0;
+  while (index < command.length) {
+    const character = command[index];
+    if (character === "\\") {
+      result += command.slice(index, index + 2);
+      boundary = false;
+      index += 2;
+      continue;
+    }
+    if (character === "'") {
+      const end = command.indexOf("'", index + 1);
+      const stop = end === -1 ? command.length : end + 1;
+      result += command.slice(index, stop);
+      boundary = false;
+      index = stop;
+      continue;
+    }
+    // ANSI-C quoting (`$'...'`) is the one quoted form where a backslash escapes
+    // the closing quote, so its body needs the same escape handling as `"..."`.
+    if (character === "$" && command[index + 1] === "'") {
+      let cursor = index + 2;
+      while (cursor < command.length && command[cursor] !== "'") cursor += command[cursor] === "\\" ? 2 : 1;
+      const stop = Math.min(cursor + 1, command.length);
+      result += command.slice(index, stop);
+      boundary = false;
+      index = stop;
+      continue;
+    }
+    if (character === '"') {
+      let cursor = index + 1;
+      while (cursor < command.length && command[cursor] !== '"') cursor += command[cursor] === "\\" ? 2 : 1;
+      const stop = Math.min(cursor + 1, command.length);
+      result += command.slice(index, stop);
+      boundary = false;
+      index = stop;
+      continue;
+    }
+    if (boundary && /\d/.test(character)) {
+      let cursor = index;
+      while (cursor < command.length && /\d/.test(command[cursor])) cursor++;
+      if (command[cursor] === ">" || command[cursor] === "<") {
+        index = cursor;
+        continue;
+      }
+      result += command.slice(index, cursor);
+      boundary = false;
+      index = cursor;
+      continue;
+    }
+    result += character;
+    boundary = /[\s;|&()<>]/.test(character);
+    index++;
+  }
+  return result;
+}
+
+/** Parses a command without descriptor prefixes, so numeric operands survive. */
+export function parseShell(command: string): ParseEntry[] {
+  return parse(stripDescriptorPrefixes(command));
+}
+
 /** Splits a script into simple commands, dropping redirection targets. */
 function invocations(command: string): string[][] {
   let tokens;
-  try { tokens = parse(command); } catch { return []; }
+  try { tokens = parseShell(command); } catch { return []; }
   const result: string[][] = [];
   let words: string[] = [];
   let skipNext = false;
@@ -170,11 +331,8 @@ function invocations(command: string): string[][] {
         continue;
       }
       // A redirection does not end a simple command; only its target is dropped.
-      if (REDIRECT_OPERATORS.has(token.op)) {
-        // A word directly before the operator is a file descriptor (`2>/dev/null`).
-        if (words.length && /^\d+$/.test(words[words.length - 1])) words.pop();
-        skipNext = true;
-      }
+      // Descriptor prefixes were already removed from the source before parsing.
+      if (REDIRECT_OPERATORS.has(token.op)) skipNext = true;
     }
   }
   if (words.length) result.push(words);
@@ -202,7 +360,7 @@ export function denyInvocation(words: readonly string[], depth = 0): string | un
   if (executable.name.startsWith("mkfs")) return DANGEROUS;
   if (DENY_EXECUTABLES.has(executable.name)) return DANGEROUS;
   if (executable.name === "chmod" && isWorldWritableMode(chmodMode(args) ?? "")) return DANGEROUS;
-  if (executable.name === "rm" && isRootWipe(args)) return DANGEROUS;
+  if (executable.name === "rm" && isRecursiveRootRemoval(args)) return DANGEROUS;
   if (executable.name === "dd" && args.some((arg) => /^of=\/(?:dev|sd|nvme|hd)/.test(arg))) return DANGEROUS;
   if (SHELLS.has(executable.name) || executable.name === "eval") {
     const script = scriptArgument(executable.name, args);
@@ -309,7 +467,7 @@ const POLICIES: Record<string, (args: readonly string[]) => boolean> = {
     !hasShortOption(args, "oT"),
   tree: (args) => !hasLongOption(args, ["--output"]) && !hasShortOption(args, "o"),
   file: (args) => !hasLongOption(args, ["--compile"]) && !hasShortOption(args, "C"),
-  bat: (args) => !hasLongOption(args, ["--pager", "--config-file", "--config-dir"]),
+  bat: (args) => !hasLongOption(args, ["--pager", "--config-file", "--config-dir", "--generate-config-file"]),
   // `uniq INPUT OUTPUT` writes OUTPUT; only a single operand is read-only.
   uniq: isReadOnlyUniq,
   // A bare argument sets the host name.
