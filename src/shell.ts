@@ -2,7 +2,7 @@ import type { ReviewResult } from "./reviewer.js";
 import {
   CONTROL_OPERATORS, DYNAMIC, REDIRECT_OPERATORS, SCRIPT_HOSTS, SHELLS, STATEFUL,
   denyInvocation, hasAmbiguousDescriptorClose, hasAmbiguousHeredoc, hasHeredoc, hasNonShellWhitespace,
-  heredocMarkers, isReadOnlyInvocation, normalizeContinuations, parseShell, resolveExecutable,
+  heredocMarkers, isReadOnlyInvocation, logicalLines, normalizeContinuations, parseShell, resolveExecutable,
   stripDescriptorPrefixes,
 } from "./shell-policy.js";
 
@@ -38,9 +38,13 @@ function analyzeSegment(segment: Segment): Verdict {
   if (!segment.words.length) return segment.write ? { decision: "review" } : { decision: "allow" };
   const command = segment.words[0];
   if (!command || command.includes("$")) return { decision: "ask" };
+  // A deny that is already identifiable wins over every uncertainty below, so
+  // `sudo id *.txt` stays a mandatory deny instead of becoming a review.
   const blocked = denyInvocation(segment.words);
   if (blocked !== undefined) return { decision: "deny", reason: blocked };
   if (dynamicExecution(segment.words)) return { decision: "ask" };
+  // `isReadOnlyInvocation` refuses any argument an unquoted expansion could turn
+  // into several words, so the literal flag policies only judge what will run.
   if (!segment.write && isReadOnlyInvocation(segment.words, segment.globs)) return { decision: "allow" };
   return { decision: "review" };
 }
@@ -213,74 +217,15 @@ function analyzeLine(command: string): Verdict {
   return { decision: review ? "review" : "allow" };
 }
 
-/**
- * Splits a normalized script into logical lines. Newlines inside quotes are part
- * of the current word rather than command separators, so a deny rule still sees
- * the complete invocation (`sudo echo 'first\nsecond'`) before a line can fall
- * back to manual approval. `analyze` removes `\`-newline continuations first, so
- * the remaining newlines are the ones the shell treats as separators; the
- * backslash branch here only keeps an escaped character attached to its word.
- */
-function logicalLines(command: string): string[] {
-  const lines: string[] = [];
-  let start = 0;
-  let wordStart = true;
-  let quote: "'" | '"' | "$'" | undefined;
-  for (let index = 0; index < command.length; index++) {
-    const character = command[index];
-    if (quote === "'") {
-      if (character === "'") quote = undefined;
-      continue;
-    }
-    if (quote === "$'") {
-      if (character === "\\") index++;
-      else if (character === "'") quote = undefined;
-      continue;
-    }
-    if (quote === '"') {
-      if (character === "\\") index++;
-      else if (character === '"') quote = undefined;
-      continue;
-    }
-    if (character === "\\") {
-      if (index + 1 < command.length) {
-        if (command[++index] !== "\n") wordStart = false;
-      } else wordStart = false;
-      continue;
-    }
-    if (character === "'" || character === '"' || (character === "$" && command[index + 1] === "'")) {
-      wordStart = false;
-      if (character === "'" || character === '"') quote = character;
-      else { quote = "$'"; index++; }
-      continue;
-    }
-    if (character === "#" && wordStart) {
-      // A comment runs to the end of the physical line; quotes inside it are text.
-      const end = command.indexOf("\n", index);
-      if (end === -1) break;
-      lines.push(command.slice(start, end));
-      start = end + 1;
-      index = end;
-      wordStart = true;
-      continue;
-    }
-    if (character === "\n") {
-      lines.push(command.slice(start, index));
-      start = index + 1;
-      wordStart = true;
-      continue;
-    }
-    wordStart = WORD_DELIMITER.test(character);
-  }
-  lines.push(command.slice(start));
-  return lines;
-}
-
 /** Analyzes every logical line, keeping deny precedence over ask and review. */
 function analyzeLines(command: string): Verdict {
   let ask = false;
   let review = false;
-  for (const line of logicalLines(command)) {
+  const { lines, unsupported } = logicalLines(command);
+  // An undecodable heredoc header leaves the code/data split unknown, so nothing
+  // in this script may be auto-approved.
+  if (unsupported) ask = true;
+  for (const line of lines) {
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith("#")) continue;
     const verdict = analyzeLine(trimmed);
@@ -312,12 +257,19 @@ function analyzeHeredoc(command: string): Verdict {
     bodies.push({ lines: body, quoted: marker.quoted });
   }
 
-  // Analyze the command line and anything after the heredoc bodies as one
-  // script, so a quoted newline cannot split a blocked invocation in two.
-  const script = analyzeLines([firstLine, ...lines.slice(index)].join("\n"));
-  if (script.decision === "deny") return script;
-  let ask = script.decision === "ask";
-  const review = script.decision === "review";
+  // The header line and the lines after the bodies are script; everything between
+  // is data. The header is analyzed on its own because its markers have already
+  // been consumed above — handing them back to the heredoc scanner would swallow
+  // the tail as a second body. The tail is analyzed as its own script so a further
+  // heredoc there is routed the same way, and a blocked command spanning a quoted
+  // newline is still seen whole.
+  const header = analyzeLine(firstLine);
+  if (header.decision === "deny") return header;
+  const tail = lines.slice(index).join("\n");
+  const rest: Verdict = tail ? analyze(tail) : { decision: "allow" };
+  if (rest.decision === "deny") return rest;
+  let ask = header.decision === "ask" || rest.decision === "ask";
+  const review = header.decision === "review" || rest.decision === "review";
   for (const body of bodies) {
     const text = body.lines.join("\n");
     // A quoted body is data and its header was unambiguous, so a continuation

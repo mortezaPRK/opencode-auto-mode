@@ -216,18 +216,25 @@ function isFilesystemRoot(target: string): boolean {
 /**
  * True when `rm` removes the filesystem root recursively. Force is irrelevant:
  * a writable root is already destroyed by `rm -r / --no-preserve-root`.
+ *
+ * `--` ends option parsing, so every later argument is a target: `rm -- -r /`
+ * asks `rm` to remove the files `-r` and `/` without recursion, which fails on
+ * the root instead of deleting it, while `rm -r -- /` still denies.
  */
 function isRecursiveRootRemoval(args: readonly string[]): boolean {
   let recursive = false;
+  let endOfOptions = false;
   const targets: string[] = [];
   for (const arg of args) {
-    if (arg === "--") continue;
+    if (endOfOptions) { targets.push(arg); continue; }
+    if (arg === "--") { endOfOptions = true; continue; }
     if (arg.startsWith("--")) {
       if (arg === "--recursive") recursive = true;
       continue;
     }
     if (arg.startsWith("-") && arg.length > 1) {
-      if (arg.includes("r") || arg.includes("R")) recursive = true;
+      const letters = arg.slice(1);
+      if (letters.includes("r") || letters.includes("R")) recursive = true;
       continue;
     }
     targets.push(arg);
@@ -692,6 +699,105 @@ export function normalizeContinuations(command: string): string {
   return result;
 }
 
+export interface LogicalScript {
+  /** One entry per logical command line, in source order; heredoc bodies are omitted. */
+  lines: string[];
+  /** True when a here-document header could not be decoded, so the code/data split is unknowable. */
+  unsupported: boolean;
+}
+
+/**
+ * Splits a script into the logical command lines a shell would run.
+ *
+ * The scan is quote-aware: a newline inside `'...'`, `"..."`, or `$'...'` is part
+ * of the word being built, so `sudo echo 'first`+newline+`second'` stays one
+ * invocation and a blocked command is visible as a whole instead of becoming two
+ * harmless-looking fragments. A `\`-newline keeps an escaped character attached
+ * to its word (callers normalize continuations first, so only the escaped form
+ * remains here), and a comment ends its own physical line without hiding the next.
+ *
+ * Here-document bodies are data, not commands: they are skipped, so the `sudo` in
+ * `cat <<'EOF'`+newline+`sudo id`+newline+`EOF` is plain text, while a command
+ * after the terminator is still analyzed. `unsupported` reports a header this
+ * scanner cannot decode, where the terminator — and therefore the boundary
+ * between script and data — is unknown, so callers must fail closed.
+ */
+export function logicalLines(command: string): LogicalScript {
+  const lines: string[] = [];
+  let unsupported = false;
+  let start = 0;
+  let wordStart = true;
+  let quote: "'" | '"' | "$'" | undefined;
+  let pending: HeredocMarker[] = [];
+  /** Ends the current line at `end` and jumps past the bodies of its markers. */
+  const endLine = (end: number) => {
+    lines.push(command.slice(start, end));
+    start = end + 1;
+    if (!pending.length) return;
+    start = heredocBodies(command, start, pending).end;
+    pending = [];
+  };
+  for (let index = 0; index < command.length; index++) {
+    const character = command[index];
+    if (quote === "'") {
+      if (character === "'") quote = undefined;
+      continue;
+    }
+    if (quote === "$'") {
+      if (character === "\\") index++;
+      else if (character === "'") quote = undefined;
+      continue;
+    }
+    if (quote === '"') {
+      if (character === "\\") index++;
+      else if (character === '"') quote = undefined;
+      continue;
+    }
+    if (character === "\\") {
+      if (index + 1 < command.length) {
+        if (command[++index] !== "\n") wordStart = false;
+      } else wordStart = false;
+      continue;
+    }
+    if (character === "'" || character === '"' || (character === "$" && command[index + 1] === "'")) {
+      wordStart = false;
+      if (character === "'" || character === '"') quote = character;
+      else { quote = "$'"; index++; }
+      continue;
+    }
+    if (character === "#" && wordStart) {
+      // A comment runs to the end of the physical line; quotes inside it are text.
+      const end = command.indexOf("\n", index);
+      if (end === -1) break;
+      endLine(end);
+      index = start - 1;
+      wordStart = true;
+      continue;
+    }
+    if (character === "<") {
+      const parsed = heredocMarkerAt(command, index);
+      if (parsed !== undefined) {
+        pending.push(parsed.marker);
+        wordStart = false;
+        index = parsed.end - 1;
+        continue;
+      }
+      if (command[index + 1] === "<" && command[index + 2] !== "<" && command[index - 1] !== "<")
+        unsupported = true;
+    }
+    if (character === "\n") {
+      endLine(index);
+      // Resume after the bodies, if this line opened any.
+      index = start - 1;
+      wordStart = true;
+      continue;
+    }
+    wordStart = WORD_BREAK.test(character);
+  }
+  lines.push(command.slice(start));
+  return { lines, unsupported };
+}
+
 /**
  * Parses the command a shell would run: continuations are removed, descriptor
  * prefixes and midword comment markers are stripped, and the remainder is handed
@@ -793,11 +899,31 @@ function invocations(command: string): string[][] {
   return result;
 }
 
+/**
+ * Deny reason for a nested script (`sh -c`, `eval`), or undefined when nothing in
+ * it is a dangerous operation.
+ *
+ * The script is projected onto the commands a shell would actually run, using the
+ * same quote-aware `logicalLines` split as a top-level script: newlines separate
+ * commands only outside quotes, so `sh -c 'pwd`+newline+`sudo id'` still shows the
+ * mandatory deny, while `sh -c 'echo "first`+newline+`second"'` stays one word.
+ * Here-document bodies are data and are never scanned as commands.
+ *
+ * A header this scanner cannot decode leaves the code/data split unknown, so the
+ * deny pass stands down: the caller has already failed closed to manual approval
+ * for the surrounding shell invocation, and guessing here could deny quoted data.
+ */
 function denyScript(command: string, depth: number): string | undefined {
   if (FORK_BOMB.test(command)) return DANGEROUS;
-  for (const words of invocations(command)) {
-    const reason = denyInvocation(words, depth);
-    if (reason !== undefined) return reason;
+  if (hasAmbiguousHeredoc(command)) return undefined;
+  const script = normalizeContinuations(command);
+  const { lines, unsupported } = logicalLines(script);
+  if (unsupported) return undefined;
+  for (const line of lines) {
+    for (const words of invocations(line)) {
+      const reason = denyInvocation(words, depth);
+      if (reason !== undefined) return reason;
+    }
   }
   return undefined;
 }
@@ -836,12 +962,11 @@ const UNIQ_LONG_VALUE_FLAGS = new Set(["--skip-fields", "--skip-chars", "--check
  * argument after an operand is therefore counted as an operand. Unknown leading
  * flags fail closed, while known flags keep `uniq -f 2 file` read-only.
  *
- * An unquoted glob can expand into more than one word, so `uniq *.txt` can
- * become `uniq a.txt b.txt` and overwrite the last match. Quoted glob characters
- * stay literal and one-operand invocations remain read-only.
+ * An unquoted expansion can turn one operand into several (`uniq *.txt` becomes
+ * `uniq a.txt b.txt` and overwrites the last match), which
+ * `isReadOnlyInvocation` already refuses before any policy runs.
  */
-function isReadOnlyUniq(args: readonly string[], globs: readonly boolean[]): boolean {
-  if (globs.some(Boolean)) return false;
+function isReadOnlyUniq(args: readonly string[]): boolean {
   let operands = 0;
   let endOfOptions = false;
   for (let index = 0; index < args.length; index++) {
@@ -918,7 +1043,7 @@ function isReadOnlyDate(args: readonly string[]): boolean {
   return true;
 }
 
-const POLICIES: Record<string, (args: readonly string[], globs: readonly boolean[]) => boolean> = {
+const POLICIES: Record<string, (args: readonly string[]) => boolean> = {
   // Flags that read a program from a file, run a command, or write output.
   rg: (args) => !hasLongOption(args, ["--pre", "--pre-glob", "--hostname-bin", "--search-zip"]) &&
     !hasShortOption(args, "z"),
@@ -983,15 +1108,22 @@ function isReadOnlyGh(args: readonly string[]): boolean {
 /**
  * True only when one parsed simple command is read-only. Callers pass an
  * already-split segment, so chaining, redirection and wrappers are handled
- * before this point. `globs` marks words that came from an unquoted glob token,
- * which can expand into several arguments at execution time.
+ * before this point.
+ *
+ * `globs` marks words that came from an unquoted expansion (`*`, `?`, `[ab]`,
+ * `{a,b}`, `$name`), which Bash can turn into several arguments. A literal flag
+ * policy cannot see what those arguments will be: `sort --out{put,put}=out file`
+ * becomes two `--output=out` options and writes a file, and `uniq *.txt` can
+ * become `uniq a.txt b.txt`. An invocation with an uncertain word is therefore
+ * never read-only. Quoted expansions stay one literal word and are judged as
+ * written, so `uniq '*.txt'` remains a single operand.
  */
 export function isReadOnlyInvocation(words: readonly string[], globs: readonly boolean[] = []): boolean {
+  if (globs.some(Boolean)) return false;
   const command = basename(words[0] ?? "");
   const args = words.slice(1);
-  const argGlobs = globs.slice(1);
   // Own properties only: `./constructor` must not resolve to `Object`.
-  if (Object.hasOwn(POLICIES, command)) return POLICIES[command](args, argGlobs);
+  if (Object.hasOwn(POLICIES, command)) return POLICIES[command](args);
   if (READ_ONLY.has(command)) return true;
   if (command === "git") return isReadOnlyGit(args);
   if (command === "find") return !args.some((arg) => /^-(?:fprint|fprint0|fprintf|fls)$/.test(arg));

@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { compositeDecision } from "./classifier.js";
-import { escapeLiteralHashes, hasAmbiguousDescriptorClose, normalizeContinuations, parseShell, stripDescriptorPrefixes } from "./shell-policy.js";
+import { escapeLiteralHashes, hasAmbiguousDescriptorClose, logicalLines, normalizeContinuations, parseShell, stripDescriptorPrefixes } from "./shell-policy.js";
 import { guardShell, shellWords } from "./shell.js";
 
 const unused = async () => { throw new Error("unexpected reviewer call"); };
@@ -626,5 +626,121 @@ describe("shell policy edge cases", () => {
       "bat --lessopen file", "hostname -", "hostname -- -review-host", "hostname -b review-host",
       "sudo echo 'first\nsecond'"])
       assert.notEqual(guardShell([command])?.decision, "allow", command);
+  });
+
+  it("splits nested scripts into the commands their shell runs", () => {
+    // `shell-quote` reads a newline as plain whitespace, so a nested script has to
+    // be split into logical commands before the deny pass: otherwise the second
+    // line becomes an argument of the first command and the deny is missed.
+    for (const command of ["sh -c 'pwd\nsudo id'", "bash -c 'pwd\nrm -rf /'", "eval 'pwd\nsudo id'",
+      "sh -c 'pwd\nls\nsudo id'", "sh -lc 'echo first\nsudo id'", "bash -c 'pwd\nrm -r -- /'",
+      "sh -c 'pwd # comment\nsudo id'", "sh -c 'echo one; pwd\nchmod 777 secret'",
+      "sh -c 'echo \"first\nsecond\" ; sudo id'", "bash -c 'for x in a\nrm -rf /'"])
+      assert.equal(guardShell([command])?.decision, "deny", command);
+    // A quoted newline is part of one word, so the invocation stays whole instead
+    // of splitting into a fragment that no longer names `sudo`.
+    assert.equal(guardShell(["sh -c 'sudo echo \"first\nsecond\"'"])?.decision, "deny");
+    assert.equal(guardShell(["sh -c 'echo \"first\nsecond\"'"])?.decision, "ask");
+    // Nothing dangerous inside still asks: a nested shell needs manual approval.
+    for (const command of ["sh -c 'pwd\nls'", "bash -c 'echo \"first\nsecond\"'", "eval 'pwd\npwd'"])
+      assert.equal(guardShell([command])?.decision, "ask", command);
+    // The deny pass also reaches a dangerous resource behind a nested one.
+    assert.equal(guardShell(["sh -c 'pwd'", "sh -c 'sudo id'"])?.decision, "deny");
+    assert.equal(guardShell(["sh -c 'pwd'", "pwd"])?.decision, "ask");
+  });
+
+  it("excludes nested heredoc bodies from the deny pass", () => {
+    // The body of a heredoc is data for the inner shell, so a dangerous word or a
+    // `;` inside it is text, not a command. Only the surrounding script is judged.
+    for (const command of ["sh -c 'cat <<\"EOF\"\ntext; sudo id\nEOF'",
+      "sh -c 'cat <<\"EOF\"\nrm -rf /\nEOF'", "bash -c 'cat <<\"EOF\"\nchmod 777 secret\nEOF'",
+      "eval 'cat <<EOF\nsudo id\nEOF'", "sh -c 'cat <<- \"EOF\"\n\tsudo id\n\tEOF'",
+      "sh -c 'cat <<\"A\" <<\"B\"\nx\nA\nsudo id\nB'", "sh -c 'cat <<\\EOF\nx\nEOF\nsudo id\nEOF'",
+      "sh -c 'cat <<\"EOF\"\nx\nEOF\n'"]
+      ) assert.equal(guardShell([command])?.decision, "ask", command);
+    // A command after the terminator is script again, so the tail still denies.
+    for (const command of ["sh -c 'cat <<\"EOF\"\nx\nEOF\nsudo id'",
+      "eval 'cat <<EOF\nx\nEOF\nrm -rf /'", "bash -c 'cat <<-EOF\n\tx\n\tEOF\nshutdown now'",
+      "sh -c 'cat <<\"A\" <<\"B\"\nx\nA\ny\nB\nrm -r -- /'"])
+      assert.equal(guardShell([command])?.decision, "deny", command);
+    // The same shapes outside a nested shell keep their previous verdicts.
+    assert.equal(guardShell(["cat <<\"EOF\"\ntext; sudo id\nEOF"])?.decision, "allow");
+    assert.equal(guardShell(["cat <<\"EOF\"\nx\nEOF\nsudo id"])?.decision, "deny");
+  });
+
+  it("projects a script onto its commands with the shared logical-line scan", () => {
+    assert.deepEqual(logicalLines("cat <<'EOF'\nsudo id\nEOF\npwd"),
+      { lines: ["cat <<'EOF'", "pwd"], unsupported: false });
+    assert.deepEqual(logicalLines("cat <<-'EOF'\n\tsudo id\n\tEOF\nls"),
+      { lines: ["cat <<-'EOF'", "ls"], unsupported: false });
+    assert.deepEqual(logicalLines("echo a # comment ; sudo id\npwd").lines,
+      ["echo a # comment ; sudo id", "pwd"]);
+    assert.deepEqual(logicalLines("echo 'a\nb'\nsudo id").lines, ["echo 'a\nb'", "sudo id"]);
+    assert.deepEqual(logicalLines("echo a\\\nsudo id").lines, ["echo a\\\nsudo id"]);
+    assert.equal(logicalLines("cat <<E'OF'\nbody\nEOF\nsudo id").unsupported, true);
+    assert.equal(logicalLines("cat <<< 'x' ; sudo id").unsupported, false);
+    // Bodies are absent from the projection; only the header and tail are script.
+    assert.equal(logicalLines("cat <<'EOF'\ntext\nEOF\npwd").lines.some((line) => line.includes("text")), false);
+    assert.deepEqual(logicalLines("cat <<'EOF'\nsudo id\nEOF").lines, ["cat <<'EOF'", ""]);
+  });
+
+  it("requires review when an unquoted expansion can add arguments", () => {
+    // Bash expands one written word into several arguments, so a literal flag
+    // policy cannot see the flags that will actually run. `sort
+    // --out{put,put}=out` becomes two `--output=out` options and writes a file.
+    for (const command of ["sort --out{put,put}=out input", "sort --out{put,put}=out",
+      "sort --output{=x} file", "rg -{n,l} pattern file", "bat --pager{,=less} file",
+      "date +{a,b}", "tree -{L,o} 2", "file {--compile,-C} /tmp/magic", "hostname {a,b}",
+      "hostname --file={/tmp/name}", "cat {a,b}.txt", "ls *.txt", "rg pattern *.ts",
+      "wc -l [ab].txt", "printf %s [ab]"])
+      assert.equal(guardShell([command]), undefined, command);
+    // Quoted expansions stay one literal word, so the flag policies still apply
+    // to the text that will run and read-only invocations stay allowed.
+    for (const command of ["cat '{a,b}.txt'", "ls '*.txt'", "sort '-u' file", "uniq '*.txt'",
+      "rg 'a{1,2}' file", "date '+%s'", "bat --style=numbers README.md"])
+      assert.equal(guardShell([command])?.decision, "allow", command);
+    // An identifiable mandatory deny is decided before the expansion check.
+    for (const command of ["sudo id *.txt", "cat {a,b} ; sudo id", "rm -rf / {a,b}",
+      "chmod 777 {a,b}", "sort --out{put,put}=out in ; sudo id"])
+      assert.equal(guardShell([command])?.decision, "deny", command);
+    // A root hidden inside an expansion is not identifiable, so it is only review.
+    for (const command of ["rm -rf {/tmp/x,/}", "rm -rf /tmp/{x,/}"])
+      assert.equal(guardShell([command]), undefined, command);
+  });
+
+  it("ends rm option parsing at a literal double dash", () => {
+    // `--` ends option parsing, so `-r` there is a file name and the invocation is
+    // not recursive: it cannot remove the root and must reach review, not a deny.
+    for (const command of ["rm -- -r /", "rm -- -r -f /", "rm -f -- /", "rm -- -rf /",
+      "rm -- / -r", "rm -- --recursive /"])
+      assert.equal(guardShell([command]), undefined, command);
+    // Recursion written before `--` still applies to every later target.
+    for (const command of ["rm -r -- /", "rm -rf -- /", "rm --recursive -- /", "rm -R -- /*",
+      "rm -r -- / --no-preserve-root", "rm -fr --tmp -- /"])
+      assert.equal(guardShell([command])?.decision, "deny", command);
+    // The previous shapes keep their verdicts.
+    for (const command of ["rm -rf /", "rm -r /*", "rm --recursive /"])
+      assert.equal(guardShell([command])?.decision, "deny", command);
+    for (const command of ["rm -rf ./build", "rm -- ./build", "rm -f /tmp/file"])
+      assert.notEqual(guardShell([command])?.decision, "deny", command);
+  });
+
+  it("keeps the earlier gates ahead of the new verdicts", () => {
+    // Deny precedence, dynamic syntax, and parse failures are unchanged.
+    assert.equal(guardShell(["sudo echo 'first\nsecond'"])?.decision, "deny");
+    assert.equal(guardShell(["pwd $(sudo id)"])?.decision, "ask");
+    assert.equal(guardShell(["sh -c 'echo a\u00a0b'"])?.decision, "ask");
+    assert.equal(guardShell(["sh -c 'echo $[ 1 << 2 ]'"])?.decision, "ask");
+    assert.equal(guardShell(["sh -c \"echo $'a b'\""])?.decision, "ask");
+    // Nested continuations, hashes, and descriptor closes keep their gates.
+    assert.equal(guardShell(["bash -c 's\\\nudo id'"])?.decision, "deny");
+    assert.equal(guardShell(["sh -c 'echo a#b ; sudo id'"])?.decision, "deny");
+    assert.equal(guardShell(["sh -c 'true;2>&-sudo id'"])?.decision, "ask");
+    assert.equal(guardShell(["sh -c 'stdbuf -o L sudo id'"])?.decision, "deny");
+    // Read-only pipelines and permits that do not depend on flags stay allowed.
+    for (const command of ["rg TODO src && bun run typecheck", "git status --short", "ls -la src",
+      "docker logs otel-lgtm --since 10m 2>&1 | grep -iE 'trace|error'",
+      "gh label list --limit 100 2>&1", "find . -name '*.ts'", "uniq -c file", "hostname -s"])
+      assert.equal(guardShell([command])?.decision, "allow", command);
   });
 });
