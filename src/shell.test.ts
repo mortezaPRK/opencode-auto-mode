@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { compositeDecision } from "./classifier.js";
-import { escapeLiteralHashes, hasAmbiguousDescriptorClose, normalizeContinuations, stripDescriptorPrefixes } from "./shell-policy.js";
+import { escapeLiteralHashes, hasAmbiguousDescriptorClose, hasHeredocExpansion, normalizeContinuations, stripDescriptorPrefixes } from "./shell-policy.js";
 import { guardShell, shellWords } from "./shell.js";
 
 const unused = async () => { throw new Error("unexpected reviewer call"); };
@@ -139,6 +139,49 @@ describe("shell approval guard", () => {
       assert.equal(guardShell([command])?.decision, "allow", command);
     // `a\\`+newline leaves a real newline, so the next line is its own command.
     assert.equal(guardShell(["echo a\\\\\nb"]), undefined);
+  });
+  it("asks for unquoted heredoc bodies the shell would expand", () => {
+    // A plain body, then the same substitutions split by a continuation, under
+    // a plain, a continued, and a split heredoc header.
+    for (const command of ["cat <<EOF\n$(touch marker)\nEOF", "cat <<EOF\n`touch marker`\nEOF",
+      "cat <<EOF\n$\\\n(touch marker)\nEOF", "cat <<EOF\n`\\\ntouch marker`\nEOF",
+      "cat <<EOF\n<\\\n(touch marker)\nEOF", "cat <<EOF\n>\\\n(touch marker)\nEOF",
+      "cat \\\n<<EOF\n$\\\n(touch marker)\nEOF", "cat <<\\\nEOF\n$\\\n(touch marker)\nEOF",
+      "cat <<E\\\nOF\n$\\\n(touch marker)\nEOF",
+      // Quotes inside an unquoted body are data, so they do not suppress it.
+      "cat <<EOF\n'$\\\n(touch marker)'\nEOF", "cat <<EOF\n\"$\\\n(touch marker)\"\nEOF",
+      "cat <<EOF\n'$(touch marker)'\nEOF"])
+      assert.equal(guardShell([command])?.decision, "ask", command);
+    // A quoted body is data, a continued body keeps its line join, and an
+    // escaped dollar is not a substitution.
+    for (const command of ["cat <<'EOF'\n$\\\n(touch marker)\nEOF", "cat <<'EOF'\n$(touch marker)\nEOF",
+      'cat <<"EOF"\n`touch marker`\nEOF', "cat \\\n<<'EOF'\n$\\\n(touch marker)\nEOF",
+      "cat <<EOF\nhello \\\nworld\nEOF", "cat \\\n<<EOF\nhello\nEOF"])
+      assert.equal(guardShell([command])?.decision, "allow", command);
+    assert.equal(guardShell(["cat <<EOF\n\\$(touch marker)\nEOF"])?.decision, "ask");
+    // With several heredocs, only the unquoted bodies are expanded.
+    assert.equal(guardShell(["cat <<'A' <<B\nhello\nA\n$\\\n(touch marker)\nB"])?.decision, "ask");
+    assert.equal(guardShell(["cat <<'A' <<'B'\n$\\\n(touch marker)\nA\n`touch marker`\nB"])?.decision, "allow");
+    assert.equal(hasHeredocExpansion("$\\\n(touch marker)"), true);
+    assert.equal(hasHeredocExpansion("'$\\\n(touch marker)'"), true);
+    assert.equal(hasHeredocExpansion("`touch marker`"), true);
+    assert.equal(hasHeredocExpansion("\\$(touch marker)"), false);
+    assert.equal(hasHeredocExpansion("\\`touch marker\\`"), false);
+    assert.equal(hasHeredocExpansion("echo \\\nnext"), false);
+    assert.equal(hasHeredocExpansion("a\\\\\nb"), false);
+    // Differential: for one body, a continued header may never be more
+    // permissive than the plain header the guard already handled.
+    const rank: Record<string, number> = { allow: 0, review: 1, ask: 2, deny: 3 };
+    const bodies = ["$(touch marker)", "$\\\n(touch marker)", "'$\\\n(touch marker)'",
+      "`touch marker`", "hello \\\nworld", "\\$(touch marker)"];
+    for (const body of bodies) {
+      const plain = guardShell([`cat <<EOF\n${body}\nEOF`]);
+      const plainRank = rank[plain?.decision ?? "review"];
+      for (const header of ["cat \\\n<<EOF", "cat <<\\\nEOF", "cat <<E\\\nOF"]) {
+        const continued = guardShell([`${header}\n${body}\nEOF`]);
+        assert.ok(rank[continued?.decision ?? "review"] >= plainRank, `${header} ${body}`);
+      }
+    }
   });
   it("keeps a continued command exactly as dangerous as the command it joins", () => {
     const insert = (command: string, index: number) => `${command.slice(0, index)}\\\n${command.slice(index)}`;

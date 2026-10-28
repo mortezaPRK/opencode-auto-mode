@@ -457,6 +457,49 @@ function heredocBodies(command: string, start: number, markers: readonly Heredoc
 }
 
 /**
+ * The text an unquoted here-document body expands to.
+ *
+ * A body is not shell syntax, so the only escapes are `\` before `\`, `$`, a
+ * backtick, or a newline. An escaped newline is removed, while an escaped
+ * backslash leaves the newline that follows it in place.
+ */
+function heredocBodyText(body: string): string {
+  let text = "";
+  for (let index = 0; index < body.length; index++) {
+    const character = body[index];
+    if (character !== "\\") { text += character; continue; }
+    const next = body[index + 1];
+    if (next === undefined) { text += character; continue; }
+    if (next === "\n") { index++; continue; }
+    text += character + next;
+    index++;
+  }
+  return text;
+}
+
+/**
+ * True when an unquoted here-document body contains a substitution the guard
+ * must not approve automatically.
+ *
+ * A body is not shell syntax: `'` and `"` are data and give no quoting power,
+ * so a substitution written inside them still runs. Only `\` escapes the next
+ * character, and `\`+newline joins lines, so `$`+`\`+newline+`(` is the same
+ * `$(` a plain text scan cannot see. Process-substitution text stays
+ * conservative even where the shell leaves it literal. Quoted here-document
+ * bodies are data and are never scanned.
+ */
+export function hasHeredocExpansion(body: string): boolean {
+  const text = heredocBodyText(body);
+  for (let index = 0; index < text.length; index++) {
+    const character = text[index];
+    if (character === "\\") { index++; continue; }
+    if (character === "`") return true;
+    if ((character === "$" || character === "<" || character === ">") && text[index + 1] === "(") return true;
+  }
+  return false;
+}
+
+/**
  * Removes `\`-newline continuations so the command is validated and parsed as
  * the shell would run it.
  *

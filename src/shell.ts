@@ -1,8 +1,8 @@
 import type { ReviewResult } from "./reviewer.js";
 import {
   CONTROL_OPERATORS, DYNAMIC, REDIRECT_OPERATORS, SCRIPT_HOSTS, SHELLS, STATEFUL,
-  denyInvocation, hasAmbiguousDescriptorClose, heredocMarkers, isReadOnlyInvocation, normalizeContinuations,
-  parseShell, resolveExecutable, stripDescriptorPrefixes,
+  denyInvocation, hasAmbiguousDescriptorClose, hasHeredocExpansion, heredocMarkers, isReadOnlyInvocation,
+  normalizeContinuations, parseShell, resolveExecutable, stripDescriptorPrefixes,
 } from "./shell-policy.js";
 
 const MAX_COMMAND_CHARS = 4096;
@@ -337,8 +337,13 @@ function analyzeHeredoc(command: string): Verdict {
   let ask = script.decision === "ask";
   const review = script.decision === "review";
   for (const body of bodies) {
-    // Unquoted heredoc bodies undergo command and parameter expansion.
-    if (!body.quoted && DYNAMIC_SYNTAX.test(body.lines.join("\n"))) return { decision: "ask" };
+    // An unquoted body expands like a double-quoted string but is not shell
+    // syntax: quotes are data, and `\`+newline joins lines. Scan the
+    // expansion-normalized text so `$`+`\`+newline+`(` cannot hide a
+    // substitution the shell would run; the plain scan stays as a conservative
+    // catch for escaped forms. Quoted bodies are data and stay allowed.
+    const text = body.lines.join("\n");
+    if (!body.quoted && (DYNAMIC_SYNTAX.test(text) || hasHeredocExpansion(text))) return { decision: "ask" };
   }
   try {
     const words = parseShell(firstLine).filter((token): token is string => typeof token === "string");
