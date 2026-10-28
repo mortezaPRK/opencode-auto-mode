@@ -1,6 +1,6 @@
 {
   "name": "@mortz.prk/opencode-auto-mode",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Configurable automatic permission review for OpenCode v2.",
   "author": {
     "name": "Andrew Mellen",
