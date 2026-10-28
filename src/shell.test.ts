@@ -438,12 +438,16 @@ describe("shell policy edge cases", () => {
   it("reviews uniq operands that can glob-expand into the output argument", () => {
     for (const command of ["uniq *.txt", "uniq -c *.txt", "uniq -f *.txt", "uniq -- *.txt",
       "uniq in.txt *.txt", "uniq [ab].txt", "uniq {a,b}.txt", "uniq a'b'[c].txt",
-      "uniq 2>/dev/null [ab].txt", "uniq $HOME/x", "uniq \\*.txt", "uniq \\?.txt"])
+      "uniq 2>/dev/null [ab].txt", "uniq $HOME/x", "uniq \\*.txt", "uniq \\?.txt",
+      // A parameter in double quotes keeps one word only after expansion, and its
+      // value decides the operand: `uniq "$HOME/x"` can become `uniq x /y`.
+      'uniq "$HOME/x"', 'uniq "$@"', 'uniq "${X:--c}"'])
       assert.equal(guardShell([command]), undefined, command);
     // Quoted glob characters (and escaped brackets/braces) are literal operands, so one-operand calls stay read-only.
     for (const command of ["uniq '*.txt'", 'uniq "*.txt"', "uniq -c '*.txt'", "uniq -- '*.txt'",
       "uniq '[ab].txt'", "uniq '{a,b}.txt'", "uniq \\[ab\\].txt", "uniq 2>/dev/null '*.txt'",
-      'uniq "$HOME/x"'])
+      // Single quotes and an escaped `\$` are literal text, not a parameter.
+      "uniq '$.txt'", "uniq '\\$HOME/x'", 'uniq "\\$HOME/x"'])
       assert.equal(guardShell([command])?.decision, "allow", command);
   });
 
@@ -670,15 +674,22 @@ describe("shell policy edge cases", () => {
 
   it("projects a script onto its commands with the shared logical-line scan", () => {
     assert.deepEqual(logicalLines("cat <<'EOF'\nsudo id\nEOF\npwd"),
-      { lines: ["cat <<'EOF'", "pwd"], unsupported: false });
+      { lines: ["cat <<'EOF'", "pwd"], certain: 2 });
     assert.deepEqual(logicalLines("cat <<-'EOF'\n\tsudo id\n\tEOF\nls"),
-      { lines: ["cat <<-'EOF'", "ls"], unsupported: false });
+      { lines: ["cat <<-'EOF'", "ls"], certain: 2 });
     assert.deepEqual(logicalLines("echo a # comment ; sudo id\npwd").lines,
       ["echo a # comment ; sudo id", "pwd"]);
     assert.deepEqual(logicalLines("echo 'a\nb'\nsudo id").lines, ["echo 'a\nb'", "sudo id"]);
     assert.deepEqual(logicalLines("echo a\\\nsudo id").lines, ["echo a\\\nsudo id"]);
-    assert.equal(logicalLines("cat <<E'OF'\nbody\nEOF\nsudo id").unsupported, true);
-    assert.equal(logicalLines("cat <<< 'x' ; sudo id").unsupported, false);
+    // An undecodable header still leaves its own line script: `cat <<E'OF'; sudo id`
+    // runs `sudo id`, but nothing after that line is trusted.
+    assert.deepEqual(logicalLines("cat <<E'OF'\nbody\nEOF\nsudo id"),
+      { lines: ["cat <<E'OF'", "body", "EOF", "sudo id"], certain: 1 });
+    // An unquoted body line ending in a backslash removes its newline, so the
+    // terminator can match later: only the header is certain script.
+    assert.equal(logicalLines("cat <<EOF\nfoo\\\nEOF\nsudo id\nEOF").certain, 1);
+    assert.equal(logicalLines("cat <<'EOF'\nfoo\\\nEOF\nsudo id\nEOF").certain, 3);
+    assert.equal(logicalLines("cat <<< 'x' ; sudo id").certain, 1);
     // Bodies are absent from the projection; only the header and tail are script.
     assert.equal(logicalLines("cat <<'EOF'\ntext\nEOF\npwd").lines.some((line) => line.includes("text")), false);
     assert.deepEqual(logicalLines("cat <<'EOF'\nsudo id\nEOF").lines, ["cat <<'EOF'", ""]);
@@ -694,8 +705,9 @@ describe("shell policy edge cases", () => {
       "hostname --file={/tmp/name}", "cat {a,b}.txt", "ls *.txt", "rg pattern *.ts",
       "wc -l [ab].txt", "printf %s [ab]"])
       assert.equal(guardShell([command]), undefined, command);
-    // Quoted expansions stay one literal word, so the flag policies still apply
-    // to the text that will run and read-only invocations stay allowed.
+    // Quoted glob characters and braces are literal text, so the flag policies
+    // still apply to the words that will run and those calls stay allowed. (A
+    // quoted *parameter* is uncertain and covered below.)
     for (const command of ["cat '{a,b}.txt'", "ls '*.txt'", "sort '-u' file", "uniq '*.txt'",
       "rg 'a{1,2}' file", "date '+%s'", "bat --style=numbers README.md"])
       assert.equal(guardShell([command])?.decision, "allow", command);
@@ -723,6 +735,85 @@ describe("shell policy edge cases", () => {
       assert.equal(guardShell([command])?.decision, "deny", command);
     for (const command of ["rm -rf ./build", "rm -- ./build", "rm -f /tmp/file"])
       assert.notEqual(guardShell([command])?.decision, "deny", command);
+  });
+
+  it("treats a double-quoted parameter as an uncertain argument", () => {
+    // `shell-quote` drops a parameter it cannot resolve, so `sort "${X:--oout}"
+    // input` looked like `sort "" input` and was auto-approved, while Bash expands
+    // the default to `-oout` and writes a file. Any unescaped `$` inside double
+    // quotes is one uncertain word until it expands, `$@` included: it can become
+    // several arguments and change the operand count.
+    for (const command of ['sort "${X:--oout}" input', 'find . "${X:--delete}"',
+      'uniq "$@"', 'uniq "$HOME/x"', 'rg "${X:---pre=./p}" pattern .',
+      'bat "${X:---config-file=/tmp/x}" file', 'hostname "${X:--b}"',
+      'tree "${X:---output=/tmp/out}"', 'cat "$file"', 'git log --format="$x"',
+      'echo "${X:--n}"', 'rg -n "$pattern" src'])
+      assert.equal(guardShell([command]), undefined, command);
+    // Single quotes and an escaped `\$` are literal text, and quoted glob
+    // characters were already one word, so those keep their read-only verdicts.
+    for (const command of ["sort '$X' input", 'sort "\\$X" input', "uniq '\\$HOME/x'",
+      'uniq "\\$HOME/x"', "rg '\\$HOME' src", "cat '$HOME'", 'uniq "*.txt"'])
+      assert.equal(guardShell([command])?.decision, "allow", command);
+    // Raw dynamic syntax still asks, and an identifiable deny still wins.
+    for (const command of ['sort "$(echo x)" input', 'pwd "`echo x`"', 'cat "$((1 + 1))"'])
+      assert.equal(guardShell([command])?.decision, "ask", command);
+    for (const command of ['sudo sort "${X:--oout}" input', 'cat "$x" ; sudo id',
+      'find . "${X:--delete}" && sudo id'])
+      assert.equal(guardShell([command])?.decision, "deny", command);
+  });
+
+  it("fails closed when an unquoted heredoc body can move its terminator", () => {
+    // A shell removes a `\`-newline in an unquoted body before matching the
+    // terminator, so a body line ending in a backslash swallows the next line —
+    // including the line that merely looks like the terminator. The raw text ended
+    // the body early and read `sudo id` as a command that never runs.
+    for (const command of ["cat <<EOF\nfoo\\\nEOF\nsudo id\nEOF",
+      "cat <<EOF\nfoo\\\nbar\nEOF\nsudo id", "cat <<-EOF\n\tfoo\\\n\tEOF\nsudo id\nEOF",
+      "sh -c 'cat <<EOF\nfoo\\\nEOF\nsudo id\nEOF'",
+      "sh -c 'cat <<-EOF\n\tfoo\\\n\tEOF\npwd'"])
+      assert.equal(guardShell([command])?.decision, "ask", command);
+    // A quoted body keeps its backslashes, so the terminator cannot move and the
+    // tail is still script.
+    for (const command of ["cat <<'EOF'\nfoo\\\nEOF\nsudo id\nEOF",
+      'cat <<"EOF"\nfoo\\\nEOF\nsudo id', 'sh -c \'cat <<"EOF"\nfoo\\\nEOF\nsudo id\nEOF\''])
+      assert.equal(guardShell([command])?.decision, "deny", command);
+    // The header is still script, and benign unquoted bodies stay read-only.
+    assert.equal(guardShell(["sudo cat <<EOF\nfoo\\\nEOF"])?.decision, "deny");
+    for (const command of ["cat <<EOF\nhello\nEOF", "cat <<'EOF'\nfoo\\\nbar\nEOF"])
+      assert.equal(guardShell([command])?.decision, "allow", command);
+  });
+
+  it("finds the -c script after later shell options", () => {
+    // A shell keeps parsing options after `-c`, so its first operand is the
+    // script: `sh -c -e '...'` and `sh -c -- '...'` run the quoted string. Taking
+    // `-e` or `--` for the script missed the deny entirely.
+    for (const command of ["sh -c -e 'pwd\nsudo id'", "sh -c -- 'pwd\nsudo id'",
+      "bash -c -x -e 'rm -rf /'", "sh -c -o errexit 'sudo id'", "sh -c -O extglob 'sudo id'",
+      "bash -c --noprofile --norc 'sudo id'", "sh -ce 'pwd\nsudo id'", "sh -c -u -- 'chmod 777 x'",
+      "bash -c -e -c 'sudo id'"])
+      assert.equal(guardShell([command])?.decision, "deny", command);
+    // An unknown option could consume the script itself, and a missing script has
+    // no commands to check, so both fail closed to manual approval.
+    for (const command of ["sh -c -Z 'sudo id'", "sh -c -e", "sh -c -e pwd", "sh -c"])
+      assert.equal(guardShell([command])?.decision, "ask", command);
+    // Only the first operand is the script; later words are its arguments.
+    assert.equal(guardShell(["sh -c 'pwd' -c 'sudo id'"])?.decision, "ask");
+  });
+
+  it("denies header commands of a heredoc whose body boundary is unknown", () => {
+    // An undecodable delimiter leaves the body boundary unknown, but everything on
+    // the header line runs before the body is read: `cat <<\EOF; sudo id` still
+    // runs `sudo id`, and the delimiter itself is only a redirection target.
+    for (const command of ["sh -c 'cat <<\\EOF; sudo id\nx\nEOF'",
+      "bash -c 'cat <<\\EOF; rm -rf /'", "eval 'cat <<\\EOF; chmod 777 x\nbody\nEOF'",
+      "sh -c 'cat <<E'\"'\"'OF'\"'\"'; sudo id\nx\nEOF'", "cat <<\\EOF; sudo id\nx\nEOF",
+      "cat \\\n<<EOF; sudo id\nx\nEOF"])
+      assert.equal(guardShell([command])?.decision, "deny", command);
+    // Nothing past the header line is trusted, so body data is never a command.
+    for (const command of ["sh -c 'cat <<\\EOF\nsudo id\nEOF'",
+      "sh -c 'cat <<\\EOF; pwd\nsudo id\nEOF'", "sh -c 'cat <<\\EOF; echo sudo\nx\nEOF'",
+      "cat <<\\EOF\nx\nEOF\nsudo id\nEOF"])
+      assert.equal(guardShell([command])?.decision, "ask", command);
   });
 
   it("keeps the earlier gates ahead of the new verdicts", () => {

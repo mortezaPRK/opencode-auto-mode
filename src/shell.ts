@@ -58,15 +58,22 @@ interface ParsedLine { segments: Segment[]; complete: boolean }
 const WORD_DELIMITER = /[ \t\n;|&()<>]/;
 
 /**
- * One entry per shell word, true when the word contains an unquoted expansion
- * that can turn it into several arguments.
+ * One entry per shell word, true when the word contains an expansion that can
+ * turn it into several arguments.
  *
  * `shell-quote` only marks `*` and `?` as globs, but bracket (`[ab]`) and brace
- * (`{a,b}`) expansion, and unquoted parameter expansion, change the argument
- * count too. This scan is quote- and escape-aware, so quoted or escaped bracket,
- * brace, and parameter markers are not flagged here. `shell-quote` still reports
- * an escaped `*`/`?` as a glob token, which stays conservatively reviewed.
- * Matching the flags by position keeps the raw text out of the parsed logic.
+ * (`{a,b}`) expansion, and parameter expansion, change the argument count too.
+ * This scan is quote- and escape-aware, so quoted or escaped bracket, brace, and
+ * glob markers are not flagged here. `shell-quote` still reports an escaped
+ * `*`/`?` as a glob token, which stays conservatively reviewed.
+ *
+ * A parameter inside double quotes counts as uncertain for the same reason: it
+ * stays one word only after expansion, and the value decides both the text and —
+ * for `"$@"` — the count. `sort "${X:--oout}" file` writes a file when `X` is
+ * unset, `find . "${X:--delete}"` deletes, and `uniq "$@"` can become two
+ * operands, while `shell-quote` sees only an empty string. Single quotes and an
+ * escaped `\$` are literal and stay safe. Matching the flags by position keeps
+ * the raw text out of the parsed logic.
  */
 function wordExpansions(command: string): boolean[] {
   const expansions: boolean[] = [];
@@ -94,6 +101,7 @@ function wordExpansions(command: string): boolean[] {
     if (quote === '"') {
       if (character === "\\") index++;
       else if (character === '"') quote = undefined;
+      else if (character === "$") expansion = true;
       continue;
     }
     if (character === "\\") {
@@ -221,10 +229,10 @@ function analyzeLine(command: string): Verdict {
 function analyzeLines(command: string): Verdict {
   let ask = false;
   let review = false;
-  const { lines, unsupported } = logicalLines(command);
-  // An undecodable heredoc header leaves the code/data split unknown, so nothing
-  // in this script may be auto-approved.
-  if (unsupported) ask = true;
+  const { lines, certain } = logicalLines(command);
+  // An undecodable header or a body that can move its terminator leaves the
+  // script/data split unknown, so nothing past that line may be auto-approved.
+  if (certain < lines.length) ask = true;
   for (const line of lines) {
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith("#")) continue;
@@ -257,29 +265,35 @@ function analyzeHeredoc(command: string): Verdict {
     bodies.push({ lines: body, quoted: marker.quoted });
   }
 
-  // The header line and the lines after the bodies are script; everything between
-  // is data. The header is analyzed on its own because its markers have already
-  // been consumed above — handing them back to the heredoc scanner would swallow
-  // the tail as a second body. The tail is analyzed as its own script so a further
-  // heredoc there is routed the same way, and a blocked command spanning a quoted
-  // newline is still seen whole.
+  // The header line is script, and so is the text after the bodies — but only if
+  // the bodies really end where the raw text says. The header is analyzed on its
+  // own because its markers have already been consumed above: handing them back
+  // to the heredoc scanner would swallow the tail as a second body.
   const header = analyzeLine(firstLine);
   if (header.decision === "deny") return header;
+  // An unquoted body is matched against its terminator after the shell removes
+  // continuations, so a body line ending in a backslash moves the boundary —
+  // including the last one, whose `\`-newline joins the terminator line into the
+  // body. That has to fail closed before the tail is judged, or a tail that is
+  // really body data would deny. A quoted body keeps its backslashes literally.
+  for (const body of bodies) {
+    if (body.quoted) continue;
+    if (body.lines.some((line) => line.endsWith("\\"))) return { decision: "ask" };
+  }
+  // The tail is analyzed as its own script so a further heredoc there is routed
+  // the same way, and a blocked command spanning a quoted newline is still seen
+  // whole.
   const tail = lines.slice(index).join("\n");
   const rest: Verdict = tail ? analyze(tail) : { decision: "allow" };
   if (rest.decision === "deny") return rest;
   let ask = header.decision === "ask" || rest.decision === "ask";
   const review = header.decision === "review" || rest.decision === "review";
+  // Unquoted heredoc bodies undergo command and parameter expansion. That can run
+  // a substitution, so it fails closed, but it cannot move the terminator: the
+  // tail denied above stays a deny.
   for (const body of bodies) {
-    const text = body.lines.join("\n");
-    // A quoted body is data and its header was unambiguous, so a continuation
-    // there stays literal. An unquoted body is matched against its terminator
-    // after the shell removes continuations, so any `\`-newline can move the
-    // body boundary and must fail closed even when the body looks benign.
     if (body.quoted) continue;
-    if (text.includes("\\\n")) return { decision: "ask" };
-    // Unquoted heredoc bodies undergo command and parameter expansion.
-    if (DYNAMIC_SYNTAX.test(text)) return { decision: "ask" };
+    if (DYNAMIC_SYNTAX.test(body.lines.join("\n"))) return { decision: "ask" };
   }
   try {
     const words = parseShell(firstLine).filter((token): token is string => typeof token === "string");
@@ -309,7 +323,14 @@ function analyze(command: string): Verdict {
     return { decision: "ask" };
   // Fail closed on a heredoc header that normalization cannot be trusted on:
   // the raw source is the only place its marker and delimiter are still intact.
-  if (hasAmbiguousHeredoc(command)) return { decision: "ask" };
+  // The header line itself is still script — `cat <<\EOF; sudo id` runs `sudo id`
+  // before the shell ever reads the body — so a deny visible there is mandatory;
+  // everything after that line may be data and only reaches manual approval.
+  if (hasAmbiguousHeredoc(command)) {
+    const header = logicalLines(normalizeContinuations(command)).lines[0] ?? "";
+    const verdict = analyzeLine(header);
+    return verdict.decision === "deny" ? verdict : { decision: "ask" };
+  }
   // Normalize once, before routing: `logicalLines` must split on the newlines
   // the shell actually treats as separators, and heredoc bodies stay untouched.
   const normalized = normalizeContinuations(command);

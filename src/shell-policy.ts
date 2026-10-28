@@ -243,6 +243,39 @@ function isRecursiveRootRemoval(args: readonly string[]): boolean {
   return targets.some(isFilesystemRoot);
 }
 
+/** Shell options that take no value and may follow `-c` before its script. */
+const SHELL_FLAGS = new Set(["-a", "-b", "-C", "-e", "-f", "-h", "-i", "-k", "-l", "-m", "-n", "-p", "-r", "-s",
+  "-t", "-u", "-v", "-x", "-B", "-E", "-H", "-P", "-T", "--login", "--noprofile", "--norc", "--posix",
+  "--restricted", "--verbose", "--noediting"]);
+/** Shell options that consume the next word as their value. */
+const SHELL_VALUE_OPTIONS = new Set(["-o", "-O", "--rcfile", "--init-file"]);
+const SHELL_FLAG_LETTERS = "abcCefhiklmnprstuvxBEHPT";
+
+/**
+ * The script operand that follows the `-c` option at `start`.
+ *
+ * A shell keeps parsing options after `-c`, so `sh -c -e 'pwd`+newline+`sudo id'`
+ * runs the quoted string, not `-e`, and `sh -c -- script` runs `script`. Known
+ * flags and their values are skipped; an unknown option could consume the script
+ * itself, so its arity is unknowable and the caller must fail closed.
+ */
+function shellScript(args: readonly string[], start: number): string | undefined {
+  let index = start;
+  while (index < args.length) {
+    const arg = args[index];
+    if (arg === "--") return args[index + 1];
+    if (SHELL_VALUE_OPTIONS.has(arg)) { index += 2; continue; }
+    if (SHELL_FLAGS.has(arg)) { index++; continue; }
+    if (/^-[^-]+$/.test(arg) && [...arg.slice(1)].every((letter) => SHELL_FLAG_LETTERS.includes(letter))) {
+      index++;
+      continue;
+    }
+    if (arg.startsWith("-") && arg.length > 1) return undefined;
+    return arg;
+  }
+  return undefined;
+}
+
 /** The script a shell or `eval` would run, when invoked non-interactively. */
 function scriptArgument(name: string, args: readonly string[]): string | undefined {
   if (name === "eval") return args.length ? args.join(" ") : undefined;
@@ -250,7 +283,7 @@ function scriptArgument(name: string, args: readonly string[]): string | undefin
     const arg = args[index];
     if (arg === "--") return undefined;
     if (!arg.startsWith("-") || arg.startsWith("--")) continue;
-    if (arg.slice(1).includes("c")) return args[index + 1];
+    if (arg.slice(1).includes("c")) return shellScript(args, index + 1);
   }
   return undefined;
 }
@@ -570,13 +603,26 @@ export function hasAmbiguousHeredoc(command: string): boolean {
   return scanHeredoc(header).unsupported;
 }
 
+interface HeredocCopy {
+  text: string;
+  end: number;
+  /**
+   * True when an unquoted body line ends with a backslash. A shell removes that
+   * `\`-newline before matching the terminator, so the body can run past the line
+   * the raw text compares and the terminator may match somewhere else entirely —
+   * including on a line the collector treats as script.
+   */
+  unstable: boolean;
+}
+
 /**
  * Copies here-document bodies verbatim, returning the copied text and the
  * offset where the command script resumes.
  */
-function heredocBodies(command: string, start: number, markers: readonly HeredocMarker[]): { text: string; end: number } {
+function heredocBodies(command: string, start: number, markers: readonly HeredocMarker[]): HeredocCopy {
   let index = start;
   let text = "";
+  let unstable = false;
   for (const marker of markers) {
     let closed = false;
     while (index < command.length) {
@@ -586,10 +632,12 @@ function heredocBodies(command: string, start: number, markers: readonly Heredoc
       text += command.slice(index, stop);
       index = stop;
       if ((marker.stripTabs ? line.replace(/^\t+/, "") : line) === marker.delimiter) { closed = true; break; }
+      // A quoted body keeps its backslashes, so only an unquoted one can move.
+      if (!marker.quoted && line.endsWith("\\")) unstable = true;
     }
     if (!closed) break;
   }
-  return { text, end: index };
+  return { text, end: index, unstable };
 }
 
 /**
@@ -702,8 +750,13 @@ export function normalizeContinuations(command: string): string {
 export interface LogicalScript {
   /** One entry per logical command line, in source order; heredoc bodies are omitted. */
   lines: string[];
-  /** True when a here-document header could not be decoded, so the code/data split is unknowable. */
-  unsupported: boolean;
+  /**
+   * How many leading entries in `lines` are certainly script. A here-document
+   * header this scanner cannot decode, or an unquoted body whose continuation can
+   * move its own terminator, ends that prefix: the header line itself still runs,
+   * but later entries may be body data.
+   */
+  certain: number;
 }
 
 /**
@@ -718,23 +771,28 @@ export interface LogicalScript {
  *
  * Here-document bodies are data, not commands: they are skipped, so the `sudo` in
  * `cat <<'EOF'`+newline+`sudo id`+newline+`EOF` is plain text, while a command
- * after the terminator is still analyzed. `unsupported` reports a header this
- * scanner cannot decode, where the terminator — and therefore the boundary
- * between script and data — is unknown, so callers must fail closed.
+ * after the terminator is still analyzed. `certain` reports the prefix of lines
+ * whose script/data split is known; callers must not auto-approve past it.
  */
 export function logicalLines(command: string): LogicalScript {
   const lines: string[] = [];
-  let unsupported = false;
+  let certain: number | undefined;
   let start = 0;
   let wordStart = true;
   let quote: "'" | '"' | "$'" | undefined;
   let pending: HeredocMarker[] = [];
+  /** Records that everything from the line at `line` onwards may be data. */
+  const markUncertain = (line: number) => {
+    if (certain === undefined) certain = line + 1;
+  };
   /** Ends the current line at `end` and jumps past the bodies of its markers. */
   const endLine = (end: number) => {
     lines.push(command.slice(start, end));
     start = end + 1;
     if (!pending.length) return;
-    start = heredocBodies(command, start, pending).end;
+    const bodies = heredocBodies(command, start, pending);
+    if (bodies.unstable) markUncertain(lines.length - 1);
+    start = bodies.end;
     pending = [];
   };
   for (let index = 0; index < command.length; index++) {
@@ -783,7 +841,7 @@ export function logicalLines(command: string): LogicalScript {
         continue;
       }
       if (command[index + 1] === "<" && command[index + 2] !== "<" && command[index - 1] !== "<")
-        unsupported = true;
+        markUncertain(lines.length);
     }
     if (character === "\n") {
       endLine(index);
@@ -795,7 +853,7 @@ export function logicalLines(command: string): LogicalScript {
     wordStart = WORD_BREAK.test(character);
   }
   lines.push(command.slice(start));
-  return { lines, unsupported };
+  return { lines, certain: certain ?? lines.length };
 }
 
 /**
@@ -909,17 +967,21 @@ function invocations(command: string): string[][] {
  * mandatory deny, while `sh -c 'echo "first`+newline+`second"'` stays one word.
  * Here-document bodies are data and are never scanned as commands.
  *
- * A header this scanner cannot decode leaves the code/data split unknown, so the
- * deny pass stands down: the caller has already failed closed to manual approval
- * for the surrounding shell invocation, and guessing here could deny quoted data.
+ * When the split between script and data is unknown — an undecodable header, a
+ * continuation in the raw header, or an unquoted body that can move its own
+ * terminator — only the lines that are certainly script are checked. The header
+ * line always runs: `cat <<\EOF; sudo id` still runs `sudo id`, and a marker's
+ * delimiter is only a redirection target. Guessing past that line could deny
+ * quoted here-document data, so it is left to manual approval.
  */
 function denyScript(command: string, depth: number): string | undefined {
   if (FORK_BOMB.test(command)) return DANGEROUS;
-  if (hasAmbiguousHeredoc(command)) return undefined;
   const script = normalizeContinuations(command);
-  const { lines, unsupported } = logicalLines(script);
-  if (unsupported) return undefined;
-  for (const line of lines) {
+  const { lines, certain } = logicalLines(script);
+  // A continuation in the raw header can hide where that header ends, so only its
+  // first line is certain script.
+  const code = hasAmbiguousHeredoc(command) ? 1 : certain;
+  for (const line of lines.slice(0, code)) {
     for (const words of invocations(line)) {
       const reason = denyInvocation(words, depth);
       if (reason !== undefined) return reason;
