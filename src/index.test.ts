@@ -13,37 +13,63 @@ interface Evaluation {
 async function setup(options: unknown = {}, messages: unknown[] = [{ type: "user", text: "Create a file named a" }], answers = ["BLOCK", "ALLOW: authorized"]) {
   let evaluate!: (event: Evaluation) => Promise<void>;
   let disposed = 0;
+  const disposals: string[] = [];
+  let permissionDispose: (() => Promise<void>) | undefined;
+  let rpcDispose: (() => Promise<void>) | undefined;
+  let toolDispose: (() => unknown) | undefined;
   const prompts: string[] = [];
   const models: ({ id: string; providerID: string; variant?: string } | null | undefined)[] = [];
   const interrupts: { data: { sessionID: string } }[] = [];
-  const subscriptionSignals: AbortSignal[] = [];
+  const subscriptions: AbortSignal[] = [];
   let wake: (() => void) | undefined;
-  async function* subscribe(input: { signal?: AbortSignal }) {
-    if (input.signal !== undefined) subscriptionSignals.push(input.signal);
-    while (!input.signal?.aborted) {
-      if (!interrupts.length) {
-        await new Promise<void>((resolve) => {
-          wake = resolve;
-          input.signal?.addEventListener("abort", () => resolve(), { once: true });
-        });
-        continue;
+  let rpcHandlers: Record<string, (input: unknown) => Promise<unknown>> = {};
+  const rpcEvents: unknown[] = [];
+  // The status event sink is replaceable after setup so a test can stall or
+  // fail delivery the way a busy or restarting client would.
+  const delivery = {
+    emit: async (_name: string, payload: unknown) => { rpcEvents.push(payload); },
+  };
+  function subscribe(input: { signal?: AbortSignal }) {
+    if (input.signal !== undefined) subscriptions.push(input.signal);
+    return (async function* () {
+      while (!input.signal?.aborted) {
+        if (!interrupts.length) {
+          await new Promise<void>((resolve) => {
+            wake = resolve;
+            input.signal?.addEventListener("abort", () => resolve(), { once: true });
+          });
+          continue;
+        }
+        const next = interrupts.shift();
+        if (next !== undefined) yield next;
       }
-      const next = interrupts.shift();
-      if (next !== undefined) yield next;
-    }
+    })();
   }
   const ctx = {
     options,
-    permission: { hook: async (_: string, handler: typeof evaluate) => { evaluate = handler; return { dispose: async () => { disposed++; } }; } },
-    tool: { hook: async () => ({ dispose: async () => { disposed++; } }) },
+    permission: { hook: async (_: string, handler: typeof evaluate) => { evaluate = handler; return { dispose: async () => { disposed++; disposals.push("permission"); await permissionDispose?.(); } }; } },
+    tool: { hook: async () => ({ dispose: () => { disposed++; disposals.push("tool"); return toolDispose?.(); } }) },
     session: { get: async () => ({ location: { directory: "/repo" }, model: { providerID: "session-provider", id: "session-model", variant: "high" } }), context: async () => messages },
     event: { subscribe },
+    rpc: {
+      register: async (_definition: unknown, handlers: typeof rpcHandlers) => {
+        rpcHandlers = handlers;
+        return { events: delivery, dispose: async () => { disposed++; disposals.push("rpc"); await rpcDispose?.(); } };
+      },
+    },
     generate: { text: async ({ prompt, model }: { prompt: string; model?: { id: string; providerID: string; variant?: string } | null }) => { prompts.push(prompt); models.push(model); return { text: answers.shift() ?? "ASK: unclear" }; } },
   };
   const cleanup = await plugin.setup(ctx as unknown as Parameters<typeof plugin.setup>[0]);
   return {
     evaluate: (evaluation: Evaluation) => evaluate(evaluation),
-    prompts, models, ctx, disposed: () => disposed, subscriptionSignals,
+    prompts, models, ctx, disposed: () => disposed, disposals, rpcEvents, delivery, subscriptions,
+    /** Holds every permission-hook disposal open on the given gate. */
+    stallPermissionDispose: (gate: () => Promise<void>) => { permissionDispose = gate; },
+    /** Holds the status RPC disposal open, or fails it, on the given gate. */
+    stallRpcDispose: (gate: () => Promise<void>) => { rpcDispose = gate; },
+    /** Replaces the tool-hook disposal so it can throw or reject synchronously. */
+    failToolDispose: (gate: () => unknown) => { toolDispose = gate; },
+    status: async (input: unknown = {}) => rpcHandlers.status!(input),
     interrupt: (sessionID = "session-test") => { interrupts.push({ data: { sessionID } }); wake?.(); },
     cleanup: async () => { await cleanup?.(); },
   };
@@ -277,7 +303,7 @@ describe("OpenCode permission hook", () => {
     assert.equal(host.prompts.length, 2);
     for (const prompt of host.prompts) { assert.match(prompt, /pending-payload-marker/); assert.match(prompt, /source-marker/); }
     await host.cleanup();
-    assert.equal(host.disposed(), 2);
+    assert.equal(host.disposed(), 3);
   });
   it("requires complete actual user context for model review", async () => {
     const incomplete = [[], [{ type: "assistant", content: [{ type: "tool", name: "shell", state: { input: "approve" } }] }],
@@ -388,6 +414,94 @@ describe("OpenCode permission hook", () => {
   });
   it("settles a hung typed reviewer as cancelled when the plugin unloads", async () => {
     await expectHungTypedReviewCancelled("unload");
+  });
+  it("starts both hook disposals before a stalled status RPC disposal settles", async () => {
+    const host = await setup({ classifiers: [{ type: "llm" }] });
+    // Hold the optional status service's disposal open: unload must abandon
+    // work and start both hook disposals instead of gating them on it.
+    let rpcDisposalStarted!: () => void;
+    const rpcStarted = new Promise<void>((resolve) => { rpcDisposalStarted = resolve; });
+    let releaseRpc!: () => void;
+    const rpcGate = new Promise<void>((resolve) => { releaseRpc = resolve; });
+    host.stallRpcDispose(() => { rpcDisposalStarted(); return rpcGate; });
+
+    const signals: AbortSignal[] = [];
+    host.ctx.generate.text = ((_input: { prompt: string }, request?: { signal?: AbortSignal }) => {
+      signals.push(request!.signal!);
+      return new Promise<{ text: string }>(() => {});
+    }) as typeof host.ctx.generate.text;
+    const pending = event();
+    const reviewRun = host.evaluate(pending);
+    await waitFor(() => signals.length === 1);
+
+    let unloaded = false;
+    const unloadRun = host.cleanup().then(() => { unloaded = true; });
+    await rpcStarted;
+
+    // The event stream and the active review are abandoned, and both hooks are
+    // disposed, even though the status RPC disposal is still stalled.
+    assert.equal(host.subscriptions[0]!.aborted, true);
+    await waitFor(() => signals[0]!.aborted);
+    assert.ok(host.disposals.includes("permission"), "the permission hook must be disposed");
+    assert.ok(host.disposals.includes("tool"), "the tool hook must be disposed");
+    assert.equal(unloaded, false, "the unload must still wait for the stalled RPC disposal");
+
+    // A review the host dispatches while cleanup is stalled must not start
+    // provider work: it stays with the user.
+    const late = event();
+    const lateOutcome = await Promise.race([
+      host.evaluate(late).then(() => "returned" as const),
+      delay(1_000).then(() => "blocked" as const),
+    ]);
+    assert.equal(lateOutcome, "returned", "a post-abandonment review must not wait on a provider");
+    assert.equal(late.effect, "ask");
+    assert.match(late.message!, /interrupted/i);
+    assert.equal(signals.length, 1, "abandonment must block new provider work");
+
+    // The abandoned review settles as ask without waiting for the gate.
+    await reviewRun;
+    assert.equal(pending.effect, "ask");
+    assert.match(pending.message!, /interrupted/i);
+
+    releaseRpc();
+    await unloadRun;
+    assert.equal(unloaded, true);
+
+    // Once unload settles, a dispatched evaluation still starts no review.
+    const after = event();
+    const afterOutcome = await Promise.race([
+      host.evaluate(after).then(() => "returned" as const),
+      delay(1_000).then(() => "blocked" as const),
+    ]);
+    assert.equal(afterOutcome, "returned", "an unloaded review must not wait on a provider");
+    assert.equal(after.effect, "ask");
+    assert.match(after.message!, /interrupted/i);
+    assert.equal(signals.length, 1);
+    assert.equal(host.disposed(), 3);
+  });
+  it("settles unload when a cleanup throws or rejects without skipping the others", async () => {
+    // A rejected status RPC disposal must not skip either hook disposal.
+    const rejecting = await setup({ classifiers: [{ type: "static" }] });
+    rejecting.stallRpcDispose(() => Promise.reject(new Error("status disposal failed")));
+    await rejecting.cleanup();
+    assert.deepEqual([...rejecting.disposals].sort(), ["permission", "rpc", "tool"]);
+
+    // A hook disposal that throws synchronously must not skip the other hook or
+    // the status RPC, and must not surface as an unhandled rejection.
+    const throwing = await setup({ classifiers: [{ type: "static" }] });
+    throwing.failToolDispose(() => { throw new Error("tool disposal failed"); });
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      await throwing.cleanup();
+      await delay(20);
+      assert.deepEqual([...throwing.disposals].sort(), ["permission", "rpc", "tool"]);
+      assert.equal(throwing.disposed(), 3);
+      assert.deepEqual(unhandled, []);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
   });
   it("stops before starting a fallback provider with an already-aborted signal", async () => {
     const host = await setup({ classifiers: [{ type: "llm" }, { type: "llm" }], reviewTimeoutMs: 5_000 });
@@ -675,8 +789,8 @@ describe("OpenCode permission hook", () => {
     const host = await setup({ classifiers: [{ type: "static" }] });
     host.ctx.permission.hook = async () => { throw new Error("permission registration failed"); };
     await assert.rejects(Promise.resolve(plugin.setup(host.ctx as unknown as Parameters<typeof plugin.setup>[0])));
-    assert.equal(host.subscriptionSignals.length, 2);
-    assert.equal(host.subscriptionSignals[1]!.aborted, true);
+    assert.equal(host.subscriptions.length, 2);
+    assert.equal(host.subscriptions[1]!.aborted, true);
     await host.cleanup();
   });
   it("aborts the subscription and active reviews when tool hook registration fails", async () => {
@@ -690,7 +804,7 @@ describe("OpenCode permission hook", () => {
     }) as typeof host.ctx.tool.hook;
     const setupRun = plugin.setup(host.ctx as unknown as Parameters<typeof plugin.setup>[0]);
     await toolRegistration;
-    assert.equal(host.subscriptionSignals.length, 2);
+    assert.equal(host.subscriptions.length, 2);
     let providerSignal: AbortSignal | undefined;
     host.ctx.generate.text = ((_input: { prompt: string }, request?: { signal?: AbortSignal }) => {
       providerSignal = request?.signal;
@@ -701,21 +815,168 @@ describe("OpenCode permission hook", () => {
     await waitFor(() => providerSignal !== undefined);
     rejectTool(new Error("tool registration failed"));
     await assert.rejects(Promise.resolve(setupRun));
-    assert.equal(host.subscriptionSignals[1]!.aborted, true);
+    assert.equal(host.subscriptions[1]!.aborted, true);
     await waitFor(() => providerSignal!.aborted);
     await reviewRun;
     assert.equal(pending.effect, "ask");
     assert.match(pending.message!, /interrupted/i);
     await host.cleanup();
   });
-  it("keeps repeated policy denials denied and disposes partial setup", async () => {    const host = await setup({ classifiers: [{ type: "static" }] });
+  it("abandons reviews and subscriptions before a stalled cleanup settles", async () => {
+    const host = await setup({ classifiers: [{ type: "llm" }] });
+    let rejectTool!: (error: Error) => void;
+    let toolStarted!: () => void;
+    const toolRegistration = new Promise<void>((resolve) => { toolStarted = resolve; });
+    host.ctx.tool.hook = (() => {
+      toolStarted();
+      return new Promise((_resolve, reject) => { rejectTool = reject; });
+    }) as typeof host.ctx.tool.hook;
+    // Hold the permission hook's disposal open: abandonment must not wait for it.
+    let disposalStarted!: () => void;
+    const started = new Promise<void>((resolve) => { disposalStarted = resolve; });
+    let releaseDisposal!: () => void;
+    const disposalGate = new Promise<void>((resolve) => { releaseDisposal = resolve; });
+    host.stallPermissionDispose(() => { disposalStarted(); return disposalGate; });
+
+    const setupRun = plugin.setup(host.ctx as unknown as Parameters<typeof plugin.setup>[0]);
+    await toolRegistration;
+    let providerSignal: AbortSignal | undefined;
+    host.ctx.generate.text = ((_input: { prompt: string }, request?: { signal?: AbortSignal }) => {
+      providerSignal = request?.signal;
+      return new Promise<{ text: string }>(() => {});
+    }) as typeof host.ctx.generate.text;
+    const pending = event();
+    const reviewRun = host.evaluate(pending);
+    await waitFor(() => providerSignal !== undefined);
+
+    rejectTool(new Error("tool registration failed"));
+    await started;
+
+    // Disposal is still stalled, yet the event stream, the active review, and
+    // the status RPC are already abandoned and both cleanups have started.
+    assert.equal(host.subscriptions.length, 2);
+    assert.equal(host.subscriptions[1]!.aborted, true);
+    await waitFor(() => providerSignal!.aborted);
+    assert.ok(host.disposals.includes("permission"));
+    assert.ok(host.disposals.includes("rpc"));
+
+    releaseDisposal();
+    // The stalled disposal must not replace the registration error.
+    await assert.rejects(Promise.resolve(setupRun), /tool registration failed/);
+    await reviewRun;
+    assert.equal(pending.effect, "ask");
+    assert.match(pending.message!, /interrupted/i);
+    await host.cleanup();
+  });
+  it("exposes configuration and decisions over RPC without prompts", async () => {
+    const host = await setup({ classifiers: [{ type: "static" }, { type: "llm" }], reviewTimeoutMs: 30_000 });
+    const before = await host.status({ sessionID: "session-test" }) as { enabled: boolean; classifiers: string[]; recent: unknown[] };
+    assert.equal(before.enabled, true);
+    assert.deepEqual(before.classifiers, ["static", "llm"]);
+    assert.deepEqual(before.recent, []);
+    await host.evaluate(event());
+    const after = await host.status({ sessionID: "session-test" }) as { recent: { decision: string; reason: string }[] };
+    assert.equal(after.recent.length, 1);
+    assert.equal(after.recent[0].decision, "allow");
+    assert.doesNotMatch(JSON.stringify(after), /Build a feature/);
+    assert.equal(host.rpcEvents.length, 1);
+    await host.cleanup();
+  });
+  it("bounds a long action in the status snapshot and decision event", async () => {
+    const host = await setup({ classifiers: [{ type: "static" }] });
+    const action = `custom:${"x".repeat(500)}`;
+    const pending = { ...event(), action };
+    await host.evaluate(pending);
+    const after = await host.status({ sessionID: "session-test" }) as {
+      reviewing: unknown[]; recent: { action: string; decision: string }[];
+    };
+    // Finishing the review still clears it from the active list.
+    assert.deepEqual(after.reviewing, []);
+    assert.equal(after.recent.length, 1);
+    assert.equal(after.recent[0].decision, "ask");
+    assert.equal(after.recent[0].action.length, 128);
+    assert.ok(action.startsWith(after.recent[0].action.slice(0, -1)));
+    assert.equal(host.rpcEvents.length, 1);
+    assert.equal((host.rpcEvents[0] as { action: string }).action, after.recent[0].action);
+    assert.ok(JSON.stringify(host.rpcEvents).length < 1_024);
+    // Bounding the status copy must not rewrite the review request itself.
+    assert.equal(pending.action, action);
+    await host.cleanup();
+  });
+  it("returns the permission decision without waiting for a stalled status event", async () => {
+    const host = await setup({ classifiers: [{ type: "static" }] });
+    let emitted = 0;
+    host.delivery.emit = () => { emitted++; return new Promise<void>(() => {}); };
+    const pending = { ...event(), resources: ["sudo rm -rf /"] };
+    const outcome = await Promise.race([
+      host.evaluate(pending).then(() => "returned" as const),
+      delay(1_000).then(() => "blocked" as const),
+    ]);
+    assert.equal(outcome, "returned");
+    assert.equal(pending.effect, "deny");
+    assert.equal(emitted, 1);
+    await host.cleanup();
+  });
+  it("survives a status event that throws synchronously", async () => {
+    const host = await setup({ classifiers: [{ type: "static" }] });
+    host.delivery.emit = () => { throw new Error("status delivery failed"); };
+    const pending = { ...event(), resources: ["sudo rm -rf /"] };
+    await host.evaluate(pending);
+    assert.equal(pending.effect, "deny");
+    await host.cleanup();
+  });
+  it("does not leave a rejected status event unhandled", async () => {
+    const host = await setup({ classifiers: [{ type: "static" }] });
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      host.delivery.emit = () => Promise.reject(new Error("status delivery failed"));
+      const pending = { ...event(), resources: ["sudo rm -rf /"] };
+      await host.evaluate(pending);
+      assert.equal(pending.effect, "deny");
+      await delay(20);
+      assert.deepEqual(unhandled, []);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+      await host.cleanup();
+    }
+  });
+  it("reports an invalid configuration over RPC", async () => {
+    const host = await setup({ classifiers: [{ type: "bogus" }] });
+    const snapshot = await host.status() as { enabled: boolean; configError?: string };
+    assert.equal(snapshot.enabled, false);
+    assert.match(snapshot.configError!, /classifiers/i);
+    await host.cleanup();
+  });
+  it("keeps repeated policy denials denied and disposes partial setup", async () => {
+    const host = await setup({ classifiers: [{ type: "static" }] });
     for (let i = 0; i < 25; i++) {
       const pending = { ...event(), resources: ["sudo rm -rf /"] };
       await host.evaluate(pending); assert.equal(pending.effect, "deny");
     }
     await host.cleanup();
-    host.ctx.tool.hook = async () => { throw new Error("setup failed"); };
-    await assert.rejects(Promise.resolve(plugin.setup(host.ctx as unknown as Parameters<typeof plugin.setup>[0])));
-    assert.equal(host.disposed(), 3);
+    host.ctx.tool.hook = () => { throw new Error("setup failed"); };
+    await assert.rejects(Promise.resolve(plugin.setup(host.ctx as unknown as Parameters<typeof plugin.setup>[0])), /setup failed/);
+    // The failed attempt registered the RPC and followed events before the tool
+    // hook threw; disposing the permission hook must not leave either behind.
+    assert.equal(host.disposed(), 5);
+    assert.equal(host.subscriptions[1]?.aborted, true);
+  });
+  it("disposes the RPC and event stream when the permission hook throws", async () => {
+    const host = await setup({ classifiers: [{ type: "static" }] });
+    await host.cleanup();
+    host.ctx.permission.hook = () => { throw new Error("permission setup failed"); };
+    await assert.rejects(Promise.resolve(plugin.setup(host.ctx as unknown as Parameters<typeof plugin.setup>[0])), /permission setup failed/);
+    assert.equal(host.disposed(), 4);
+    assert.equal(host.subscriptions[1]?.aborted, true);
+  });
+  it("disposes partial setup when a hook registration rejects", async () => {
+    const host = await setup({ classifiers: [{ type: "static" }] });
+    await host.cleanup();
+    host.ctx.tool.hook = async () => { throw new Error("tool setup failed"); };
+    await assert.rejects(Promise.resolve(plugin.setup(host.ctx as unknown as Parameters<typeof plugin.setup>[0])), /tool setup failed/);
+    assert.equal(host.disposed(), 5);
+    assert.equal(host.subscriptions[1]?.aborted, true);
   });
 });
