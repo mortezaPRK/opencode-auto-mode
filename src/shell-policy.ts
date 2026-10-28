@@ -386,8 +386,12 @@ export interface HeredocMarker { delimiter: string; quoted: boolean; stripTabs: 
  * Reads the here-document marker that starts at `<<`, returning the marker and
  * the offset just past its delimiter.
  *
- * A here-string (`<<<`) is not a here-document and has no body, and a `<<`
- * without a delimiter introduces nothing, so both return undefined.
+ * Only delimiters this parser decodes exactly are accepted: a bare word of
+ * `[A-Za-z0-9_]`, or one fully quoted word. Single quotes keep a backslash
+ * literal, so `'E\OF'` decodes to `E\OF`; a double-quoted word decodes `\\`,
+ * `\$`, `` \` ``, and `\"`, so the raw text is not the delimiter and any
+ * backslash there is unsupported. Escapes, expansion, concatenated words, and
+ * an unterminated quote all return undefined, and callers fail closed.
  */
 function heredocMarkerAt(line: string, index: number): { marker: HeredocMarker; end: number } | undefined {
   if (line[index] !== "<" || line[index + 1] !== "<" || line[index + 2] === "<" || line[index - 1] === "<")
@@ -402,12 +406,23 @@ function heredocMarkerAt(line: string, index: number): { marker: HeredocMarker; 
     const closing = line[cursor];
     quoted = true;
     cursor++;
-    while (cursor < line.length && line[cursor] !== closing) delimiter += line[cursor++];
-    if (line[cursor] === closing) cursor++;
+    let closed = false;
+    while (cursor < line.length) {
+      const character = line[cursor];
+      if (character === closing) { closed = true; cursor++; break; }
+      if (closing === '"' && character === "\\") return undefined;
+      delimiter += character;
+      cursor++;
+    }
+    if (!closed) return undefined;
   } else {
     while (cursor < line.length && /[A-Za-z0-9_]/.test(line[cursor])) delimiter += line[cursor++];
   }
-  return delimiter ? { marker: { delimiter, quoted, stripTabs }, end: cursor } : undefined;
+  if (!delimiter) return undefined;
+  // The delimiter word must end here; a quoted run glued to more word text is a
+  // concatenation this parser does not decode.
+  if (cursor < line.length && !WORD_BREAK.test(line[cursor])) return undefined;
+  return { marker: { delimiter, quoted, stripTabs }, end: cursor };
 }
 
 interface HeredocScan { markers: HeredocMarker[]; unsupported: boolean }
@@ -416,9 +431,10 @@ interface HeredocScan { markers: HeredocMarker[]; unsupported: boolean }
  * Scans one command line for here-document markers, ignoring markers inside
  * quoted strings and comments.
  *
- * `unsupported` reports a marker this parser cannot track: an escaped or
- * expanded delimiter (`<<\EOF`, `<<$name`) or a delimiter word assembled from
- * quoted and unquoted parts (`<<E'OF'`, `<<'EOF'x`). A shorter delimiter would
+ * `unsupported` reports a marker this parser cannot decode exactly: an escaped
+ * or expanded delimiter (`<<\EOF`, `<<$name`), a delimiter word assembled from
+ * quoted and unquoted parts (`<<E'OF'`, `<<'EOF'x`), a backslash inside a
+ * double-quoted delimiter, or an unterminated quote. A wrong delimiter would
  * move the body boundary, so callers fail closed instead.
  */
 function scanHeredoc(line: string): HeredocScan {
@@ -439,14 +455,14 @@ function scanHeredoc(line: string): HeredocScan {
     if (character === "#" && wordStart) break;
     if (character === "<") {
       const parsed = heredocMarkerAt(line, index);
-      if (parsed !== undefined) {
-        if (parsed.end < line.length && !WORD_BREAK.test(line[parsed.end])) unsupported = true;
+      if (parsed === undefined) {
+        if (line[index + 1] === "<" && line[index + 2] !== "<" && line[index - 1] !== "<") unsupported = true;
+      } else {
         markers.push(parsed.marker);
         index = parsed.end - 1;
         wordStart = false;
         continue;
       }
-      if (line[index + 1] === "<" && line[index + 2] !== "<" && line[index - 1] !== "<") unsupported = true;
     }
     wordStart = WORD_BREAK.test(character);
   }
@@ -524,7 +540,9 @@ function commandLine(command: string): string {
  * visible: a continuation in the header can split `<`+`<`, split the delimiter
  * (`<<`+newline+`EOF`, `<<E`+newline+`OF`), or hide the entire marker
  * (`cat <<`+newline+`'EOF'`). Guessing there can move the body boundary past a
- * trailing command, so these and unsupported delimiters require approval.
+ * trailing command, so these and delimiters the reader cannot decode exactly
+ * (escapes, expansion, concatenated words, a backslash inside double quotes)
+ * require approval.
  */
 export function hasAmbiguousHeredoc(command: string): boolean {
   const header = commandLine(command);

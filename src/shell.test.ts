@@ -204,6 +204,37 @@ describe("shell approval guard", () => {
     for (const command of ["cat <<'EOF'\nx\nEOF\nsudo id", "sudo cat <<'EOF'\nx\nEOF"])
       assert.equal(guardShell([command])?.decision, "deny", command);
   });
+  it("asks for heredoc delimiters the parser cannot decode exactly", () => {
+    // A double-quoted delimiter decodes `\\`, `\$`, `` \` `` and `\"`, so the raw
+    // text is not the terminator and a tail runs after the decoded one.
+    for (const command of ["cat <<\"E\\\\OF\"\nx\nE\\OF\nsudo id\nE\\\\OF",
+      "cat <<\"E\\$OF\"\nx\nE$OF\nsudo id\nE\\$OF",
+      "cat <<\"E\\`OF\"\nx\nE`OF\nsudo id\nE\\`OF",
+      "cat <<\"E\\\"OF\"\nx\nE\"OF\nsudo id\nE\\\"OF"])
+      assert.equal(guardShell([command])?.decision, "ask", command);
+    // Every marker on a multi-heredoc line is validated.
+    for (const command of ["cat <<'A' <<\"E\\\\OF\"\nx\nA\ny\nE\\OF\nsudo id\nE\\\\OF",
+      "cat <<\"E\\\\OF\" <<'A'\nx\nE\\OF\nsudo id\nE\\\\OF"])
+      assert.equal(guardShell([command])?.decision, "ask", command);
+    // Escaped, concatenated, unsupported-word, and unterminated delimiters.
+    for (const command of ["cat <<\\EOF\nx\nEOF\nsudo id\nEOF", "cat <<\"EO\"F\nx\nEOF\nsudo id\nEOF",
+      "cat <<E\"OF\"\nx\nEOF\nsudo id\nEOF", "cat <<-'E'X\nx\nEOF\nsudo id\nEOF",
+      "cat <<\"EOF\nx\nEOF", "cat <<'EOF\nx\nEOF", "cat <<$x\nx\nEOF",
+      "cat <<EOF-1\nx\nEOF-1", "cat <<EOF.x\nx\nEOF.x", "cat <<EOF=x\nx\nEOF=x",
+      "cat <<EOF#x\nx\nEOF#x", "cat <<''\nx\n", "cat <<\nx\n"])
+      assert.equal(guardShell([command])?.decision, "ask", command);
+    // Single quotes keep a backslash literal, so the delimiter is faithful and
+    // the tail after the terminator is script: deny precedence holds.
+    assert.equal(guardShell(["cat <<'E\\OF'\nx\nE\\OF\nsudo id"])?.decision, "deny");
+    assert.equal(guardShell(["cat <<'E\\OF'\nx\nE\\OF\npwd"])?.decision, "allow");
+    // The supported grammar stays read-only: bare words, one quoted word, and a
+    // double-quoted word whose text needs no decoding.
+    for (const command of ["cat <<'EOF'\nx\nEOF", "cat <<\"EOF\"\nx\nEOF",
+      "cat <<\"$x\"\nbody\n$x\npwd", "cat <<_EOF_1\nx\n_EOF_1\npwd", "cat <<2\nx\n2\npwd",
+      "cat <<- 'EOF'\n\tx\n\tEOF\npwd", "cat <<'A B'\nx\nA B\npwd",
+      "cat <<\"'EOF'\"\nx\n'EOF'\npwd", "cat <<\"$'EOF'\"\nx\n$'EOF'\npwd"])
+      assert.equal(guardShell([command])?.decision, "allow", command);
+  });
   it("keeps a continued command exactly as dangerous as the command it joins", () => {
     const insert = (command: string, index: number) => `${command.slice(0, index)}\\\n${command.slice(index)}`;
     for (const command of ["sudo id", "su root", "rm -rf /", "rm -r / --no-preserve-root", "chmod 777 secret",
