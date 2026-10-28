@@ -738,6 +738,27 @@ describe("OpenCode permission hook", () => {
     assert.equal(host.rpcEvents.length, 1);
     await host.cleanup();
   });
+  it("bounds a long action in the status snapshot and decision event", async () => {
+    const host = await setup({ classifiers: [{ type: "static" }] });
+    const action = `custom:${"x".repeat(500)}`;
+    const pending = { ...event(), action };
+    await host.evaluate(pending);
+    const after = await host.status({ sessionID: "session-test" }) as {
+      reviewing: unknown[]; recent: { action: string; decision: string }[];
+    };
+    // Finishing the review still clears it from the active list.
+    assert.deepEqual(after.reviewing, []);
+    assert.equal(after.recent.length, 1);
+    assert.equal(after.recent[0].decision, "ask");
+    assert.equal(after.recent[0].action.length, 128);
+    assert.ok(action.startsWith(after.recent[0].action.slice(0, -1)));
+    assert.equal(host.rpcEvents.length, 1);
+    assert.equal((host.rpcEvents[0] as { action: string }).action, after.recent[0].action);
+    assert.ok(JSON.stringify(host.rpcEvents).length < 1_024);
+    // Bounding the status copy must not rewrite the review request itself.
+    assert.equal(pending.action, action);
+    await host.cleanup();
+  });
   it("returns the permission decision without waiting for a stalled status event", async () => {
     const host = await setup({ classifiers: [{ type: "static" }] });
     let emitted = 0;

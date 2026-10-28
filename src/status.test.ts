@@ -61,6 +61,36 @@ describe("status tracker", () => {
     assert.ok(recent.every((entry) => entry.reason.length <= 200));
     assert.equal(status.recent(500, "session-a").length, 100);
   });
+  it("bounds a long action and stage before retaining or returning it", () => {
+    const status = createStatusTracker();
+    status.start("session-a", "review-1", 1000);
+    status.start("session-a", "review-2", 1002);
+    const action = `custom:${"x".repeat(500)}`;
+    const stage = "s".repeat(500);
+    const returned = status.finish({ reviewID: "review-1", sessionID: "session-a", action,
+      decision: "ask", stage, reason: "r".repeat(500), durationMs: 1, at: 1003 });
+    assert.equal(returned.action.length, 128);
+    assert.ok(returned.action.endsWith("…"));
+    assert.ok(action.startsWith(returned.action.slice(0, -1)));
+    assert.equal(returned.stage.length, 64);
+    assert.ok(returned.stage.endsWith("…"));
+    assert.ok(returned.reason.length <= 200);
+    const snapshot = status.snapshot({ ...base, sessionID: "session-a" });
+    // The finished review is gone, but another active review in the session
+    // is untouched, and the retained entry is the same bounded entry returned
+    // for publishing.
+    assert.deepEqual(snapshot.reviewing.map((entry) => entry.reviewID), ["review-2"]);
+    assert.deepEqual(snapshot.recent, [returned]);
+    assert.deepEqual(status.recent(1, "session-a"), [returned]);
+  });
+  it("clips a long action without splitting a surrogate pair", () => {
+    const status = createStatusTracker();
+    const action = `${"a".repeat(126)}😀${"b".repeat(10)}`;
+    const entry = status.finish({ reviewID: "review-1", sessionID: "session-a", action,
+      decision: "allow", stage: "static", reason: "safe", durationMs: 1, at: 1003 });
+    assert.equal(entry.action, `${"a".repeat(126)}😀…`);
+    assert.equal(Array.from(entry.action).length, 128);
+  });
   it("reports configuration state without echoing long errors", () => {
     const status = createStatusTracker();
     const snapshot = status.snapshot({ ...base, enabled: false, configError: "e".repeat(400) });

@@ -1,11 +1,18 @@
 import type { AutoModeDecision, AutoModeStatus } from "./rpc.js";
 
 const MAX_RECENT = 100;
+// Match the audit record bounds so live status and durable history describe
+// the same action, not an unbounded copy of the permission event.
+const MAX_ACTION_CHARS = 128;
+const MAX_STAGE_CHARS = 64;
 const MAX_REASON_CHARS = 200;
 const MAX_REVIEWING = 256;
 
 function clip(value: string, max = MAX_REASON_CHARS): string {
-  return value.length > max ? `${value.slice(0, max - 1)}…` : value;
+  // Count code points, not UTF-16 units, so clipping cannot cut a surrogate
+  // pair in half.
+  const characters = Array.from(value);
+  return characters.length > max ? `${characters.slice(0, max - 1).join("")}…` : value;
 }
 
 export interface StatusTracker {
@@ -36,7 +43,12 @@ export function createStatusTracker(): StatusTracker {
     },
     finish(decision) {
       reviewing.delete(decision.reviewID);
-      const entry: AutoModeDecision = { ...decision, reason: clip(decision.reason) };
+      const entry: AutoModeDecision = {
+        ...decision,
+        action: clip(decision.action, MAX_ACTION_CHARS),
+        stage: clip(decision.stage, MAX_STAGE_CHARS),
+        reason: clip(decision.reason),
+      };
       recent = [...recent, entry].slice(-MAX_RECENT);
       return entry;
     },
