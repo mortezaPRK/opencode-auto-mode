@@ -31,6 +31,29 @@ export function hasNonShellWhitespace(text: string): boolean {
   return /[^\S \t\n]/.test(text);
 }
 
+/**
+ * Syntax this policy does not decode: whitespace a shell does not separate words
+ * on, legacy `$[...]` arithmetic, and ANSI-C / locale quoting.
+ *
+ * Callers check both the raw text and the text after continuation removal:
+ * normalization deletes `\`-newlines, which can assemble one of these forms from
+ * characters that were separate in the raw source (`$`+`\`-newline+`'...'` is
+ * ANSI-C quoting to a shell).
+ */
+export function hasUndecodedSyntax(text: string): boolean {
+  return hasNonShellWhitespace(text) || text.includes("$[") ||
+    text.includes("$'") || text.includes('$"');
+}
+
+/**
+ * True when removing `\`-newlines would assemble syntax this policy does not
+ * decode. Parsing such a line can place a quote or word boundary differently
+ * from the shell, so callers must not take a deny from it.
+ */
+export function hasAssembledUndecodedSyntax(text: string): boolean {
+  return !hasUndecodedSyntax(text) && hasUndecodedSyntax(normalizeContinuations(text));
+}
+
 type OptionArity = "flag" | "value";
 
 interface WrapperGrammar {
@@ -550,14 +573,14 @@ export function hasHeredoc(text: string): boolean {
 }
 
 /**
- * The raw command line, up to the newline a shell would treat as its end.
- * Quoted newlines and `\`-newlines stay inside the line; a comment's newline
- * ends it.
+ * The raw command line that starts at `start`, and the offset of the newline
+ * that ends it. Quoted newlines and `\`-newlines stay inside the line; a
+ * comment's newline ends it.
  */
-function commandLine(command: string): string {
+function commandLineAt(command: string, start: number): { line: string; end: number } {
   let quote: "'" | '"' | "$'" | undefined;
   let wordStart = true;
-  for (let index = 0; index < command.length; index++) {
+  for (let index = start; index < command.length; index++) {
     const character = command[index];
     if (quote === "'") { if (character === "'") quote = undefined; continue; }
     if (quote === "$'") {
@@ -575,18 +598,68 @@ function commandLine(command: string): string {
     if (character === "$" && command[index + 1] === "'") { quote = "$'"; index++; wordStart = false; continue; }
     if (character === "#" && wordStart) {
       const end = command.indexOf("\n", index);
-      return end === -1 ? command : command.slice(0, end);
+      return { line: command.slice(start, end === -1 ? command.length : end),
+        end: end === -1 ? command.length : end };
     }
-    if (character === "\n") return command.slice(0, index);
+    if (character === "\n") return { line: command.slice(start, index), end: index };
     wordStart = WORD_BREAK.test(character);
   }
-  return command;
+  return { line: command.slice(start), end: command.length };
+}
+
+export interface RawHeredocScript {
+  /**
+   * Raw logical command lines that are certainly script, through the first header
+   * whose boundary cannot be read. Here-document bodies are omitted.
+   */
+  lines: string[];
+  /** True when a raw header's marker or delimiter cannot be placed exactly. */
+  ambiguous: boolean;
 }
 
 /**
- * True when a here-document header cannot be tracked reliably from the raw
- * source, so the guard must fail closed instead of normalizing bytes it cannot
- * place.
+ * Projects the raw source onto its command lines up to the first here-document
+ * header this reader cannot decode, skipping the bodies of headers it can.
+ *
+ * Every header is validated here, not only the first line: a continuation in a
+ * later header (`cat <<'A'`+newline+`a`+newline+`A`+newline+`cat <<\`+newline+
+ * `'EOF'`) is invisible to a first-line check, and normalization would then join
+ * the marker and treat a following `\`-newline body line as script, hiding a
+ * command Bash runs. Bodies are copied with the same raw comparison as
+ * `logicalLines`, so data is never returned as a script line; an unquoted body
+ * whose continuation can move its own terminator stops the scan because the
+ * existing projection already asks for it.
+ *
+ * A `\`-newline in the header, an undecodable marker, or a marker that only
+ * appears after normalization ends the certain prefix: the header line itself
+ * still runs, but nothing after it can be trusted.
+ */
+export function rawHeredocScript(command: string): RawHeredocScript {
+  const lines: string[] = [];
+  let start = 0;
+  while (start < command.length) {
+    const { line, end } = commandLineAt(command, start);
+    lines.push(line);
+    const scan = scanHeredoc(line);
+    const rawMarker = hasHeredoc(line);
+    const normalizedMarker = hasHeredoc(normalizeContinuations(line));
+    if (rawMarker || normalizedMarker) {
+      if (line.includes("\\\n") || scan.unsupported) return { lines, ambiguous: true };
+      // A `<<` the reader cannot place without a continuation is just as unknown.
+      if (!scan.markers.length) return { lines, ambiguous: true };
+      const bodies = heredocBodies(command, end + 1, scan.markers);
+      if (bodies.unstable) return { lines, ambiguous: false };
+      start = bodies.end;
+      continue;
+    }
+    start = end + 1;
+  }
+  return { lines, ambiguous: false };
+}
+
+/**
+ * True when any raw here-document header cannot be tracked reliably, so the
+ * guard must fail closed instead of normalizing bytes it cannot place.
  *
  * Deleting a `\`-newline is only safe once the marker and its delimiter are
  * visible: a continuation in the header can split `<`+`<`, split the delimiter
@@ -594,13 +667,10 @@ function commandLine(command: string): string {
  * (`cat <<`+newline+`'EOF'`). Guessing there can move the body boundary past a
  * trailing command, so these and delimiters the reader cannot decode exactly
  * (escapes, expansion, concatenated words, a backslash inside double quotes)
- * require approval.
+ * require approval. Every header is checked, not only the first.
  */
 export function hasAmbiguousHeredoc(command: string): boolean {
-  const header = commandLine(command);
-  if (!hasHeredoc(header) && !hasHeredoc(normalizeContinuations(header))) return false;
-  if (header.includes("\\\n")) return true;
-  return scanHeredoc(header).unsupported;
+  return rawHeredocScript(command).ambiguous;
 }
 
 interface HeredocCopy {
@@ -968,20 +1038,36 @@ function invocations(command: string): string[][] {
  * Here-document bodies are data and are never scanned as commands.
  *
  * When the split between script and data is unknown — an undecodable header, a
- * continuation in the raw header, or an unquoted body that can move its own
- * terminator — only the lines that are certainly script are checked. The header
- * line always runs: `cat <<\EOF; sudo id` still runs `sudo id`, and a marker's
- * delimiter is only a redirection target. Guessing past that line could deny
- * quoted here-document data, so it is left to manual approval.
+ * continuation in a raw header, or an unquoted body that can move its own
+ * terminator — only the raw command lines that are certainly script are checked.
+ * The header line always runs: `cat <<\EOF; sudo id` still runs `sudo id`, and a
+ * marker's delimiter is only a redirection target. Every header is validated, not
+ * just the first, because a later continued header has the same boundary problem.
+ * Guessing past an undecodable header could deny quoted here-document data, so it
+ * is left to manual approval.
  */
 function denyScript(command: string, depth: number): string | undefined {
   if (FORK_BOMB.test(command)) return DANGEROUS;
-  const script = normalizeContinuations(command);
-  const { lines, certain } = logicalLines(script);
-  // A continuation in the raw header can hide where that header ends, so only its
-  // first line is certain script.
-  const code = hasAmbiguousHeredoc(command) ? 1 : certain;
-  for (const line of lines.slice(0, code)) {
+  const normalized = normalizeContinuations(command);
+  const raw = rawHeredocScript(command);
+  if (raw.ambiguous) {
+    for (const line of raw.lines) {
+      // A line whose own normalization assembles unsupported quoting cannot be
+      // parsed safely; its deny is left to the caller's manual approval.
+      if (hasAssembledUndecodedSyntax(line)) continue;
+      for (const words of invocations(line)) {
+        const reason = denyInvocation(words, depth);
+        if (reason !== undefined) return reason;
+      }
+    }
+    return undefined;
+  }
+  // Normalization can assemble quoting this reader does not decode. The inner
+  // shell could then run a command the projection does not place, so deny
+  // detection stands down; the caller already asks for the surrounding shell.
+  if (hasAssembledUndecodedSyntax(command)) return undefined;
+  const { lines, certain } = logicalLines(normalized);
+  for (const line of lines.slice(0, certain)) {
     for (const words of invocations(line)) {
       const reason = denyInvocation(words, depth);
       if (reason !== undefined) return reason;

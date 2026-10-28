@@ -1,9 +1,9 @@
 import type { ReviewResult } from "./reviewer.js";
 import {
   CONTROL_OPERATORS, DYNAMIC, REDIRECT_OPERATORS, SCRIPT_HOSTS, SHELLS, STATEFUL,
-  denyInvocation, hasAmbiguousDescriptorClose, hasAmbiguousHeredoc, hasHeredoc, hasNonShellWhitespace,
-  heredocMarkers, isReadOnlyInvocation, logicalLines, normalizeContinuations, parseShell, resolveExecutable,
-  stripDescriptorPrefixes,
+  denyInvocation, hasAmbiguousDescriptorClose, hasAssembledUndecodedSyntax, hasHeredoc,
+  hasUndecodedSyntax, heredocMarkers, isReadOnlyInvocation, logicalLines, normalizeContinuations, parseShell,
+  rawHeredocScript, resolveExecutable, stripDescriptorPrefixes,
 } from "./shell-policy.js";
 
 const MAX_COMMAND_CHARS = 4096;
@@ -310,7 +310,7 @@ function analyze(command: string): Verdict {
   // parser behind it) also matches CR, FF, VT, NBSP, and Unicode spaces, which
   // can move a heredoc boundary or turn a midword hash into a comment, so any of
   // them fails closed before normalization, the deny pass, or parsing.
-  if (hasNonShellWhitespace(command)) return { decision: "ask" };
+  //
   // `$[` is the legacy arithmetic expansion: the `<<` inside it is a shift, not
   // a heredoc, so heredoc routing would treat the rest of the script as a body
   // and swallow a trailing command. Extended quoting has the same problem from
@@ -319,21 +319,36 @@ function analyze(command: string): Verdict {
   // is a locale quote this parser does not decode. Reject all three on the raw
   // source before normalization or heredoc routing, conservatively including
   // quoted and heredoc data.
-  if (command.includes("$[") || command.includes("$'") || command.includes('$"'))
+  if (hasUndecodedSyntax(command)) return { decision: "ask" };
+  // Fail closed on any raw heredoc header that normalization cannot be trusted
+  // on: the raw source is the only place its marker and delimiter are still
+  // intact. Every header is validated, not just the first, because a continued
+  // header after a stable body is the same problem. Each raw line before the
+  // ambiguity is certainly script — the header line itself runs before the shell
+  // reads its body — so a deny visible there is mandatory; everything after may
+  // be data and only reaches manual approval.
+  const raw = rawHeredocScript(command);
+  if (raw.ambiguous) {
+    for (const line of raw.lines) {
+      // A line whose own normalization assembles unsupported quoting cannot be
+      // parsed safely; its deny is left to manual approval instead of guessed.
+      if (hasAssembledUndecodedSyntax(line)) continue;
+      // The raw line may still carry a `\`-newline that the shell removes before
+      // it forms this header; removing it here only reaches the deny pass, and
+      // the header line itself is always script.
+      const verdict = analyzeLine(normalizeContinuations(line).trim());
+      if (verdict.decision === "deny") return verdict;
+    }
     return { decision: "ask" };
-  // Fail closed on a heredoc header that normalization cannot be trusted on:
-  // the raw source is the only place its marker and delimiter are still intact.
-  // The header line itself is still script — `cat <<\EOF; sudo id` runs `sudo id`
-  // before the shell ever reads the body — so a deny visible there is mandatory;
-  // everything after that line may be data and only reaches manual approval.
-  if (hasAmbiguousHeredoc(command)) {
-    const header = logicalLines(normalizeContinuations(command)).lines[0] ?? "";
-    const verdict = analyzeLine(header);
-    return verdict.decision === "deny" ? verdict : { decision: "ask" };
   }
-  // Normalize once, before routing: `logicalLines` must split on the newlines
-  // the shell actually treats as separators, and heredoc bodies stay untouched.
+  // Normalization removes `\`-newlines, so the shell can parse an unsupported
+  // form the raw check above could not see: `sort $`+newline+`'\x2doout'` is
+  // `sort -oout` to Bash once the pair is gone. Repeat the whole gate on the text
+  // that is actually routed and parsed, still before any heredoc routing.
   const normalized = normalizeContinuations(command);
+  if (hasUndecodedSyntax(normalized)) return { decision: "ask" };
+  // `logicalLines` must split on the newlines the shell actually treats as
+  // separators, and heredoc bodies stay untouched.
   if (hasHeredoc(normalized)) return analyzeHeredoc(normalized);
   if (normalized.includes("\n")) return analyzeLines(normalized);
   return analyzeLine(normalized);

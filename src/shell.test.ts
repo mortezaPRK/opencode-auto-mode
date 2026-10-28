@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { compositeDecision } from "./classifier.js";
-import { escapeLiteralHashes, hasAmbiguousDescriptorClose, logicalLines, normalizeContinuations, parseShell, stripDescriptorPrefixes } from "./shell-policy.js";
+import { escapeLiteralHashes, hasAmbiguousDescriptorClose, logicalLines, normalizeContinuations, parseShell, rawHeredocScript, stripDescriptorPrefixes } from "./shell-policy.js";
 import { guardShell, shellWords } from "./shell.js";
 
 const unused = async () => { throw new Error("unexpected reviewer call"); };
@@ -208,6 +208,40 @@ describe("shell approval guard", () => {
     for (const command of ["cat <<'EOF'\nx\nEOF\nsudo id", "sudo cat <<'EOF'\nx\nEOF"])
       assert.equal(guardShell([command])?.decision, "deny", command);
   });
+  it("validates every raw heredoc header, not just the first line", () => {
+    // The reported command: the stable body for `A` ends, then the second header
+    // is continued (`<<\`+newline+`'EOF'`). Normalization joins that header before
+    // the scanner sees it, and Bash keeps the backslash in the quoted body, so the
+    // raw `EOF` line terminates it and `sudo id` runs as a command.
+    const reported = "cat <<'A'\na\nA\ncat <<\\\n'EOF'\nx\\\nEOF\nsudo id\nEOF";
+    assert.equal(guardShell([reported])?.decision, "ask");
+    assert.notEqual(guardShell([reported])?.decision, "allow");
+    // The same boundary shape with a read-only tail is still unknown.
+    assert.equal(guardShell(["cat <<'A'\na\nA\ncat <<\\\n'EOF'\nx\\\nEOF\npwd\nEOF"])?.decision, "ask");
+    // A command before the ambiguous header is certainly script, so a deny there
+    // keeps its precedence instead of being downgraded to the ask.
+    assert.equal(guardShell(["cat <<'A'\na\nA\nsudo id\ncat <<\\\n'EOF'\nx\\\nEOF\nEOF"])?.decision, "deny");
+    assert.equal(guardShell(["cat <<'A'\na\nA\nsudo cat <<\\\n'EOF'\nx\\\nEOF\nEOF"])?.decision, "deny");
+    // The same header text inside a quoted body is data: it must neither move the
+    // boundary nor supply a deny.
+    assert.equal(guardShell(["cat <<'EOF'\ncat <<\\\n'EOF'\nsudo id\nEOF"])?.decision, "allow");
+    // A known tail after a stable quoted body keeps its mandatory deny.
+    assert.equal(guardShell(["cat <<'EOF'\nx\nEOF\nsudo id"])?.decision, "deny");
+    // The header of an undecodable heredoc is script even when its body contains
+    // the split quoting the normalized gate rejects, so the header deny stays.
+    assert.equal(guardShell(["cat <<\\EOF; sudo id\n$\\\n'x'\nEOF"])?.decision, "deny");
+    // Split quoting on a later line is not parsed for a deny: in Bash it can be
+    // quoted data, so that line only contributes the ask.
+    assert.equal(guardShell(["pwd\nsort $\\\n'x ; sudo id'\ncat <<\\EOF\nbody\nEOF"])?.decision, "ask");
+    // Nested scripts use the same raw header projection.
+    assert.equal(guardShell(["sh -c 'cat <<\"A\"\na\nA\ncat <<\\\n\"EOF\"\nx\\\nEOF\nsudo id\nEOF'"])
+      ?.decision, "ask");
+    assert.equal(guardShell(["sh -c 'pwd\nsudo id\ncat <<\\\n\"EOF\"\nx\\\nEOF\nEOF'"])?.decision, "deny");
+    // Nested header text inside a quoted body is still data and never a deny.
+    assert.equal(guardShell(["sh -c 'cat <<\"EOF\"\ncat <<\\\n\"EOF\"\nsudo id\nEOF'"])?.decision, "ask");
+    // The nested header deny also survives split quoting in its body.
+    assert.equal(guardShell(["sh -c 'cat <<\\EOF; sudo id\n$\\\n\"x\"\nEOF'"])?.decision, "deny");
+  });
   it("asks for heredoc delimiters the parser cannot decode exactly", () => {
     // A double-quoted delimiter decodes `\\`, `\$`, `` \` `` and `\"`, so the raw
     // text is not the terminator and a tail runs after the decoded one.
@@ -299,6 +333,34 @@ describe("shell approval guard", () => {
     // The same text without extended quoting stays read-only.
     for (const command of ["echo a b", "echo 'a b'", 'echo "a b"'])
       assert.equal(guardShell([command])?.decision, "allow", command);
+  });
+  it("repeats the undecoded-syntax gates after normalization", () => {
+    // The reported command: the raw text has `$`, a `\`-newline, and then a
+    // quoted word, so the raw gate sees no ANSI-C quoting. Bash removes the pair
+    // and parses `sort $'\x2doout' input`, which is `sort -oout input`, while the
+    // guard read the joined word as an operand and fell through to review.
+    const reported = "sort $\\\n'\\x2doout' input";
+    assert.equal(guardShell([reported])?.decision, "ask");
+    assert.notEqual(guardShell([reported])?.decision, "allow");
+    for (const command of ["sort $\\\n'\\x2d'\\\n'oout' input",
+      'sort $\\\n"-oout" input', "echo $\\\n'a b'", 'echo $\\\n"a b"',
+      "echo $\\\n[ 1 + 1 ]", "sort $\\\n'\\x2doout' input ; pwd"])
+      assert.equal(guardShell([command])?.decision, "ask", command);
+    // A nested shell receives the assembled quoting once its outer `\`-newline is
+    // removed, so the outer dynamic shell still has to ask.
+    for (const command of ['sh -c "echo $\\\n\'a b\'"',
+      'bash -c "sort $\\\n\'\\x2doout\' input"',
+      "sh -c 'echo $\\\n\"a b\"'", "sh -c 'sort $\\\n\"-oout\" input'"])
+      assert.equal(guardShell([command])?.decision, "ask", command);
+    // A mandatory deny on another resource still wins over the new ask.
+    assert.equal(guardShell([reported, "sudo id"])?.decision, "deny");
+    // Forms that need no decoding keep their previous verdicts, and a quoted
+    // heredoc body is data rather than a second gate.
+    for (const command of ["sort '\\x2doout' input", 'sort "\\x2doout" input',
+      "sort \\$ '\\x2doout' input", "cat <<'EOF'\nsort $\\\n'\\x2doout' input\nEOF"])
+      assert.equal(guardShell([command])?.decision, "allow", command);
+    assert.equal(guardShell(["sort $ '\\x2doout' input"]), undefined);
+    assert.equal(guardShell(["sort '\\x2doout' input ; sudo id"])?.decision, "deny");
   });
   it("keeps a continued command exactly as dangerous as the command it joins", () => {
     const insert = (command: string, index: number) => `${command.slice(0, index)}\\\n${command.slice(index)}`;
@@ -693,6 +755,19 @@ describe("shell policy edge cases", () => {
     // Bodies are absent from the projection; only the header and tail are script.
     assert.equal(logicalLines("cat <<'EOF'\ntext\nEOF\npwd").lines.some((line) => line.includes("text")), false);
     assert.deepEqual(logicalLines("cat <<'EOF'\nsudo id\nEOF").lines, ["cat <<'EOF'", ""]);
+  });
+  it("projects raw headers up to the first one it cannot decode", () => {
+    // Every header is visited, so a continued later header ends the certain
+    // prefix even though the first header is plain.
+    assert.deepEqual(rawHeredocScript("cat <<'A'\na\nA\ncat <<\\\n'EOF'\nx\\\nEOF\nsudo id\nEOF"),
+      { lines: ["cat <<'A'", "cat <<\\\n'EOF'"], ambiguous: true });
+    // A plain header with a stable body does not end it, and the body is data.
+    assert.deepEqual(rawHeredocScript("cat <<'EOF'\ncat <<\\\n'EOF'\nsudo id\nEOF"),
+      { lines: ["cat <<'EOF'"], ambiguous: false });
+    assert.deepEqual(rawHeredocScript("cat <<'EOF'\nx\nEOF\npwd"),
+      { lines: ["cat <<'EOF'", "pwd"], ambiguous: false });
+    assert.deepEqual(rawHeredocScript("pwd ; sudo id"),
+      { lines: ["pwd ; sudo id"], ambiguous: false });
   });
 
   it("requires review when an unquoted expansion can add arguments", () => {
