@@ -1,7 +1,7 @@
 const MAX_USERS = 10;
 const MAX_TOOLS = 20;
 const MAX_USER_CHARS = 8_000;
-const MAX_ENTRY_CHARS = 500;
+const MAX_ENTRY_BYTES = 500;
 const MAX_TRANSCRIPT_BYTES = 12_000;
 
 interface ToolEntry {
@@ -12,10 +12,6 @@ interface ToolEntry {
 interface Entry {
   role: "user" | "tool";
   text: string;
-}
-
-function truncate(value: string, max: number): string {
-  return value.length > max ? `${value.slice(0, max - 1)}…` : value;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -56,8 +52,11 @@ function formatTool(tool: ToolEntry): { text: string; truncated: boolean } {
     const input = state?.["input"] ?? tool.input;
     const raw = typeof input === "string" ? input : JSON.stringify(input);
     if (raw) {
-      truncated = raw.length > MAX_ENTRY_CHARS;
-      detail = truncate(raw, MAX_ENTRY_CHARS);
+      // Keep the tail as well as the head: written payloads and patches often
+      // carry their constraints at the end. Clip once, on escaped bytes, so a
+      // later UTF-16 length check cannot cut the preserved tail back off.
+      detail = clipEscaped(raw, MAX_ENTRY_BYTES);
+      truncated = detail !== raw;
     }
   } catch {
     detail = "";
@@ -101,9 +100,12 @@ function clipEscaped(value: string, maxBytes: number): string {
   return `${prefixByEscapedBytes(characters, headBudget)}${marker}${suffixByEscapedBytes(characters, budget - headBudget)}`;
 }
 
-function clipChars(value: string, max: number): string {
-  if (value.length <= max) return value;
+/** Clips text to `max` code points, keeping both ends for review evidence. */
+export function clipChars(value: string, max: number): string {
   const characters = Array.from(value);
+  // Compare code points, not UTF-16 units, so astral characters cannot make
+  // this return a longer string than it received.
+  if (characters.length <= max) return value;
   const head = Math.floor(max * 0.6);
   return `${characters.slice(0, head).join("")}…${characters.slice(characters.length - (max - head)).join("")}`;
 }
@@ -111,7 +113,6 @@ function clipChars(value: string, max: number): string {
 interface TranscriptData {
   transcript: string;
   userEvidence: boolean;
-  missingUserText: boolean;
   notes: string[];
 }
 
@@ -148,17 +149,15 @@ function renderTranscript(entries: Entry[], toolTruncated: boolean, userClipped:
 function buildTranscript(messages: unknown[]): TranscriptData {
   const entries: Entry[] = [];
   let userEvidence = false;
-  let missingUserText = false;
   let userClipped = false;
   let toolTruncated = false;
   for (const message of messages) {
     const record = asRecord(message);
     if (record?.type === "user") {
       const text = userText(message);
-      if (text === undefined) {
-        missingUserText = true;
-        continue;
-      }
+      // An empty turn (attachments only, synthetic input) says nothing about
+      // authorization; it must not invalidate the rest of the session.
+      if (text === undefined) continue;
       userEvidence = true;
       const clipped = clipChars(text, MAX_USER_CHARS);
       if (clipped !== text) userClipped = true;
@@ -171,7 +170,7 @@ function buildTranscript(messages: unknown[]): TranscriptData {
     }
   }
   const rendered = renderTranscript(entries, toolTruncated, userClipped);
-  return { transcript: rendered.transcript, userEvidence, missingUserText, notes: rendered.notes };
+  return { transcript: rendered.transcript, userEvidence, notes: rendered.notes };
 }
 
 export interface ReviewContext { transcript: string; complete: boolean; reason?: string; notes?: string[] }
@@ -179,6 +178,8 @@ export interface ReviewContext { transcript: string; complete: boolean; reason?:
 export function extractReviewContext(messages: unknown[]): ReviewContext {
   const attachment = messages.some((message) => {
     const record = asRecord(message);
+    // Skill messages carry model-facing instructions the text-only reviewer cannot see.
+    if (record?.type === "skill") return true;
     if (record?.type !== "user") return false;
     // These attachments carry evidence that the text-only reviewer cannot see.
     return ["files", "skills", "agents"].some((key) =>
@@ -189,11 +190,6 @@ export function extractReviewContext(messages: unknown[]): ReviewContext {
     return {
       transcript: data.transcript, complete: false, notes: data.notes,
       reason: "User authorization includes attachments that cannot be reviewed automatically",
-    };
-  if (data.missingUserText)
-    return {
-      transcript: data.transcript, complete: false, notes: data.notes,
-      reason: "A user message has no text that can be reviewed",
     };
   if (!data.userEvidence)
     return {

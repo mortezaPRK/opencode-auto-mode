@@ -31,8 +31,14 @@ describe("classify", () => {
     }
   });
 
-  it("sends chained or redirected commands to review as one action", () => {
-    const result = classify("shell", ["git status && rm -rf /tmp/scratch"]);
+  it("uses the shell guard for shell tiers", () => {
+    assert.equal(classify("shell", ["rg sudo src"]).tier, "auto-allow");
+    assert.equal(classify("shell", ["sort -o /tmp/out file"]).tier, "review");
+    assert.equal(classify("shell", ["rg --pre ./p x ."]).tier, "review");
+    assert.equal(classify("shell", ["echo 'chmod 777'"]).tier, "auto-allow");
+  });
+
+  it("sends chained or redirected commands to review as one action", () => {    const result = classify("shell", ["git status && rm -rf /tmp/scratch"]);
     assert.equal(result.tier, "review");
     assert.match(result.reason, /one action/);
   });

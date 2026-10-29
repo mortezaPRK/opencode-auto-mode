@@ -1,5 +1,6 @@
 import { randomBytes } from "node:crypto";
 import type { AuditRecord } from "./audit.js";
+import { sanitizeRecord } from "./audit.js";
 import type { OtlpOptions } from "./otlp.js";
 import type { StageResult } from "./reviewer.js";
 
@@ -55,20 +56,25 @@ export function createTraceExporter(setting: boolean | OtlpOptions | undefined, 
       return {
         traceID, spanID, attempts,
         finish(record) {
-          const shared = [attribute("review.id", record.reviewID), attribute("session.id", record.sessionID)];
+          // Both log sinks sanitize before serialising; traces are a third sink
+          // and must not export unbounded record fields.
+          const safe = sanitizeRecord(record);
+          const shared = [attribute("review.id", safe.reviewID), attribute("session.id", safe.sessionID)];
           const spans = [{
             traceId: traceID, spanId: spanID, name: "auto_mode.review", kind: 1,
-            startTimeUnixNano: nano(startedAt), endTimeUnixNano: nano(startedAt + record.durationMs),
-            attributes: [...shared, attribute("action", record.action), attribute("agent", record.agent ?? ""),
-              attribute("decision", record.decision), attribute("stage", record.stage)],
-            status: { code: record.error ? 2 : 1 },
+            startTimeUnixNano: nano(startedAt), endTimeUnixNano: nano(startedAt + safe.durationMs),
+            attributes: [...shared, attribute("action", safe.action), attribute("agent", safe.agent ?? ""),
+              attribute("decision", safe.decision), attribute("stage", safe.stage),
+              ...(safe.errorKind === undefined ? [] : [attribute("error.kind", safe.errorKind)])],
+            status: { code: safe.error ? 2 : 1 },
           }, ...attempts.map((attempt) => ({
             traceId: traceID, spanId: randomBytes(8).toString("hex"), parentSpanId: spanID,
             name: "auto_mode.classifier", kind: 1,
             startTimeUnixNano: nano(attempt.startedAt), endTimeUnixNano: nano(attempt.startedAt + attempt.durationMs),
             attributes: [...shared, attribute("classifier.index", attempt.index), attribute("classifier.type", attempt.type),
-              attribute("model", attempt.model ?? ""), attribute("decision", attempt.result.decision)],
-            status: { code: 1 },
+              attribute("model", attempt.model ?? ""), attribute("decision", attempt.result.decision),
+              ...(attempt.result.errorKind === undefined ? [] : [attribute("error.kind", attempt.result.errorKind)])],
+            status: { code: attempt.result.errorKind === undefined ? 1 : 2 },
           }))];
           const body = JSON.stringify({ resourceSpans: [{
             resource: { attributes: [attribute("service.name", "opencode-auto-mode")] },

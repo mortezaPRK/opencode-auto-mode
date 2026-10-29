@@ -21,10 +21,20 @@ if (flag("help")) {
 }
 
 const dbPath = opt("db") ?? path.join(os.homedir(), ".local/share/opencode/opencode.db");
-const configPath = opt("config") ?? path.join(os.homedir(), ".config/opencode/opencode.json");
-const days = Number(opt("days") ?? 14);
+const defaultConfig = [".config/opencode/opencode.jsonc", ".config/opencode/opencode.json"]
+  .map((relative) => path.join(os.homedir(), relative))
+  .find((candidate) => fs.existsSync(candidate));
+const configPath = opt("config") ?? defaultConfig ?? path.join(os.homedir(), ".config/opencode/opencode.json");
+const days = positiveCount(opt("days"), 14, "--days");
 const agentFilter = opt("agent") ?? "any";
-const show = Number(opt("show") ?? 25);
+const show = positiveCount(opt("show"), 25, "--show");
+
+function positiveCount(raw: string | undefined, fallback: number, name: string): number {
+  if (raw === undefined) return fallback;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value <= 0) throw new Error(`${name} must be a positive whole number`);
+  return value;
+}
 
 function stripJsonc(text: string): string {
   let out = "";

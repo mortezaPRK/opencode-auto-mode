@@ -6,6 +6,21 @@ import { parseOptions } from "./config.js";
 const record = { ts: "2026-10-23T10:00:00.000Z", reviewID: "r", sessionID: "s", agent: "build", action: "shell", resources: ["ls"], hostEffect: "ask", decision: "deny", stage: "static", reason: "no", durationMs: 4 };
 
 describe("OTLP exporter", () => {
+  it("bounds records the same way for OTLP as for the local audit log", () => {
+    const resources = Array.from({ length: 20 }, () => "r".repeat(900));
+    const log = toLogRecord({ ...record, resources, reason: "z".repeat(2_000), errorDetail: "e".repeat(2_000), errorKind: "provider" });
+    const attributes = Object.fromEntries(log.attributes.map((entry: { key: string; value: { stringValue?: string } }) => [entry.key, entry.value.stringValue]));
+    assert.equal((attributes.resources as string).split(" ; ").length, 16);
+    for (const resource of (attributes.resources as string).split(" ; ")) assert.ok(resource.length <= 512);
+    assert.ok((log.body.stringValue as string).length <= 512);
+    assert.ok((attributes["error.detail"] as string).length <= 512);
+    assert.equal(attributes["error.kind"], "provider");
+  });
+  it("rejects an unknown failure kind instead of exporting it", () => {
+    const log = toLogRecord({ ...record, error: true, errorKind: "ATTACKER_CONTROLLED" as never });
+    const kind = log.attributes.find((entry: { key: string }) => entry.key === "error.kind");
+    assert.equal(kind?.value.stringValue, "provider");
+  });
   it("is off unless configured and has an endpoint", () => {
     assert.equal(createOtlpExporter(undefined, {}), undefined);
     assert.equal(createOtlpExporter(false, { OPENCODE_OTLP_ENDPOINT: "http://x" }), undefined);
