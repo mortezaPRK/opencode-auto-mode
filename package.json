@@ -47,7 +47,7 @@
     "@opencode/ai": "2.1.4",
     "@opencode/plugin": "2.2.0",
     "@opencode/schema": "2.2.0",
-    "effect": "4.0.6",
+    "effect": "4.0.1",
     "shell-quote": "1.12.0"
   },
   "peerDependencies": {
