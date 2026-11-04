@@ -1,41 +1,51 @@
-import type { AutoModeDecision, AutoModeStatus } from "./rpc.js";
+import {
+  MAX_STATUS_ACTION_CHARS,
+  MAX_STATUS_REASON_CHARS,
+  MAX_STATUS_REVIEWING,
+  MAX_STATUS_STAGE_CHARS,
+  type AutoModeCounts,
+  type AutoModeDecision,
+  type AutoModeErrorKind,
+  type AutoModeMode,
+  type AutoModeStatus,
+} from "./rpc.js";
 
-const MAX_RECENT = 100;
-// Match the audit record bounds so live status and durable history describe
-// the same action, not an unbounded copy of the permission event.
-const MAX_ACTION_CHARS = 128;
-const MAX_STAGE_CHARS = 64;
-const MAX_REASON_CHARS = 200;
-const MAX_REVIEWING = 256;
-
-function clip(value: string, max = MAX_REASON_CHARS): string {
-  // Count code points, not UTF-16 units, so clipping cannot cut a surrogate
-  // pair in half.
+function clip(value: string, max = MAX_STATUS_REASON_CHARS): string {
+  // Count code points so clipping cannot split a surrogate pair.
   const characters = Array.from(value);
   return characters.length > max ? `${characters.slice(0, max - 1).join("")}…` : value;
 }
 
-export interface StatusTracker {
-  start(sessionID: string, reviewID: string, at: number): void;
-  finish(decision: Omit<AutoModeDecision, "reason"> & { reason: string }): AutoModeDecision;
-  snapshot(input: { enabled: boolean; configError?: string; classifiers: string[]; reviewTimeoutMs: number; sessionID?: string }): AutoModeStatus;
-  recent(limit: number, sessionID?: string): AutoModeDecision[];
+function counts(value: AutoModeCounts | undefined): AutoModeCounts {
+  // Rebuild exactly three counters so arbitrary stored/transport keys never leak.
+  return { allow: value?.allow ?? 0, ask: value?.ask ?? 0, deny: value?.deny ?? 0 };
 }
 
-/**
- * Small in-memory view of AutoMode for clients. It holds no prompts and is
- * bounded in both entries and text so a long session cannot grow it without
- * limit; durable history stays in the audit log.
- */
+export interface StatusSnapshotInput {
+  enabled: boolean;
+  mode: AutoModeMode;
+  configError?: string;
+  errorKind?: AutoModeErrorKind;
+  reviewTimeoutMs: number;
+  sessionID?: string;
+  /** Today's audit counts, supplied by the server rather than accumulated in UI memory. */
+  counts?: AutoModeCounts;
+  breaker?: boolean;
+}
+
+export interface StatusTracker {
+  start(sessionID: string, reviewID: string, at: number): void;
+  finish(decision: AutoModeDecision): AutoModeDecision;
+  snapshot(input: StatusSnapshotInput): AutoModeStatus;
+}
+
+/** Bounded active-review tracking. Finished decisions are not retained. */
 export function createStatusTracker(): StatusTracker {
-  // Keyed by review rather than session: a session can ask about several
-  // actions at once, and finishing one must not hide the others.
   const reviewing = new Map<string, { sessionID: string; startedAt: number }>();
-  let recent: AutoModeDecision[] = [];
 
   return {
     start(sessionID, reviewID, at) {
-      if (reviewing.size >= MAX_REVIEWING && !reviewing.has(reviewID)) {
+      if (reviewing.size >= MAX_STATUS_REVIEWING && !reviewing.has(reviewID)) {
         const oldest = reviewing.keys().next().value;
         if (oldest !== undefined) reviewing.delete(oldest);
       }
@@ -43,30 +53,33 @@ export function createStatusTracker(): StatusTracker {
     },
     finish(decision) {
       reviewing.delete(decision.reviewID);
-      const entry: AutoModeDecision = {
-        ...decision,
-        action: clip(decision.action, MAX_ACTION_CHARS),
-        stage: clip(decision.stage, MAX_STAGE_CHARS),
+      // Return only the bounded live-decision surface; never retain arbitrary
+      // record fields such as removed rule or shadow metadata.
+      return {
+        reviewID: decision.reviewID,
+        sessionID: decision.sessionID,
+        action: clip(decision.action, MAX_STATUS_ACTION_CHARS),
+        decision: clip(decision.decision, MAX_STATUS_STAGE_CHARS),
+        stage: clip(decision.stage, MAX_STATUS_STAGE_CHARS),
         reason: clip(decision.reason),
+        durationMs: decision.durationMs,
+        at: decision.at,
+        ...(decision.errorKind === undefined ? {} : { errorKind: clip(decision.errorKind, MAX_STATUS_STAGE_CHARS) }),
       };
-      recent = [...recent, entry].slice(-MAX_RECENT);
-      return entry;
     },
     snapshot(input) {
       return {
         enabled: input.enabled,
+        mode: input.mode,
         ...(input.configError === undefined ? {} : { configError: clip(input.configError) }),
-        classifiers: input.classifiers,
+        ...(input.errorKind === undefined ? {} : { errorKind: input.errorKind }),
         reviewTimeoutMs: input.reviewTimeoutMs,
         reviewing: [...reviewing.entries()]
           .filter(([, entry]) => input.sessionID === undefined || entry.sessionID === input.sessionID)
           .map(([reviewID, entry]) => ({ sessionID: entry.sessionID, reviewID, startedAt: entry.startedAt })),
-        recent: input.sessionID === undefined ? recent.slice(-20) : recent.filter((entry) => entry.sessionID === input.sessionID).slice(-20),
+        counts: counts(input.counts),
+        ...(input.breaker === undefined ? {} : { breaker: input.breaker }),
       };
-    },
-    recent(limit, sessionID) {
-      const matches = sessionID === undefined ? recent : recent.filter((entry) => entry.sessionID === sessionID);
-      return matches.slice(-limit);
     },
   };
 }

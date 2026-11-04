@@ -197,6 +197,465 @@ export function resolveExecutable(words: readonly string[]): { name: string; ind
   return index < words.length ? { name: basename(words[index]), index } : undefined;
 }
 
+/** Commands whose non-option operands are files they read or modify. */
+const PATH_OPERAND_COMMANDS = new Set(["cat", "less", "more", "head", "tail", "strings", "xxd", "od",
+  "hexdump", "file", "stat", "wc", "md5sum", "diff", "sort", "uniq", "cut", "bat", "cp", "mv", "rm",
+  "chmod", "chown", "truncate", "install", "open"]);
+/** Commands whose first non-option operand is a pattern and whose rest are paths. */
+const PATTERN_FIRST_COMMANDS = new Set(["grep", "rg"]);
+/** `shasum`, `sha1sum`, `sha256sum`, `sha384sum`, `sha512sum`. */
+const CHECKSUM_COMMAND = /^(?:shasum|sha(?:1|224|256|384|512)sum)$/;
+
+/** How a value-taking option consumes its value: pattern data, or a file path. */
+type ValueRole = "data" | "path";
+
+/**
+ * Known long options and the role of their value, used for exact matches and
+ * unambiguous abbreviations: `--reg=.` is `--regexp=`, `--fil=` is `--file=`.
+ * `data` values are patterns, types, encodings, labels, formats or numbers and
+ * must never be read as paths; `path` values name files.
+ */
+const LONG_OPTION_VALUES = new Map<string, ValueRole>([
+  // grep
+  ["--regexp", "data"], ["--file", "path"], ["--exclude", "data"], ["--include", "data"],
+  ["--exclude-dir", "data"], ["--include-dir", "data"], ["--exclude-from", "path"],
+  ["--ignore-file", "path"],
+  ["--label", "data"], ["--directories", "data"], ["--devices", "data"], ["--binary-files", "data"],
+  ["--after-context", "data"], ["--before-context", "data"], ["--context", "data"], ["--max-count", "data"],
+  // rg
+  ["--type", "data"], ["--type-not", "data"], ["--type-add", "data"], ["--type-clear", "data"],
+  ["--encoding", "data"], ["--replace", "data"], ["--glob", "data"], ["--iglob", "data"],
+  ["--max-columns", "data"], ["--threads", "data"], ["--max-depth", "data"],
+  ["--sort", "data"], ["--sortr", "data"], ["--field-match-separator", "data"],
+  ["--field-context-separator", "data"], ["--context-separator", "data"],
+  // sed
+  ["--expression", "data"], ["--line-length", "data"],
+  // jq
+  ["--from-file", "path"],
+  // git
+  ["--grep", "data"], ["--format", "data"],
+  // sort: a file of random bytes; value options that must not shift a path.
+  ["--random-source", "path"], ["--key", "data"], ["--field-separator", "data"],
+  ["--batch-size", "data"], ["--buffer-size", "data"], ["--parallel", "data"],
+  // diff: a file compared from/to; formats and labels are data.
+  ["--to-file", "path"], ["--line-format", "data"], ["--old-line-format", "data"],
+  ["--new-line-format", "data"], ["--unchanged-line-format", "data"], ["--width", "data"],
+  ["--horizon-lines", "data"], ["--palette", "data"], ["--ignore-matching-lines", "data"],
+  // file: an alternate magic file.
+  ["--magic-file", "path"],
+  // tree: an input file of paths.
+  ["--gitfile", "path"],
+  // Writing, temporary, program and library paths; attached values are still
+  // file operands for the scope and symlink checks. jq's --arg/--argjson are
+  // data names, kept exact so `--arg` does not abbreviate to `--argfile`.
+  ["--output", "path"], ["--temporary-directory", "path"], ["--compress-program", "path"],
+  ["--library-path", "path"], ["--slurpfile", "path"], ["--rawfile", "path"], ["--argfile", "path"],
+  ["--arg", "data"], ["--argjson", "data"],
+]);
+
+/** Resolve a long option or its unambiguous abbreviation, when it is known. */
+export function resolveLongOption(option: string): string | undefined {
+  if (LONG_OPTION_VALUES.has(option)) return option;
+  if (!option.startsWith("--") || option.length <= 2) return undefined;
+  const matches = [...LONG_OPTION_VALUES.keys()].filter((name) => name.startsWith(option));
+  return matches.length === 1 ? matches[0] : undefined;
+}
+
+/** True when a long option's value is data this policy must not treat as a path. */
+export function isDataOption(option: string): boolean {
+  const resolved = resolveLongOption(option);
+  return resolved !== undefined && LONG_OPTION_VALUES.get(resolved) === "data";
+}
+
+/** Value-taking letters for `grep -A 2`, `-m 1`, `-d skip`, `-e PATTERN`, `-f FILE`. */
+const GREP_SHORT_VALUES: Record<string, ValueRole> = {
+  e: "data", f: "path", A: "data", B: "data", C: "data", m: "data", d: "data", D: "data",
+};
+/** Value-taking letters for `rg -t ts`, `-g GLOB`, `-e PATTERN`, `-f FILE`, ... */
+const RG_SHORT_VALUES: Record<string, ValueRole> = {
+  e: "data", f: "path", g: "data", t: "data", T: "data", E: "data", j: "data", M: "data",
+  r: "data", A: "data", B: "data", C: "data", m: "data",
+};
+/** sed's expression/script files and the numeric line length. */
+const SED_SHORT_VALUES: Record<string, ValueRole> = { e: "data", f: "path", l: "data" };
+/** jq's filter and library files. */
+const JQ_SHORT_VALUES: Record<string, ValueRole> = { f: "path", L: "path" };
+/** Numeric/format/size values of the plain readers and file tools. */
+const PLAIN_SHORT_VALUES: Record<string, Record<string, ValueRole>> = {
+  head: { n: "data", c: "data" },
+  tail: { n: "data", c: "data", s: "data" },
+  sort: { k: "data", t: "data", S: "data", o: "path", T: "path" },
+  uniq: { f: "data", s: "data", w: "data" },
+  diff: { U: "data", C: "data", I: "data", x: "data", X: "path", L: "data" },
+  cut: { d: "data", f: "data", b: "data", c: "data" },
+  xxd: { l: "data", s: "data", c: "data", g: "data" },
+  od: { N: "data", j: "data", t: "data" },
+  hexdump: { n: "data", s: "data", e: "data", f: "path" },
+  strings: { n: "data", t: "data", e: "data" },
+  stat: { c: "data" },
+  less: { p: "data", o: "path", b: "data", h: "data", j: "data", x: "data", y: "data", z: "data" },
+  more: { n: "data" },
+  open: { a: "data", b: "data" },
+  file: { f: "path", m: "path", e: "data", F: "data" },
+};
+/** Git subcommands whose operands this policy can place. */
+const GIT_HANDLED = new Set(["commit", "tag", "branch", "checkout", "switch", "push", "fetch"]);
+const GIT_LONG_VALUES: Record<string, Record<string, ValueRole>> = {
+  commit: { "--message": "data", "--file": "path", "--author": "data", "--date": "data",
+    "--reuse-message": "data", "--reedit-message": "data", "--fixup": "data", "--squash": "data" },
+  tag: { "--message": "data", "--file": "path" },
+  branch: { "--contains": "data", "--points-at": "data", "--merged": "data", "--no-merged": "data" },
+  checkout: { "--orphan": "data", "--conflict": "data" },
+  switch: { "--orphan": "data", "--conflict": "data" },
+  push: { "--push-option": "data", "--repo": "path" },
+  fetch: { "--depth": "data", "--deepen": "data", "--upload-pack": "path" },
+};
+const GIT_SHORT_VALUES: Record<string, Record<string, ValueRole>> = {
+  commit: { m: "data", F: "path", C: "data", c: "data" },
+  tag: { m: "data", F: "path" },
+  branch: { m: "data", M: "data", c: "data", C: "data" },
+  checkout: { b: "data", B: "data" },
+  switch: { c: "data", C: "data" },
+};
+
+/**
+ * Which words of a simple command are files and which are data.
+ *
+ * A shell word is data or a path depending on the position a command gives it:
+ * `cat auth` reads a file named `auth`, `grep auth file` searches for `auth`,
+ * `sed s/.env/.x/p file` runs a script, and `jq .name file` evaluates a filter.
+ * `paths` are indices of standalone file operands, `data` indices of pattern,
+ * script, filter or option-value words, and `pathValues` are file values
+ * attached to an option (`-fFILE`, `--file=FILE`). Every other word (the
+ * executable, ordinary options) is neither; callers keep their own check for
+ * it. Commands outside the grammar below report no roles at all.
+ */
+export interface OperandRoles {
+  /** Indices of words the command consumes as file paths. */
+  paths: number[];
+  /** Indices of words the command consumes as data. */
+  data: number[];
+  /** File values attached to an option (`-fFILE`, `--file=FILE`). */
+  pathValues: string[];
+}
+
+interface RoleSets { paths: Set<number>; data: Set<number>; pathValues: string[] }
+
+interface ShortValue { letter: string; role: ValueRole; attached?: string }
+
+/** Splits `--name=value` into its option name and attached value. */
+function longOptionPart(word: string): { option: string; attached?: string } | undefined {
+  if (!word.startsWith("--") || word.length <= 2) return undefined;
+  const separator = word.indexOf("=");
+  return separator === -1 ? { option: word } : { option: word.slice(0, separator), attached: word.slice(separator + 1) };
+}
+
+/**
+ * Reads a short-option bundle letter by letter. The first letter that takes a
+ * value wins: the rest of the word is its attached value (`-ifpats` is `-i -f
+ * pats`), or the next word when the bundle ends at that letter (`-if pats`).
+ * Unknown letters are ordinary flags.
+ */
+function shortOption(word: string, table: Record<string, ValueRole>): ShortValue | undefined {
+  if (!word.startsWith("-") || word.startsWith("--") || word.length < 2) return undefined;
+  const letters = word.slice(1);
+  for (let index = 0; index < letters.length; index++) {
+    const role = table[letters[index]];
+    if (role === undefined) continue;
+    const attached = letters.slice(index + 1);
+    return { letter: letters[index], role, attached: attached.length ? attached : undefined };
+  }
+  return undefined;
+}
+
+/**
+ * The flag letters of one short bundle, stopping at the first letter that takes
+ * a value. An attached value (`-fpatterns`, `-Xcredentials`) is data or a path,
+ * never a flag, so recursion checks cannot be spoofed by a value's spelling.
+ */
+function shortFlags(word: string, table: Record<string, ValueRole>): string {
+  if (!word.startsWith("-") || word.startsWith("--") || word.length < 2) return "";
+  const letters = word.slice(1);
+  let position = 0;
+  while (position < letters.length && table[letters[position]] === undefined) position++;
+  return letters.slice(0, position);
+}
+
+/** Marks the value a short option consumes and returns the new word index. */
+function takeShortValue(parsed: ShortValue, index: number, base: number,
+  args: readonly string[], roles: RoleSets): number {
+  if (parsed.role === "path") {
+    if (parsed.attached !== undefined) roles.pathValues.push(parsed.attached);
+    else if (index + 1 < args.length) {
+      roles.paths.add(base + index + 1);
+      return index + 1;
+    }
+  } else if (parsed.attached === undefined && index + 1 < args.length) {
+    roles.data.add(base + index + 1);
+    return index + 1;
+  }
+  return index;
+}
+
+/** Marks attached (`--grep=X`) and separate (`--grep X`) data option values. */
+function dataOptionRoles(args: readonly string[], base: number): RoleSets {
+  const roles: RoleSets = { paths: new Set(), data: new Set(), pathValues: [] };
+  let endOfOptions = false;
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index];
+    if (endOfOptions) continue;
+    if (arg === "--") { endOfOptions = true; continue; }
+    const part = longOptionPart(arg);
+    if (part === undefined) continue;
+    const resolved = resolveLongOption(part.option);
+    if (resolved === undefined || LONG_OPTION_VALUES.get(resolved) !== "data") continue;
+    if (part.attached !== undefined) { roles.data.add(base + index); continue; }
+    if (index + 1 < args.length) { roles.data.add(base + index + 1); index++; }
+  }
+  return roles;
+}
+
+/** Marks attached (`--file=X`) path option values as file operands. */
+function pathOptionRoles(args: readonly string[], roles: RoleSets): void {
+  let endOfOptions = false;
+  for (const arg of args) {
+    if (endOfOptions) continue;
+    if (arg === "--") { endOfOptions = true; continue; }
+    const part = longOptionPart(arg);
+    if (part === undefined || part.attached === undefined) continue;
+    const resolved = resolveLongOption(part.option);
+    if (resolved === undefined || LONG_OPTION_VALUES.get(resolved) !== "path") continue;
+    roles.pathValues.push(part.attached);
+  }
+}
+
+/** Adds every non-option positional as a path (`cat`, `sort`, checksums, ...). */
+function plainRoles(name: string, args: readonly string[], base: number, roles: RoleSets): void {
+  const table = PLAIN_SHORT_VALUES[name] ?? {};
+  let endOfOptions = false;
+  for (let index = 0; index < args.length; index++) {
+    const word = args[index];
+    if (!endOfOptions && word === "--") { endOfOptions = true; continue; }
+    if (!endOfOptions && word.startsWith("-") && word.length > 1) {
+      if (word.startsWith("--")) continue;
+      const parsed = shortOption(word, table);
+      if (parsed !== undefined) index = takeShortValue(parsed, index, base, args, roles);
+      continue;
+    }
+    if (roles.data.has(base + index)) continue;
+    roles.paths.add(base + index);
+  }
+}
+
+/**
+ * `grep`/`rg`: the first positional is a pattern unless `-e`/`--regexp` already
+ * supplied one, and `-f`/`--file` names a pattern file. Every positional after
+ * a pattern is a path.
+ */
+function grepRoles(name: string, args: readonly string[], base: number, roles: RoleSets): void {
+  const table = name === "rg" ? RG_SHORT_VALUES : GREP_SHORT_VALUES;
+  let seenPattern = false;
+  let endOfOptions = false;
+  for (let index = 0; index < args.length; index++) {
+    const word = args[index];
+    if (!endOfOptions && word === "--") { endOfOptions = true; continue; }
+    if (!endOfOptions && word.startsWith("-") && word.length > 1) {
+      if (word.startsWith("--")) {
+        const part = longOptionPart(word);
+        const resolved = part === undefined ? undefined : resolveLongOption(part.option);
+        if (resolved === "--regexp") { seenPattern = true; continue; }
+        // Any path-valued long option names a file: `--file` (pattern file),
+        // `--exclude-from`/`--ignore-file` (files of patterns). Only `--file`
+        // supplies the pattern; the others leave the next positional a pattern.
+        if (resolved !== undefined && LONG_OPTION_VALUES.get(resolved) === "path") {
+          if (part?.attached !== undefined) roles.pathValues.push(part.attached);
+          else if (index + 1 < args.length) roles.paths.add(base + ++index);
+          if (resolved === "--file") seenPattern = true;
+          continue;
+        }
+        continue;
+      }
+      const parsed = shortOption(word, table);
+      if (parsed === undefined) continue;
+      index = takeShortValue(parsed, index, base, args, roles);
+      if (parsed.letter === "e" || parsed.letter === "f") seenPattern = true;
+      continue;
+    }
+    if (roles.data.has(base + index)) continue;
+    if (!seenPattern) { roles.data.add(base + index); seenPattern = true; continue; }
+    roles.paths.add(base + index);
+  }
+}
+
+/**
+ * `sed`: the first positional is the script unless `-e`/`--expression` supplied
+ * one. `-f`/`--file` names a script file and also means every positional is a
+ * file; `-l`/`--line-length` takes a number that is not an operand.
+ */
+function sedRoles(args: readonly string[], base: number, roles: RoleSets): void {
+  let scripted = false;
+  let endOfOptions = false;
+  for (let index = 0; index < args.length; index++) {
+    const word = args[index];
+    if (!endOfOptions && word === "--") { endOfOptions = true; continue; }
+    if (!endOfOptions && word.startsWith("-") && word.length > 1) {
+      if (word.startsWith("--")) {
+        const part = longOptionPart(word);
+        const resolved = part === undefined ? undefined : resolveLongOption(part.option);
+        if (resolved === "--expression") { scripted = true; continue; }
+        if (resolved === "--file") {
+          if (part?.attached !== undefined) roles.pathValues.push(part.attached);
+          else if (index + 1 < args.length) roles.paths.add(base + ++index);
+          scripted = true;
+          continue;
+        }
+        continue;
+      }
+      const parsed = shortOption(word, SED_SHORT_VALUES);
+      if (parsed === undefined) continue;
+      index = takeShortValue(parsed, index, base, args, roles);
+      if (parsed.letter === "e" || parsed.letter === "f") scripted = true;
+      continue;
+    }
+    if (roles.data.has(base + index)) continue;
+    if (!scripted) { roles.data.add(base + index); scripted = true; continue; }
+    roles.paths.add(base + index);
+  }
+}
+
+/**
+ * `jq`: the first positional is the filter unless `-f`/`--from-file` supplies
+ * one. All value-taking options are stated explicitly, so a bare `1` after a
+ * flag (`-e`, `-r`, `--tab`) is the filter. `--arg`/`--argjson` take a name and
+ * a value as data, `--slurpfile`/`--rawfile`/`--argfile` take a name (data) and
+ * a file (path), and `--args`/`--jsonargs` make positionals string data.
+ */
+function jqRoles(args: readonly string[], base: number, roles: RoleSets): void {
+  let filterSupplied = false;
+  let positionalData = false;
+  let endOfOptions = false;
+  const takeValues = (index: number, count: number, role: ValueRole): number => {
+    let taken = 0;
+    while (taken < count && index + 1 < args.length) {
+      const next = base + ++index;
+      (role === "data" ? roles.data : roles.paths).add(next);
+      taken++;
+    }
+    return index;
+  };
+  for (let index = 0; index < args.length; index++) {
+    const word = args[index];
+    if (!endOfOptions && word === "--") { endOfOptions = true; continue; }
+    if (!endOfOptions && word.startsWith("-") && word.length > 1) {
+      if (word.startsWith("--")) {
+        const part = longOptionPart(word);
+        const option = part?.option;
+        const resolved = part === undefined ? undefined : resolveLongOption(part.option);
+        if (resolved === "--from-file") {
+          if (part?.attached !== undefined) roles.pathValues.push(part.attached);
+          else if (index + 1 < args.length) roles.paths.add(base + ++index);
+          filterSupplied = true;
+          continue;
+        }
+        if (option === "--arg" || option === "--argjson") { index = takeValues(index, 2, "data"); continue; }
+        if (option === "--slurpfile" || option === "--rawfile" || option === "--argfile") {
+          index = takeValues(index, 1, "data");
+          index = takeValues(index, 1, "path");
+          continue;
+        }
+        if (option === "--args" || option === "--jsonargs") { positionalData = true; continue; }
+        if (option === "--library-path") { index = takeValues(index, 1, "path"); continue; }
+        if (option === "--indent") { index = takeValues(index, 1, "data"); continue; }
+        continue;
+      }
+      const parsed = shortOption(word, JQ_SHORT_VALUES);
+      if (parsed !== undefined) {
+        index = takeShortValue(parsed, index, base, args, roles);
+        if (parsed.letter === "f") filterSupplied = true;
+      }
+      continue;
+    }
+    if (roles.data.has(base + index)) continue;
+    if (positionalData) { roles.data.add(base + index); continue; }
+    if (!filterSupplied) { roles.data.add(base + index); filterSupplied = true; continue; }
+    roles.paths.add(base + index);
+  }
+}
+
+/**
+ * Git subcommands whose operands are refs, messages or other data rather than
+ * files: `commit -m` messages, `branch <name>`, `checkout`/`switch` branches,
+ * `push`/`fetch` refspecs and `tag` names. `git add .env` stays an ordinary
+ * word, so a file operand is still protected once `--` ends ref parsing.
+ */
+function gitRoles(args: readonly string[], base: number, roles: RoleSets): void {
+  const subcommand = args[0];
+  if (subcommand === undefined || !GIT_HANDLED.has(subcommand)) return;
+  const rest = args.slice(1);
+  const long = GIT_LONG_VALUES[subcommand] ?? {};
+  const short = GIT_SHORT_VALUES[subcommand] ?? {};
+  const refs = subcommand === "tag" || subcommand === "branch" || subcommand === "push" || subcommand === "fetch";
+  let endOfOptions = false;
+  for (let index = 0; index < rest.length; index++) {
+    const word = rest[index];
+    const position = base + 1 + index;
+    if (!endOfOptions && word === "--") { endOfOptions = true; continue; }
+    if (!endOfOptions && word.startsWith("--") && word.length > 2) {
+      const part = longOptionPart(word);
+      const role = part === undefined ? undefined : long[part.option];
+      if (part === undefined || role === undefined) continue;
+      if (part.attached !== undefined) {
+        if (role === "path") roles.pathValues.push(part.attached);
+        else roles.data.add(position);
+        continue;
+      }
+      if (index + 1 < rest.length) {
+        const next = base + 1 + ++index;
+        (role === "data" ? roles.data : roles.paths).add(next);
+      }
+      continue;
+    }
+    if (!endOfOptions && word.startsWith("-") && word.length > 1) {
+      const parsed = shortOption(word, short);
+      if (parsed !== undefined) index = takeShortValue(parsed, index, base + 1, rest, roles);
+      continue;
+    }
+    if (roles.data.has(position)) continue;
+    // `checkout`/`switch` treat positionals before `--` as refs and after it as
+    // paths; `commit` positionals are always paths.
+    if (refs || ((subcommand === "checkout" || subcommand === "switch") && !endOfOptions))
+      roles.data.add(position);
+    else roles.paths.add(position);
+  }
+}
+
+/** The path and data roles of one simple command's argv. */
+export function operandRoles(words: readonly string[]): OperandRoles {
+  const executable = resolveExecutable(words);
+  if (executable === undefined) return { paths: [], data: [], pathValues: [] };
+  const args = words.slice(executable.index + 1);
+  const roles = dataOptionRoles(args, executable.index + 1);
+  pathOptionRoles(args, roles);
+  const name = executable.name;
+  if (PATTERN_FIRST_COMMANDS.has(name)) grepRoles(name, args, executable.index + 1, roles);
+  else if (name === "sed") sedRoles(args, executable.index + 1, roles);
+  else if (name === "jq") jqRoles(args, executable.index + 1, roles);
+  else if (name === "git") gitRoles(args, executable.index + 1, roles);
+  else if (PATH_OPERAND_COMMANDS.has(name) || CHECKSUM_COMMAND.test(name))
+    plainRoles(name, args, executable.index + 1, roles);
+  const ascending = (left: number, right: number) => left - right;
+  return {
+    paths: [...roles.paths].sort(ascending),
+    data: [...roles.data].sort(ascending),
+    pathValues: [...new Set(roles.pathValues)],
+  };
+}
+
+/** The standalone words one simple command consumes as files. */
+export function pathOperands(words: readonly string[]): string[] {
+  return operandRoles(words).paths.map((index) => words[index]);
+}
+
 /**
  * True when an argument names one of the given long options, including the
  * abbreviations GNU option parsing accepts (`sort --out=/tmp/out` means
@@ -211,14 +670,27 @@ function hasLongOption(args: readonly string[], names: readonly string[]): boole
   });
 }
 
+/**
+ * True when an argument is a long option or an unambiguous GNU-style abbreviation
+ * of it (`--forc` means `--force`). Abbreviations fail closed: any prefix of a
+ * dangerous option is treated as that option.
+ */
+export function isLongOption(argument: string, name: string): boolean {
+  const option = argument.split("=", 1)[0];
+  return option === name || (option.length > 2 && option.startsWith("--") && name.startsWith(option));
+}
+
 function hasShortOption(args: readonly string[], letters: string): boolean {
   return args.some((arg) => arg.startsWith("-") && !arg.startsWith("--") &&
     [...arg.slice(1)].some((character) => letters.includes(character)));
 }
 
 function isWorldWritableMode(arg: string): boolean {
-  const mode = arg.replace(/^[-+]+/, "");
-  return mode === "777" || mode === "0777";
+  // `chmod +w` and `chmod +rwx` omit the `who` part, which means "all users".
+  // Only a leading `-` is a removal; a leading `+` has to be read as `a+`.
+  const mode = arg.replace(/^-+/, "").replace(/^\+/, "a+");
+  return /^[0-7]{3,4}$/.test(mode) ? (Number.parseInt(mode, 8) & 0o002) !== 0 :
+    /(?:^|,)(?:[ug]*o[ugoa]*|a|)[+=][rwxXst]*w/.test(mode);
 }
 
 /** chmod options, including the BSD flags, that never consume the mode operand. */
@@ -261,7 +733,8 @@ function isRecursiveRootRemoval(args: readonly string[]): boolean {
     if (endOfOptions) { targets.push(arg); continue; }
     if (arg === "--") { endOfOptions = true; continue; }
     if (arg.startsWith("--")) {
-      if (arg === "--recursive") recursive = true;
+      // GNU option parsing accepts `--recursi` for `--recursive`.
+      if (isLongOption(arg, "--recursive")) recursive = true;
       continue;
     }
     if (arg.startsWith("-") && arg.length > 1) {
@@ -666,22 +1139,7 @@ export function rawHeredocScript(command: string): RawHeredocScript {
   return { lines, ambiguous: false };
 }
 
-/**
- * True when any raw here-document header cannot be tracked reliably, so the
- * guard must fail closed instead of normalizing bytes it cannot place.
- *
- * Deleting a `\`-newline is only safe once the marker and its delimiter are
- * visible: a continuation in the header can split `<`+`<`, split the delimiter
- * (`<<`+newline+`EOF`, `<<E`+newline+`OF`), or hide the entire marker
- * (`cat <<`+newline+`'EOF'`). Guessing there can move the body boundary past a
- * trailing command, so these and delimiters the reader cannot decode exactly
- * (escapes, expansion, concatenated words, a backslash inside double quotes)
- * require approval. Every header is checked, not only the first.
- */
-export function hasAmbiguousHeredoc(command: string): boolean {
-  return rawHeredocScript(command).ambiguous;
-}
-
+/** The copied bodies and the offset where the command script resumes. */
 interface HeredocCopy {
   text: string;
   end: number;
@@ -1138,6 +1596,21 @@ export function denyInvocation(words: readonly string[], depth = 0): string | un
   const executable = resolveExecutable(words);
   if (executable === undefined) return undefined;
   const args = words.slice(executable.index + 1);
+  if (executable.name === "sshpass" || executable.name === "printenv" ||
+      (executable.name === "env" && args.length === 0)) return DANGEROUS;
+  if (["terraform", "tofu", "pulumi"].includes(executable.name) && args.includes("destroy")) return DANGEROUS;
+  if (executable.name === "printf") {
+    // `printf -vPATH x` sets a variable exactly like `printf -v PATH x`; `--` ends
+    // option parsing, so `printf -- -v` prints the literal text.
+    const flag = args[0] ?? "";
+    const variable = flag === "-v" ? args[1] : flag.startsWith("-v") && flag.length > 2 ? flag.slice(2) : undefined;
+    if (variable !== undefined && /^(?:PATH|CDPATH|ENV|BASH_ENV|SHELLOPTS|LD_.*|DYLD_.*)$/.test(variable)) return DANGEROUS;
+  }
+  if (executable.name === "jq" && args.some((arg) => /(?:^|[^a-zA-Z_])(?:env|\$ENV)(?:$|[^a-zA-Z_])/.test(arg))) return DANGEROUS;
+  if (executable.name === "gh" && ((args[0] === "auth" && args[1] === "token") ||
+      (args[0] === "api" && args.some((arg) => /^(?:-[fF]|--(?:raw-)?field(?:=|$)|--input(?:=|$))/.test(arg))))) return DANGEROUS;
+  if (["npm", "pnpm", "yarn", "bun", "node"].includes(executable.name) &&
+      args.some((arg) => /^(?:--(?:preload|require|import)(?:=|$)|-r)/.test(arg))) return DANGEROUS;
   if (executable.name.startsWith("mkfs")) return DANGEROUS;
   if (DENY_EXECUTABLES.has(executable.name)) return DANGEROUS;
   if (executable.name === "chmod" && isWorldWritableMode(chmodMode(args) ?? "")) return DANGEROUS;
@@ -1223,6 +1696,8 @@ function isReadOnlyDate(args: readonly string[]): boolean {
     if (arg.startsWith("--") && arg.length > 2) {
       const name = arg.split("=", 1)[0];
       const attached = arg.length > name.length;
+      // `--file DATEFILE` reads dates from a file, which may be project data.
+      if (name === "--file" || resolveLongOption(name) === "--file") return false;
       if (DATE_LONG_VALUE_FLAGS.has(name)) {
         if (!attached) index++;
         continue;
@@ -1234,6 +1709,15 @@ function isReadOnlyDate(args: readonly string[]): boolean {
     for (let position = 1; position < arg.length; position++) {
       const letter = arg[position];
       if (letter === "I") break;
+      // `-f FILE` / `-fFILE` also reads a date file.
+      if (letter === "f") return false;
+      // `-rFILE` hides the reference file from the word scan; only the separate
+      // `-r FILE` form stays available to the path check.
+      if (letter === "r") {
+        if (position !== arg.length - 1) return false;
+        index++;
+        break;
+      }
       if (DATE_VALUE_FLAGS.has(letter)) {
         if (position === arg.length - 1) index++;
         break;
@@ -1244,14 +1728,87 @@ function isReadOnlyDate(args: readonly string[]): boolean {
   return true;
 }
 
+/**
+ * `jq -f`/`--from-file` runs a filter file and `--run-tests` runs a test file;
+ * either can read the environment or any file it names, so all their spellings
+ * (including attached `-fscript` and `--from-file=script`) need review.
+ */
+function isReadOnlyJq(args: readonly string[]): boolean {
+  for (const arg of args) {
+    if (arg === "--") break;
+    if (arg.startsWith("--")) {
+      const separator = arg.indexOf("=");
+      const option = separator === -1 ? arg : arg.slice(0, separator);
+      if (option === "--run-tests" || resolveLongOption(option) === "--from-file") return false;
+      continue;
+    }
+    if (shortOption(arg, JQ_SHORT_VALUES)?.letter === "f") return false;
+  }
+  return true;
+}
+
+/**
+ * `grep -r`/`-R` and `-d recurse` follow directories instead of reading only
+ * the named operands, so they can dump protected or external trees. `-R` also
+ * follows symlinks. A named protected path still denies before this policy.
+ */
+function isReadOnlyGrep(args: readonly string[]): boolean {
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index];
+    if (/[rR]/.test(shortFlags(arg, GREP_SHORT_VALUES))) return false;
+    const parsed = shortOption(arg, GREP_SHORT_VALUES);
+    if (parsed?.letter === "d" && (parsed.attached ?? args[index + 1]) === "recurse") return false;
+    if (!arg.startsWith("--") || arg.length <= 2) continue;
+    const separator = arg.indexOf("=");
+    const option = separator === -1 ? arg : arg.slice(0, separator);
+    if ("--recursive".startsWith(option) || "--dereference-recursive".startsWith(option)) return false;
+    if ("--directories".startsWith(option) &&
+        (separator === -1 ? args[index + 1] : arg.slice(separator + 1)) === "recurse") return false;
+  }
+  return true;
+}
+
+/**
+ * `rg --hidden`, `-u`/`--no-ignore` and `-L`/`--follow` reach files the default
+ * ignore rules and the named operands exclude (hidden config, ignored trees,
+ * symlink targets), so those searches need review rather than a low score.
+ */
+function isReadOnlyRg(args: readonly string[]): boolean {
+  if (hasLongOption(args, ["--pre", "--pre-glob", "--hostname-bin", "--search-zip", "--hidden",
+    "--follow", "--unrestricted", "--no-ignore", "--no-ignore-vcs", "--no-ignore-parent",
+    "--no-ignore-global", "--no-ignore-dot", "--no-ignore-files", "--no-ignore-exclude"])) return false;
+  return !args.some((arg) => /[uLz]/.test(shortFlags(arg, RG_SHORT_VALUES)));
+}
+
+/**
+ * `diff -N`/`--new-file` treats absent files as empty and `-r` walks whole
+ * trees, so a directory comparison can dump protected or external files. A
+ * named protected path still denies before this policy.
+ */
+function isReadOnlyDiff(args: readonly string[]): boolean {
+  if (hasLongOption(args, ["--new-file", "--unidirectional-new-file", "--recursive"])) return false;
+  return !args.some((arg) => /[rN]/.test(shortFlags(arg, PLAIN_SHORT_VALUES.diff ?? {})));
+}
+
 const POLICIES: Record<string, (args: readonly string[]) => boolean> = {
-  // Flags that read a program from a file, run a command, or write output.
-  rg: (args) => !hasLongOption(args, ["--pre", "--pre-glob", "--hostname-bin", "--search-zip"]) &&
-    !hasShortOption(args, "z"),
-  sort: (args) => !hasLongOption(args, ["--output", "--compress-program", "--temporary-directory"]) &&
-    !hasShortOption(args, "oT"),
-  tree: (args) => !hasLongOption(args, ["--output"]) && !hasShortOption(args, "o"),
-  file: (args) => !hasLongOption(args, ["--compile"]) && !hasShortOption(args, "C"),
+  rg: isReadOnlyRg,
+  // `grep -r`/`-R`/`-d recurse` walks whole trees, including protected and
+  // external directories: the search is no longer a bounded read.
+  grep: isReadOnlyGrep,
+  // `diff -N`/`--new-file` and `-r` dump whole trees, including files that do
+  // not exist on the other side.
+  diff: isReadOnlyDiff,
+  sort: (args) => !hasLongOption(args, ["--output", "--compress-program", "--temporary-directory",
+    "--files0-from"]) && !hasShortOption(args, "oT"),
+  // `wc --files0-from FILE` reads a file of paths.
+  wc: (args) => !hasLongOption(args, ["--files0-from"]),
+  tree: (args) => !hasLongOption(args, ["--output", "--fromfile", "--fromtabfile", "--gitfile"]) &&
+    !hasShortOption(args, "o"),
+  // `file -f/--files-from FILE` reads a list of files; `-C` compiles magic.
+  file: (args) => !hasLongOption(args, ["--compile", "--files-from"]) && !hasShortOption(args, "Cf"),
+  // `--files0-from` and `--exclude-from` read a file of paths; `-X` is the
+  // short form of `--exclude-from`.
+  du: (args) => !hasLongOption(args, ["--files0-from", "--exclude-from"]) && !hasShortOption(args, "X"),
   // `cache --build` / `--clear` mutate the cache, and `--lessopen` runs the
   // configured pager preprocessor.
   bat: (args) => !hasLongOption(args, ["--pager", "--config-file", "--config-dir", "--generate-config-file",
@@ -1269,6 +1826,7 @@ const POLICIES: Record<string, (args: readonly string[]) => boolean> = {
     return !hasLongOption(args, ["--file", "--boot"]) && !hasShortOption(args, "Fb");
   },
   date: isReadOnlyDate,
+  jq: isReadOnlyJq,
 };
 
 const READ_ONLY = new Set(["pwd", "whoami", "id", "groups", "ls", "cat", "head", "tail", "wc", "echo", "printf",
@@ -1290,9 +1848,10 @@ function isReadOnlyGit(args: readonly string[]): boolean {
 }
 
 function isReadOnlySed(args: readonly string[]): boolean {
-  if (args.some((arg) => arg === "-i" || arg.startsWith("--in-place") || arg === "-e" ||
-      arg === "--expression" || arg === "-f" || arg === "--file")) return false;
-  return args[0] === "-n" && args[1] !== undefined && /^\d+(?:,\d+)?p$/.test(args[1]);
+  // One narrowly decoded print script, then literal filenames only. Attached
+  // -e/-f forms are scripts too, not inert filenames.
+  return args[0] === "-n" && args[1] !== undefined && /^\d+(?:,\d+)?p$/.test(args[1]) &&
+    args.slice(2).every((arg) => !arg.startsWith("-"));
 }
 
 function isReadOnlyGh(args: readonly string[]): boolean {
@@ -1321,13 +1880,24 @@ function isReadOnlyGh(args: readonly string[]): boolean {
  */
 export function isReadOnlyInvocation(words: readonly string[], globs: readonly boolean[] = []): boolean {
   if (globs.some(Boolean)) return false;
+  // Path-qualified binaries may be repo-controlled lookalikes, not system tools.
+  if ((words[0] ?? "").includes("/")) return false;
   const command = basename(words[0] ?? "");
   const args = words.slice(1);
+  if (command === "printf") {
+    // Any `-v` option assigns a shell variable, attached or separate. `--` ends
+    // option parsing, so `printf -- -v` keeps `-v` as literal format text.
+    for (const arg of args) {
+      if (arg === "--") break;
+      if (/^-v/.test(arg)) return false;
+    }
+  }
   // Own properties only: `./constructor` must not resolve to `Object`.
   if (Object.hasOwn(POLICIES, command)) return POLICIES[command](args);
   if (READ_ONLY.has(command)) return true;
   if (command === "git") return isReadOnlyGit(args);
-  if (command === "find") return !args.some((arg) => /^-(?:fprint|fprint0|fprintf|fls)$/.test(arg));
+  if (command === "find")
+    return !args.some((arg) => /^--?(?:fprint|fprint0|fprintf|fls)$/.test(arg) || /^--?files0/.test(arg));
   if (command === "sed") return isReadOnlySed(args);
   if (command === "gh") return isReadOnlyGh(args);
   if (command === "docker") return args[0] === "logs";

@@ -1,336 +1,215 @@
 # OpenCode Auto Mode
 
-Reviews OpenCode permission prompts automatically. OpenCode decides what needs
-approval; the plugin reviews only `ask` actions.
+Automatic review of OpenCode permission requests. While a session's auto mode is
+on, the plugin reviews native **allow** and **ask** effects, including saved
+**Always** approvals. A native **deny** is always final.
 
-## Install and configure
+Auto Mode reduces prompts. It is not a security sandbox, and it cannot make an
+invalid configuration fail closed.
 
-Add this to `~/.config/opencode/opencode.jsonc`. It asks for permission on every
-action and reviews those requests using built-in checks. No model or API key is
-needed:
+## Requirements
+
+- OpenCode V2. The checked-in plugin SDK and schema targets OpenCode `2.2.0`.
+- Model references only if you use `decision` or `llm` classifier stages. Models
+  and provider credentials belong in your personal OpenCode provider config.
+  This repository supplies no model, endpoint, credential, or allowlist.
+- **Data egress:** a configured `decision` or `llm` stage sends the action and
+  resources (including full Code Mode source), agent, project/worktree, git
+  state, and up to 12 KB of user messages to that model's provider, even with
+  audit off. Choose a provider you trust.
+
+## Install
+
+Register the plugin **once** in your user-owned global config:
+
+`~/.config/opencode/opencode.jsonc` (or
+`$XDG_CONFIG_HOME/opencode/opencode.jsonc`). The global config must be outside
+the repository, resolve with no symlink in its path, be user-owned and not
+group/other-writable, be a single hardlink, and use an absolute
+`XDG_CONFIG_HOME` when set.
 
 ```jsonc
 {
   "$schema": "https://opencode.ai/config.json",
-  "permissions": [
-    { "action": "*", "resource": "*", "effect": "ask" }
-  ],
-  "plugins": [
-    {
-      "package": "@mortz.prk/opencode-auto-mode",
-      "options": {
-        "classifiers": [
-          { "type": "static" }
-        ]
-      }
-    }
-  ]
-}
-```
-
-OpenCode watches configuration files and reloads plugins after a save, so no
-restart is needed. If a change does not take effect, run `/reload` in the TUI to
-force a full reload.
-
-There is no default review pipeline, and empty options are invalid. Add at least
-one review entry. Built-in checks deny dangerous shell commands, allow common
-read-only commands, and send other parsed commands to the configured reviewers.
-Dynamic syntax such as command substitution, nested shells, and stateful builtins
-still requires manual approval.
-
-The snippets below change parts of that configuration; keep your `classifiers`
-list when adding other options.
-
-### How a shell command is classified
-
-Commands are parsed before they are judged, so text that merely mentions a
-dangerous word — a commit message, a search pattern, a heredoc body — is not
-treated as a dangerous operation. Denials apply to the parsed executable and its
-arguments, and nested shells are inspected recursively.
-
-Read-only allowlisting checks the executable **and** its flags. Options that
-write files or run programs (`rg --pre`, `sort -o`, `tree -o`, `file -C`,
-`bat --pager`, `hostname NAME`, `uniq IN OUT`) are handed to the reviewers
-instead of being auto-approved.
-
-A shell result is final when it is `deny` or `ask`: `ask` means manual approval,
-even if a model reviewer is configured. Read-only auto-approval is narrower than
-the pipeline: for shell actions, the static stage auto-approves only commands the
-guard recognizes as read-only. Every other parsed command that is not denied —
-including a write such as `pwd > marker` — goes to the configured reviewers, and a
-model reviewer may allow it. With no reviewer configured, it stays `ask`.
-
-## Add a typed decision model
-
-```jsonc
-{
-  "options": {
-    "classifiers": [
-      { "type": "static" },
-      { "type": "decision", "model": "typesafe-ai/jev-latest" }
-    ]
-  }
-}
-```
-
-| Provider | Setup |
-| --- | --- |
-| `typesafe-ai` | Set `TYPESAFE_API_KEY`. |
-| `openai` | Set `OPENAI_API_KEY`. |
-| `laya` | Run a loopback `/v1/systemone` service. `LAYA_API_KEY` is optional. |
-
-Decision entries accept `minConfidence` (default `0.9`), `timeoutMs`, and
-`apiKeyEnv`. `laya` also accepts `endpoint`.
-
-## Add an LLM
-
-Add an `llm` entry after the built-in checks:
-
-```jsonc
-{
-  "options": {
-    "classifiers": [
-      { "type": "static" },
-      { "type": "llm" }
-    ]
-  }
-}
-```
-
-When an `llm` entry has no `model`, the **session model** is used. To choose a
-different model:
-
-```jsonc
-{ "type": "llm", "model": "anthropic/claude-sonnet-4-5" }
-```
-
-## Combine reviewers
-
-Entries run in order. Add as many as you need:
-
-```jsonc
-{
-  "options": {
-    "classifiers": [
-      { "type": "static" },
-      { "type": "decision", "model": "typesafe-ai/jev-latest" },
-      { "type": "llm" }
-    ]
-  }
-}
-```
-
-An entry can allow, deny, or ask, which stops the pipeline. An entry that abstains
-hands the action to the next entry. If nothing decides, the action remains `ask`.
-
-## Time limit and failures
-
-A review never blocks a permission prompt indefinitely. One deadline covers every
-entry in the pipeline, including both model calls of an `llm` entry:
-
-```jsonc
-{ "options": { "reviewTimeoutMs": 60000 } }
-```
-
-`reviewTimeoutMs` accepts 1000–120000 and defaults to 60000. When the deadline
-passes, provider and context requests are aborted and the action is asked with
-`Auto-mode review deadline exceeded`. Interrupting a session also abandons its
-review, so a stopped turn cannot later receive an automatic approval.
-
-Failures are reported with a bounded cause — `deadline`, `timeout`, `cancelled`,
-`provider`, `invalid-output`, or `context` — in the audit log and in OTLP
-(`error.kind`), while the user-facing message stays generic.
-
-A typed decision reviewer that is unavailable or returns a malformed response
-abstains, so the next entry runs. An `llm` entry behaves differently: a timeout
-or provider error abstains, but an unparseable final answer is an `ask` (manual
-approval) with `invalid-output`, and the pipeline stops there.
-
-## Use it for specific agents
-
-OpenCode allows everything by default. To review only the `build` agent, set its
-permissions and leave global permissions unchanged:
-
-```jsonc
-{
-  "agents": {
-    "build": {
-      "permissions": [
-        { "action": "*", "resource": "*", "effect": "ask" }
+  "plugins": [{
+    "package": "@mortz.prk/opencode-auto-mode",
+    "options": {
+      "classifiers": [
+        { "type": "static" },
+        { "type": "llm", "model": "<provider>/<reviewer-model>" }
       ]
     }
-  }
+  }]
 }
 ```
 
-## TUI indicator
+The `static` stage handles low-risk reads and eligible in-project edits without a
+model. Remove the `llm` stage if you want a static-only setup; anything static
+cannot resolve then asks you.
 
-A passive indicator shows when the plugin is reviewing the current session.
-It is enabled by default. Set `tui: false` in plugin options to hide it.
-Invalid options show `auto-mode: invalid config` in the same place and raise an
-error toast when the configuration is loaded. OpenCode's own permission dialog
-handles manual approvals.
-
-The indicator window is longer than the maximum review deadline, so a slow
-review stays visible until it resolves.
-
-## Desktop app (preview)
-
-OpenCode 2.2.0+ can load the plugin's GUI entry in the desktop app. It adds a
-composer pill and an **Auto-mode** side panel showing whether the current session
-is being reviewed and how recent actions were decided, plus a command-palette
-entry to open the panel.
-
-The GUI only reads state. Every permission decision still comes from the server
-part, so disabling the GUI never disables automatic review.
-
-The GUI is loaded from the desktop app's own background server and reads that
-server's auto-mode state. If you connect the app to another server, that server's
-reviews do not appear in the panel.
-
-The desktop app reads plugins only from the **global** `opencode.json(c)`. If
-your TUI configuration lives in `cli.json`, add the package to the global file as
-well:
+For native typed decisions, add a `decision` stage between `static` and `llm`:
 
 ```jsonc
-{
-  "plugins": [{ "package": "@mortz.prk/opencode-auto-mode", "options": { "classifiers": [{ "type": "static" }] } }]
-}
+{ "type": "decision", "model": "<provider>/<decision-model>", "minConfidence": 0.9 }
 ```
 
-Turn the GUI off without removing the plugin in **Settings → Extensions →
-Plugins**. The GUI plugin API is experimental and may change between OpenCode
-releases; the server and TUI parts do not depend on it.
+Only add this stage if your OpenCode provider supports native decisions. The
+plugin has no HTTP decision adapter or custom endpoint option.
 
-## Review options
+Keep the plugin registration in global config only. Do not add the full plugin to
+project config, `cli.json`, or `.opencode/plugins/` as well: the plugin reads its
+safety options from exactly one global registration. The server registration
+loads the TUI part automatically. Desktop loads the experimental GUI part from
+global config and needs the built `dist/gui-experimental.cjs` bundle; in a local
+checkout, run `bun run build:gui` first.
 
-Each LLM or typed decision reviewer can have its own policy:
+## Verify
 
-```jsonc
-{
-  "options": {
-    "classifiers": [
-      {
-        "type": "llm",
-        "policy": {
-          "trusted": ["the repository and its CI configuration"],
-          "blocks": ["publish packages", "change production infrastructure"],
-          "exceptions": ["run the repository's test and lint scripts"]
-        }
-      }
-    ]
-  }
-}
+Restart nothing for a config-only change. OpenCode watches config files and
+reloads plugins after a save; `/reload` forces a full reload if needed.
+
+Run:
+
+```text
+/auto-mode status
 ```
 
-`trusted` describes the trusted boundary, `blocks` describes actions to deny, and
-`exceptions` describes narrow acceptable cases. Omitted lists use the built-in
-policy; an empty list clears that list. Policies are independent between
-reviewers and do not apply to static checks or replace OpenCode permissions.
+A working install reports `Auto mode: on`, today's allow/ask/deny counts, active
+reviews, and breaker state. With invalid configuration, the command reports
+`Auto mode: invalid` and `Review disabled: <error>`; the desktop pill reads
+`Invalid config — review disabled`. A storage or status failure is not a config
+error: the command appends its error and the pill reads `Review unavailable` or
+`status unavailable`. Fix the strict option shapes below rather than expecting a
+migration hint.
 
-## All plugin options
+## Use
 
-| Option | Default | Meaning |
+- `/auto-mode` toggles the current session.
+- `/auto-mode on` enables review and resets the breaker.
+- `/auto-mode off` restores the native host effect.
+- `/auto-mode status` reports mode, counts, active reviews, and breaker state.
+
+Configure native permissions for ordinary safe work and leave residual risky
+operations as `ask`. Keep hard denials in user-owned global `policies`
+(`tool.use`); the plugin does not install or rewrite native rules.
+
+## Options
+
+Unknown keys are rejected. `classifiers` is required and must contain 1–64
+ordered stages, with at most one `static` stage.
+
+| Option | Default | Contract |
 | --- | --- | --- |
-| `classifiers` | — | Ordered review entries; at least one is required. |
-| `reviewTimeoutMs` | `60000` | Deadline for one complete review (1000–120000). |
-| `auditLog` | off | `true` writes the default JSONL file; a string sets the path. |
-| `otlp` | off | `true` uses OpenCode's OTLP environment; an object sets `endpoint`, `headers`, and `timeoutMs`. |
-| `tui` | on | Set `false` to hide the TUI indicator. |
+| `classifiers` | required | Ordered `static`, `decision`, and `llm` stages. No default list and no unconfigured mode. |
+| `reviewTimeoutMs` | `15000` | Whole-review deadline; integer 1–120000. |
+| `breaker` | `3 / 10 / 50` | `{consecutiveDenies, windowDenies, windowSize}`. All three keys are required when supplied. |
+| `tui` | `true` | Show or hide the TUI indicator. UI-only; review still runs server-side. |
+| `audit` | `{enabled:false,maxBytes:10485760}` | Object only. Local audit is off by default. |
 
-Static entries accept `allowInProjectEdits`. Decision entries accept
-`minConfidence`, `timeoutMs`, `apiKeyEnv`, and `endpoint` (loopback `laya` only;
-defaults to `http://127.0.0.1:8000/v1/systemone`). OpenCode reloads the plugin
-when you save, so option changes apply without a restart; run `/reload` in the
-TUI if a change does not take effect. Invalid options disable automatic approval
-and are reported in the TUI and over the status RPC.
+Stage shapes:
 
-## Data that leaves the machine
+| Stage | Shape |
+| --- | --- |
+| `static` | `{ "type": "static", "allowInProjectEdits"?: boolean }` |
+| `decision` | `{ "type": "decision", "model": "<provider>/<model>", "timeoutMs"?: number, "minConfidence"?: number }` |
+| `llm` | `{ "type": "llm", "model": "<provider>/<model>", "timeoutMs"?: number }` |
 
-Reviewers see the proposed action, its resources, the session directory, the
-requesting agent, the pending permission `metadata` and `source`, and a bounded
-transcript of recent user messages and tool inputs (12 KB, with the head and tail
-of each tool input). Nothing else about the session is sent.
+## How review works
 
-* A model reviewer receives that material through OpenCode's own session model or
-  the `model` you configure.
-* A typed decision reviewer receives it at the configured provider endpoint.
-* Audit records and OTLP log records keep the action, agent, up to 16 resources,
-  a short reason, and, on failure, a short error detail. Both pass the record
-  through one sanitizer, which bounds these fields — 128 characters for the
-  action and agent, 64 for the stage, 512 for each resource, reason, and error
-  detail — but does **not** redact text.
-* OTLP exports logs and traces as separate streams (`/v1/logs` and `/v1/traces`).
-  Trace root attributes use the same sanitizer, so their action, agent, and stage
-  are bounded like the log fields. Each reviewer attempt adds a child span with
-  its model and outcome; the `model` attribute is not clipped. Traces do not
-  include resources, reasons, or error-detail text.
-* Text in every stream is unredacted, including the action and agent. Traces
-  carry the action and agent; logs carry those plus resources, reasons, and
-  error details. These fields may be sensitive, and resources or reasons can
-  contain inline file contents or shell commands, including credentials such as
-  an `Authorization` header. Audit JSONL keeps the same unredacted fields as OTLP
-  logs. Enable `auditLog` or `otlp` only if you are comfortable storing or
-  exporting that material.
-* Records do not include the reviewer prompt, the session transcript, or API keys
-  configured for providers.
+1. Native permissions, policies, and saved approvals produce `allow`, `ask`, or
+   `deny`. A native **deny is final** and is never reviewed or weakened.
+2. With mode on, native allows and asks are reviewed. Saved **Always** entries
+   are re-reviewed but never deleted or rewritten.
+3. Built-in guards run first: protected paths and credentials, risky shell
+   structure, recursive external deletion, history changes, and ambiguous syntax.
+   These guards are not user-extensible.
+4. Configured classifiers run in array order. A static stage may resolve low-risk
+   work; a decision stage uses OpenCode's native decision API; an LLM stage uses
+   its explicit reviewer. The first decisive allow or deny stops the chain.
+5. Exhaustion, unusable context, interruption, failure, or timeout resolves to
+   **ask**. A deny ends with `Continue with a safer alternative.`
 
-## Platform limits
+Mode off restores the original host effect. A paused breaker turns a reviewed
+native allow into `ask`; an existing native ask keeps its prompt.
 
-* Windows always asks for shell actions; the guard only parses POSIX syntax.
-* Reviews happen inside the OpenCode server, so a headless or remote TUI behaves
-  the same as a local one. The desktop GUI needs OpenCode 2.2.0+.
+Assuming classifiers: [static, decision, llm] (array order is authoritative).
 
-## Auditing
+```mermaid
+flowchart TD
+    A[permission evaluate<br/>allow / ask / deny] --> B{native deny?}
+    B -- yes --> B1[final, untouched<br/>audit only]
+    B -- no --> C{config valid &<br/>session on?}
+    C -- invalid --> C1[passthrough<br/>review disabled]
+    C -- off --> C2[restore native<br/>effect + message]
+    C -- paused --> C3[allow → ask<br/>ask → passthrough]
 
-Enable the audit log in plugin options:
+    C -- on --> D[context fetch<br/>size ≤ 64 KiB]
+    D --> E[Code Mode hash identity<br/>execute:sha256]
+    E --> S
 
-```jsonc
-{
-  "options": {
-    "auditLog": true
-  }
-}
+    subgraph S [scoreRequest — every hand-written safety check lives here]
+      S1[shell: guardShell + visibleShellDeny<br/>parse / operand roles / recursive delete]
+      S2[tiers: protected paths, credential names,<br/>symlink traversal, project scope]
+      S3[read/edit/write: URL, scope, safeTarget]
+      S4[webfetch/websearch/execute/unknown → HIGH]
+      S5[git history → evaluateVcsGate]
+      S1 --> S2 --> S3 --> S4 --> S5
+    end
+
+    S -- deny --> X1[DENY]
+    S -- ask --> X2[ASK]
+    S -- low / medium / high --> R
+
+    subgraph R [runClassifiers]
+      R0{score deny/ask?} -- yes --> X1
+      R0 -- no --> R1[static: low → ALLOW<br/>else abstain]
+      R1 -- abstain --> R2[decision: native generate.decisions<br/>confidence ≥ 0.9]
+      R2 -- ask / low confidence --> R3[llm: native generate.text]
+      R2 -- allow / deny --> T[terminal]
+      R3 -- allow / deny --> T
+      R3 -- ask / unresolved --> X2
+    end
+
+    X1 --> F[modes.finish<br/>counts + breaker]
+    X2 --> F
+    T --> F
+    F --> G[apply effect to host]
 ```
 
-Decisions are appended as JSON lines to
-`$XDG_STATE_HOME/opencode-auto-mode/decisions.jsonl`. Replay recorded tool calls
-without executing anything (run from a checkout; it reads the OpenCode database
-read-only and needs `--config` if your global config is not at a default path):
+## Safety limits
 
-```sh
-bun scripts/replay.ts [--days 14] [--session ID] [--agent build|any] [--json]
-```
+- **Native Auto/YOLO is client-local.** If enabled, OpenCode may auto-approve an
+  `ask` without a dialog, including a plugin ask. Plugin checks still run and
+  plugin denies still block, but the plugin cannot read, change, or synchronize
+  that switch. Disable client Auto/YOLO if you need prompts.
+- **Invalid configuration acts disabled.** The plugin performs no review and
+  native behavior applies. That is passthrough, not fail-closed.
+- Coverage is limited to the permission `evaluate` hook and the Code Mode
+  `execute.before` bridge. Native path grants are not an OS sandbox.
+- Code Mode stays HIGH: JavaScript can hide egress behind aliases and computed
+  URLs. Its permission identity is the SHA-256 of the exact UTF-8 source. Old
+  raw-code approvals generally do not match.
+- Other project plugins can affect residual effects; only run code you trust.
 
-To send decisions through OpenCode's OTLP telemetry, configure OTLP for OpenCode
-with its standard environment variables, then enable the plugin flag. This sends
-correlated decision logs and review traces, including model reviewer attempts:
+## Audit
 
-```jsonc
-{
-  "options": {
-    "otlp": true
-  }
-}
-```
+Audit is the only plugin-generated telemetry and is **off by default**. It is
+local and unsafe: raw records are unredacted and can contain secrets, file
+contents, prompts, and model outputs. If enabled, the fixed path is
+`$XDG_STATE_HOME/opencode-auto-mode/decisions.jsonl` (or
+`~/.local/state/opencode-auto-mode/decisions.jsonl` when `XDG_STATE_HOME` is not
+absolute). Rotated archives are retained; delete them manually. See
+[README.llm.md](README.llm.md#audit-and-replay) before enabling it.
 
-## Development
+## More documentation
 
-```sh
-bun install
-bun test
-bun run lint
-bun run typecheck
-bun run build:gui
-bun run test:integration
-```
-
-`build:gui` writes `dist/gui-experimental.cjs`, the file the `./gui-experimental`
-export points at. It runs automatically before publishing.
+- [README.llm.md](README.llm.md) — installation instructions for an AI agent,
+  full options, migration from 1.0.x, audit, and troubleshooting.
+- [CONTRIBUTING.md](CONTRIBUTING.md) — repository map, local development,
+  tests, and release checks. It ships with the package.
 
 ## Credit
 
 Created originally by [Andrew Mellen (mellena1)](https://github.com/mellena1) in
-[mellena1/opencode-auto-mode](https://github.com/mellena1/opencode-auto-mode),
-also credited as the author in [package.json](package.json). This independent
-project retains the original [MIT license](LICENSE).
+[mellena1/opencode-auto-mode](https://github.com/mellena1/opencode-auto-mode).
+This independent project retains the original [MIT license](LICENSE).

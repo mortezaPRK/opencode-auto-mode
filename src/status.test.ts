@@ -2,7 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { createStatusTracker } from "./status.js";
 
-const base = { enabled: true, classifiers: ["static", "llm"], reviewTimeoutMs: 60_000 };
+const base = { enabled: true, mode: "on" as const, reviewTimeoutMs: 15_000 };
 
 describe("status tracker", () => {
   it("moves a session from reviewing to its last decision", () => {
@@ -13,7 +13,9 @@ describe("status tracker", () => {
       stage: "shell-guard", reason: "dangerous", durationMs: 3, at: 1003 });
     const snapshot = status.snapshot({ ...base, sessionID: "session-a" });
     assert.deepEqual(snapshot.reviewing, []);
-    assert.equal(snapshot.recent[0].decision, "deny");
+    assert.deepEqual(snapshot.counts, { allow: 0, ask: 0, deny: 0 });
+    assert.equal("recent" in snapshot, false);
+    assert.equal("classifiers" in snapshot, false);
   });
   it("keeps overlapping reviews in one session until each finishes", () => {
     const status = createStatusTracker();
@@ -45,21 +47,21 @@ describe("status tracker", () => {
     assert.equal(pending.length, 256);
     assert.equal(pending.at(-1)!.reviewID, "review-299");
   });
-  it("keeps sessions and entries apart and bounded", () => {
-    const status = createStatusTracker();
-    status.start("session-a", "review-a", 1000);
-    status.start("session-b", "review-b", 1000);
-    assert.equal(status.snapshot({ ...base, sessionID: "session-b" }).reviewing.length, 1);
-    assert.equal(status.snapshot(base).reviewing.length, 2);
-    for (let index = 0; index < 150; index++) {
-      status.finish({ reviewID: `review-${index}`, sessionID: "session-a", action: "shell",
-        decision: "allow", stage: "static", reason: "x".repeat(500), durationMs: 1, at: index });
-    }
-    const recent = status.recent(20, "session-a");
-    assert.equal(recent.length, 20);
-    assert.equal(recent.at(-1)!.reviewID, "review-149");
-    assert.ok(recent.every((entry) => entry.reason.length <= 200));
-    assert.equal(status.recent(500, "session-a").length, 100);
+  it("copies server-supplied audit counts and breaker state", () => {
+    const tracker = createStatusTracker();
+    const counts = { allow: 4, ask: 2, deny: 1 };
+    const snapshot = tracker.snapshot({ ...base, counts, mode: "paused", enabled: false, breaker: true });
+    assert.deepEqual(snapshot.counts, counts);
+    assert.equal(snapshot.breaker, true);
+    assert.equal(snapshot.mode, "paused");
+    counts.allow = 100;
+    assert.equal(snapshot.counts.allow, 4);
+  });
+  it("rebuilds counts to exactly allow, ask and deny", () => {
+    const tracker = createStatusTracker();
+    const counts = { allow: 4, ask: 2, deny: 1, arbitrary: 99 } as never;
+    const snapshot = tracker.snapshot({ ...base, counts });
+    assert.deepEqual(snapshot.counts, { allow: 4, ask: 2, deny: 1 });
   });
   it("bounds a long action and stage before retaining or returning it", () => {
     const status = createStatusTracker();
@@ -67,21 +69,22 @@ describe("status tracker", () => {
     status.start("session-a", "review-2", 1002);
     const action = `custom:${"x".repeat(500)}`;
     const stage = "s".repeat(500);
-    const returned = status.finish({ reviewID: "review-1", sessionID: "session-a", action,
-      decision: "ask", stage, reason: "r".repeat(500), durationMs: 1, at: 1003 });
+    const completion = { reviewID: "review-1", sessionID: "session-a", action,
+      decision: "ask", stage, reason: "r".repeat(500), durationMs: 1, at: 1003,
+      ruleID: "removed-rule", shadow: true } as unknown as Parameters<typeof status.finish>[0];
+    const returned = status.finish(completion);
     assert.equal(returned.action.length, 128);
     assert.ok(returned.action.endsWith("…"));
     assert.ok(action.startsWith(returned.action.slice(0, -1)));
     assert.equal(returned.stage.length, 64);
     assert.ok(returned.stage.endsWith("…"));
     assert.ok(returned.reason.length <= 200);
+    assert.equal("ruleID" in returned, false);
+    assert.equal("shadow" in returned, false);
     const snapshot = status.snapshot({ ...base, sessionID: "session-a" });
-    // The finished review is gone, but another active review in the session
-    // is untouched, and the retained entry is the same bounded entry returned
-    // for publishing.
+    // Finishing removes only that review; there is no retained history.
     assert.deepEqual(snapshot.reviewing.map((entry) => entry.reviewID), ["review-2"]);
-    assert.deepEqual(snapshot.recent, [returned]);
-    assert.deepEqual(status.recent(1, "session-a"), [returned]);
+    assert.equal("recent" in snapshot, false);
   });
   it("clips a long action without splitting a surrogate pair", () => {
     const status = createStatusTracker();
@@ -91,10 +94,13 @@ describe("status tracker", () => {
     assert.equal(entry.action, `${"a".repeat(126)}😀…`);
     assert.equal(Array.from(entry.action).length, 128);
   });
-  it("reports configuration state without echoing long errors", () => {
+  it("reports invalid configuration without echoing long errors", () => {
     const status = createStatusTracker();
-    const snapshot = status.snapshot({ ...base, enabled: false, configError: "e".repeat(400) });
+    const snapshot = status.snapshot({ ...base, enabled: false, mode: "invalid", configError: "e".repeat(400), errorKind: "config" });
     assert.equal(snapshot.enabled, false);
+    assert.equal(snapshot.mode, "invalid");
+    assert.equal(snapshot.errorKind, "config");
     assert.ok(snapshot.configError!.length <= 200);
+    assert.equal("shadow" in snapshot, false);
   });
 });

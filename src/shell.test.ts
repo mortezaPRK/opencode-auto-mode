@@ -1,18 +1,55 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { compositeDecision } from "./classifier.js";
-import { escapeLiteralHashes, hasAmbiguousDescriptorClose, logicalLines, normalizeContinuations, parseShell, rawHeredocScript, stripDescriptorPrefixes } from "./shell-policy.js";
-import { guardShell, shellWords } from "./shell.js";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { scoreRequest } from "./score.js";
+import { parseOptions } from "./config.js";
+import { escapeLiteralHashes, hasAmbiguousDescriptorClose, logicalLines, normalizeContinuations, operandRoles, parseShell, pathOperands, rawHeredocScript, stripDescriptorPrefixes } from "./shell-policy.js";
+import { guardShell, parseShellCommands, visibleShellDeny } from "./shell.js";
 
-const unused = async () => { throw new Error("unexpected reviewer call"); };
-const permissive = [{ type: "llm" as const }];
+const options = parseOptions({ classifiers: [{ type: "static" }] });
+
+describe("shared literal shell commands", () => {
+  it("preserves logical lines, quoted newlines, redirects and continuations", () => {
+    const parsed = parseShellCommands("printf '%s' 'quoted\nnewline'\ncat \\\n file 2>/dev/null && pwd");
+    assert.equal(parsed?.complete, true);
+    assert.equal(parsed?.compound, true);
+    assert.deepEqual(parsed?.segments.map((segment) => segment.words), [["printf", "%s", "quoted\nnewline"], ["cat", "file"], ["pwd"]]);
+    assert.ok(parsed?.operands.includes("/dev/null"));
+  });
+  it("distinguishes filename dash writes from descriptor closes", () => {
+    for (const command of ["printf ok > -", "printf ok >> -", "pwd\nprintf ok > -"]) {
+      assert.equal(guardShell([command]), undefined, command);
+      assert.ok(parseShellCommands(command)?.segments.some((segment) => segment.write), command);
+    }
+    for (const command of ["printf ok >&-", "cat <&-"])
+      assert.equal(guardShell([command])?.decision, "allow", command);
+  });
+  it("requires manual approval for expanded redirect targets, including input", () => {
+    for (const command of ['cat < "${INPUT:-.env}"', "cat < $INPUT", "pwd; cat < $INPUT", "cat < $INPUT && cat file", "cat < $INPUT < $OTHER"]) {
+      assert.equal(guardShell([command])?.decision, "ask", command);
+      assert.equal(parseShellCommands(command)?.complete, false, command);
+    }
+    assert.equal(guardShell(["cat < file && pwd"])?.decision, "allow");
+    assert.equal(guardShell(["cat < $INPUT\ncat .env"])?.decision, "deny");
+    // A bracket glob that can only expand to a protected dotfile is still a deny.
+    assert.equal(guardShell(["cat < .[e]nv"])?.decision, "deny");
+    assert.equal(guardShell(["cat < .env"])?.decision, "deny");
+  });
+  it("does not establish complete parsing for dynamic syntax or heredocs", () => {
+    assert.equal(parseShellCommands("cat <<'EOF'\ntext\nEOF"), undefined);
+    assert.equal(parseShellCommands("echo $(pwd)")?.complete, false);
+    assert.equal(parseShellCommands("echo $'text'"), undefined);
+  });
+});
 
 describe("shell approval guard", () => {
   it("rejects a dangerous tail before any configured reviewer can allow it", async () => {
     for (const resources of [["pwd ; sudo rm -rf"], ["pwd", "sudo rm -rf"], ['"su"do rm -rf'], ["rm '-rf' '/'"],
       ["sudo cat <<'EOF'\nhello\nEOF"], ["pwd; \"su\"do id"], ["pwd; rm '-rf' '/'"],
       ["cat <<'EOF'\ntext\nEOF\nsudo id"]])
-      assert.equal((await compositeDecision(permissive, { action: "shell", resources }, unused)).decision, "deny");
+      assert.equal(scoreRequest({ action: "shell", resources }, options).deny, true);
   });
   it("allows read-only command sequences and harmless redirections", () => {
     for (const command of [
@@ -20,13 +57,13 @@ describe("shell approval guard", () => {
       "pwd && ls",
       "git status --short && git branch --show-current",
       "date +%s ; date +%s",
-      "gh label list --limit 100 2>&1",
-      "docker logs otel-lgtm --since 10m 2>&1 | grep -iE 'trace|error'",
-      "sed -n '210,232p' ~/.config/opencode/opencode.json",
+      "gh label list --limit 100",
+      "docker logs test-service --since 10m | grep -iE 'trace|error'",
+      "sed -n '210,232p' src/config.ts",
       "gh api repos/x/issues/25 --jq '{\"number,title\"}'",
       "rg TODO src && bun run typecheck",
       "ls -la src",
-      "echo done > /dev/null 2>&1",
+      "echo done > /dev/null",
       "cat /tmp/file",
       "find . -name '*.ts'",
       "pwd &",
@@ -105,8 +142,8 @@ describe("shell approval guard", () => {
   });
   it("denies blocked invocations split by a backslash continuation", () => {
     for (const command of ["sudo echo first \\\nsecond", "pwd; sudo \\\nid", "pwd; s\\\nu\\\ndo id",
-      "su\\\ndo id", "pwd; rm -r\\\nf /", "rm -rf \\\n/", "chmod 77\\\n7 secret",
-      "chmod 777 2\\\n>/dev/null secret", "mkfs.ext\\\n4 /dev/sda1", "dd of=\\\n/dev/sda",
+      "su\\\ndo id", "pwd; rm -r\\\nf /", "rm -rf \\\n/", "chmod 77\\\n7 target",
+      "chmod 777 2\\\n>/dev/null target", "mkfs.ext\\\n4 /dev/sda1", "dd of=\\\n/dev/sda",
       "shutdown -\\\nh now", "stdbuf -o L \\\nsudo id", "env -u HOME sudo \\\nid",
       "bash -c 'sudo echo first \\\nsecond'", "bash -c 's\\\nudo id'", "eval 'rm -rf \\\n/'",
       "cat <<'EOF'\ntext\nEOF\nsudo echo first \\\nsecond", "cat <<'EOF'\na \\\nb\nEOF\nsudo \\\nid"])
@@ -387,7 +424,7 @@ describe("shell approval guard", () => {
   });
   it("keeps a continued command exactly as dangerous as the command it joins", () => {
     const insert = (command: string, index: number) => `${command.slice(0, index)}\\\n${command.slice(index)}`;
-    for (const command of ["sudo id", "su root", "rm -rf /", "rm -r / --no-preserve-root", "chmod 777 secret",
+    for (const command of ["sudo id", "su root", "rm -rf /", "rm -r / --no-preserve-root", "chmod 777 target",
       "mkfs.ext4 /dev/sda1", "dd of=/dev/sda", "shutdown -h now", "bash -c 'sudo id'", "eval 'rm -rf /'"]) {
       assert.equal(guardShell([command])?.decision, "deny", command);
       for (let index = 0; index <= command.length; index++) {
@@ -423,30 +460,12 @@ describe("shell approval guard", () => {
       "echo 'a\nb' #comment ; sudo id"])
       assert.equal(guardShell([command])?.decision, "allow", command);
   });
-  it("feeds parsed read-only commands into the static stage without bypassing model-only pipelines", async () => {
-    assert.deepEqual(shellWords('touch "a b"'), ["touch", "a b"]);
+  it("feeds simple read-only commands into low scoring and keeps complex commands high", () => {
     assert.equal(guardShell(["touch file"]), undefined);
-    for (const command of ["ls -la src", "sed -n '1,2p' file"]) {
-      const allowed = await compositeDecision([{ type: "static" }], { action: "shell", resources: [command] }, unused);
-      assert.equal(allowed.decision, "allow", command);
-      assert.equal(allowed.stage, "static");
-      let reviewed = 0;
-      const modelOnly = await compositeDecision([{ type: "llm" }], { action: "shell", resources: [command] }, async () => {
-        reviewed++;
-        return { decision: "allow", reason: "authorized" };
-      });
-      assert.equal(modelOnly.decision, "allow");
-      assert.equal(reviewed, 1);
-    }
-    const split = await compositeDecision([{ type: "static" }], { action: "shell", resources: ["pwd", "ls"] }, unused);
-    assert.equal(split.decision, "allow");
-    let chainReviewed = 0;
-    const chain = await compositeDecision(permissive, { action: "shell", resources: ["git status && git branch --show-current"] }, async () => {
-      chainReviewed++;
-      return { decision: "allow", reason: "authorized" };
-    });
-    assert.equal(chain.decision, "allow");
-    assert.equal(chainReviewed, 1);
+    for (const command of ["ls -la src", "sed -n '1,2p' file"])
+      assert.equal(scoreRequest({ action: "shell", resources: [command] }, options).band, "low", command);
+    assert.equal(scoreRequest({ action: "shell", resources: ["pwd", "ls"] }, options).band, "low");
+    assert.equal(scoreRequest({ action: "shell", resources: ["git status && git branch --show-current"] }, options).band, "high");
   });
   it("requires review when a read-only command is given write or exec flags", () => {
     for (const command of [
@@ -485,14 +504,10 @@ describe("shell approval guard", () => {
     // Subshell syntax is not parsed into segments, so it stays a manual approval.
     assert.equal(guardShell(["( sudo id )"])?.decision, "ask");
   });
-  it("runs before decision and model reviewers", async () => {    const stages = [{ type: "decision" as const, model: "typesafe-ai/jev-latest" }, { type: "llm" as const }];
-    assert.equal((await compositeDecision(stages, { action: "shell", resources: ["pwd $(touch marker)"] }, unused)).decision, "ask");
-    assert.equal((await compositeDecision(stages, { action: "shell", resources: ["sudo rm -rf /"] }, unused)).decision, "deny");
-    const reviewed = await compositeDecision(stages, { action: "shell", resources: ["pwd > marker"] }, async (stage) => {
-      assert.equal(stage.type, "decision");
-      return { decision: "allow", reason: "authorized" };
-    });
-    assert.equal(reviewed.decision, "allow");
+  it("scores before decision and model reviewers", () => {
+    assert.equal(scoreRequest({ action: "shell", resources: ["pwd $(touch marker)"] }, options).band, "high");
+    assert.equal(scoreRequest({ action: "shell", resources: ["sudo rm -rf /"] }, options).deny, true);
+    assert.equal(scoreRequest({ action: "shell", resources: ["pwd > marker"] }, options).band, "high");
   });
 });
 
@@ -565,8 +580,7 @@ describe("shell policy edge cases", () => {
   it("ignores inherited properties when looking up a command policy", async () => {
     for (const command of ["./constructor", "./__proto__", "./toString", "constructor"]) {
       assert.equal(guardShell([command]), undefined, command);
-      const result = await compositeDecision([{ type: "static" }], { action: "shell", resources: [command] }, unused);
-      assert.equal(result.decision, "ask", command);
+      assert.equal(scoreRequest({ action: "shell", resources: [command] }, options).band, "high", command);
     }
   });
 
@@ -580,9 +594,9 @@ describe("shell policy edge cases", () => {
   });
 
   it("denies chmod only when the mode operand is world-writable", () => {
-    for (const command of ["chmod 777 secret", "chmod -R 777 dir", "chmod --changes 0777 file"])
+    for (const command of ["chmod 777 target", "chmod -R 777 dir", "chmod --changes 0777 file"])
       assert.equal(guardShell([command])?.decision, "deny", command);
-    for (const command of ["chmod 600 777", "chmod u+w 777", "chmod --reference=secret 777"])
+    for (const command of ["chmod 600 777", "chmod u+w 777", "chmod --reference=target 777"])
       assert.notEqual(guardShell([command])?.decision, "deny", command);
   });
 
@@ -630,7 +644,7 @@ describe("shell policy edge cases", () => {
   });
 
   it("drops only descriptor prefixes that are adjacent in the source", () => {
-    assert.equal(stripDescriptorPrefixes("chmod 777 > /dev/null secret"), "chmod 777 > /dev/null secret");
+    assert.equal(stripDescriptorPrefixes("chmod 777 > /dev/null target"), "chmod 777 > /dev/null target");
     assert.equal(stripDescriptorPrefixes("echo 2>/dev/null"), "echo  >/dev/null");
     assert.equal(stripDescriptorPrefixes("echo 12>&1"), "echo  >&1");
     assert.equal(stripDescriptorPrefixes("pwd;2>/dev/null"), "pwd; >/dev/null");
@@ -643,23 +657,23 @@ describe("shell policy edge cases", () => {
     assert.equal(stripDescriptorPrefixes("echo \\2>/dev/null"), "echo \\2>/dev/null");
     assert.equal(stripDescriptorPrefixes("echo x2>/dev/null"), "echo x2>/dev/null");
     assert.equal(stripDescriptorPrefixes("echo a=2>/dev/null"), "echo a=2>/dev/null");
-    for (const command of ["chmod 777 > /dev/null secret", "sh -c 'chmod 777 > /dev/null secret'",
-      "eval 'chmod 777 > /dev/null secret'", "chmod 777 >> log secret", "chmod 0777 2>/dev/null secret",
-      "chmod 777 < /dev/null secret", "bash -c 'chmod 777 2>/dev/null secret'"])
+    for (const command of ["chmod 777 > /dev/null target", "sh -c 'chmod 777 > /dev/null target'",
+      "eval 'chmod 777 > /dev/null target'", "chmod 777 >> log target", "chmod 0777 2>/dev/null target",
+      "chmod 777 < /dev/null target", "bash -c 'chmod 777 2>/dev/null target'"])
       assert.equal(guardShell([command])?.decision, "deny", command);
     // A quoted or escaped digit is an argument, not a changed file descriptor.
-    for (const command of ['chmod 600 "2">/dev/null secret', "chmod 600 \\2>/dev/null secret"])
+    for (const command of ['chmod 600 "2">/dev/null target', "chmod 600 \\2>/dev/null target"])
       assert.notEqual(guardShell([command])?.decision, "deny", command);
   });
 
   it("keeps background operators separate from descriptor prefixes", () => {
     for (const command of ["true&2>/dev/null sudo -n id", "true&2>&1 sudo -n id",
-      "true &2>>/dev/null rm -r /", "true &1>/dev/null sudo -n id", "true &2>2 chmod 777 secret",
-      "true&2>2 chmod 777 secret", "sh -c 'true &2>/dev/null sudo -n id'",
+      "true &2>>/dev/null rm -r /", "true &1>/dev/null sudo -n id", "true &2>2 chmod 777 target",
+      "true&2>2 chmod 777 target", "sh -c 'true &2>/dev/null sudo -n id'",
       "eval 'true &2>/dev/null rm -r /'"])
       assert.equal(guardShell([command])?.decision, "deny", command);
     // The background helper must still reach review, never a static allow.
-    for (const command of ["true &2>2 chmod777 secret", "true &2>/dev/null bat --generate-config-file",
+    for (const command of ["true &2>2 chmod777 target", "true &2>/dev/null bat --generate-config-file",
       "true &2>>/dev/null bat --generate-config-file"])
       assert.equal(guardShell([command]), undefined, command);
   });
@@ -668,7 +682,7 @@ describe("shell policy edge cases", () => {
     for (const command of ["true;2>&-sudo id", "true&&2>&-sudo id", "true||2>&-sudo id",
       "true|2>&-sudo id", "true&2>&-sudo id", "true\n2>&-sudo id", "true;2<&-sudo id",
       'true;2>&-"sudo" id', "true;2>&-'sudo' id", "true;2>&-\\sudo id",
-      "true;2>&-chmod 777 secret", "true;2>&-rm -rf /", "true;2>&-bat --generate-config-file",
+      "true;2>&-chmod 777 target", "true;2>&-rm -rf /", "true;2>&-bat --generate-config-file",
       "2>&-sudo id", ">&-sudo id", "sh -c 'true;2>&-sudo id'", "eval 'true;2>&-rm -rf /'"])
       assert.equal(guardShell([command])?.decision, "ask", command);
     assert.equal(hasAmbiguousDescriptorClose("true;2>&-sudo id"), true);
@@ -704,9 +718,9 @@ describe("shell policy edge cases", () => {
     assert.equal(guardShell(["echo $(sudo id)"])?.decision, "ask");
   });
 
-  it("treats a glob redirection target as a write", () => {
+  it("requires manual approval for glob redirection targets", () => {
     for (const command of ["pwd > *.txt", "pwd > *.txt file"])
-      assert.equal(guardShell([command]), undefined, command);
+      assert.equal(guardShell([command])?.decision, "ask", command);
   });
 
   it("never auto-approves the newly reviewed dangerous operations", () => {
@@ -723,7 +737,7 @@ describe("shell policy edge cases", () => {
     // line becomes an argument of the first command and the deny is missed.
     for (const command of ["sh -c 'pwd\nsudo id'", "bash -c 'pwd\nrm -rf /'", "eval 'pwd\nsudo id'",
       "sh -c 'pwd\nls\nsudo id'", "sh -lc 'echo first\nsudo id'", "bash -c 'pwd\nrm -r -- /'",
-      "sh -c 'pwd # comment\nsudo id'", "sh -c 'echo one; pwd\nchmod 777 secret'",
+      "sh -c 'pwd # comment\nsudo id'", "sh -c 'echo one; pwd\nchmod 777 target'",
       "sh -c 'echo \"first\nsecond\" ; sudo id'", "bash -c 'for x in a\nrm -rf /'"])
       assert.equal(guardShell([command])?.decision, "deny", command);
     // A quoted newline is part of one word, so the invocation stays whole instead
@@ -742,7 +756,7 @@ describe("shell policy edge cases", () => {
     // The body of a heredoc is data for the inner shell, so a dangerous word or a
     // `;` inside it is text, not a command. Only the surrounding script is judged.
     for (const command of ["sh -c 'cat <<\"EOF\"\ntext; sudo id\nEOF'",
-      "sh -c 'cat <<\"EOF\"\nrm -rf /\nEOF'", "bash -c 'cat <<\"EOF\"\nchmod 777 secret\nEOF'",
+      "sh -c 'cat <<\"EOF\"\nrm -rf /\nEOF'", "bash -c 'cat <<\"EOF\"\nchmod 777 target\nEOF'",
       "eval 'cat <<EOF\nsudo id\nEOF'", "sh -c 'cat <<- \"EOF\"\n\tsudo id\n\tEOF'",
       "sh -c 'cat <<\"A\" <<\"B\"\nx\nA\nsudo id\nB'", "sh -c 'cat <<\\EOF\nx\nEOF\nsudo id\nEOF'",
       "sh -c 'cat <<\"EOF\"\nx\nEOF\n'"]
@@ -928,8 +942,452 @@ describe("shell policy edge cases", () => {
     assert.equal(guardShell(["sh -c 'stdbuf -o L sudo id'"])?.decision, "deny");
     // Read-only pipelines and permits that do not depend on flags stay allowed.
     for (const command of ["rg TODO src && bun run typecheck", "git status --short", "ls -la src",
-      "docker logs otel-lgtm --since 10m 2>&1 | grep -iE 'trace|error'",
-      "gh label list --limit 100 2>&1", "find . -name '*.ts'", "uniq -c file", "hostname -s"])
+      "docker logs test-service --since 10m | grep -iE 'trace|error'",
+      "gh label list --limit 100", "find . -name '*.ts'", "uniq -c file", "hostname -s"])
+      assert.equal(guardShell([command])?.decision, "allow", command);
+  });
+});
+
+describe("shell security regressions", () => {
+  it("keeps mandatory denies visible before an undecoded-syntax ask", () => {
+    const request = { action: "shell" as const, projectDir: "/project" };
+    for (const command of ["cat .env # $'", "sudo id\necho $'x'", "rm -rf / # $'", "rm -rf /outside # $'",
+      ":(){ :|:& };: # $'"])
+      assert.equal(scoreRequest({ ...request, resources: [command] }, options).deny, true, command);
+    // Oversized commands keep the deny visible in their literal prefix.
+    for (const command of [`sudo id ${"x".repeat(5000)}`, `cat .env ${"x".repeat(5000)}`, `rm -rf / ${"x".repeat(5000)}`])
+      assert.equal(scoreRequest({ ...request, resources: [command] }, options).deny, true, command.slice(0, 24));
+    // Genuinely ambiguous syntax with no visible deny still reaches manual review.
+    for (const command of ["touch \"unclosed", "pwd $(touch marker)", "bash -c pwd", "echo $'a b'", "umask 000"])
+      assert.equal(scoreRequest({ ...request, resources: [command] }, options).ask, true, command);
+  });
+
+  it("treats tilde, $HOME, empty and abbreviated recursive deletes as external", () => {
+    const request = { action: "shell" as const, projectDir: "/project" };
+    for (const command of ["rm -rf ~/", "rm -rf ~/Documents", "rm -rf ~", "rm -rf \"$HOME\"",
+      "rm -rf ${HOME}/Documents", "rm -rf \"\"", "rm -rf --recursi /outside", "rm -rf --forc /outside",
+      "rm --recursi --forc /outside", "rm -r --recursiv /outside"])
+      assert.equal(scoreRequest({ ...request, resources: [command] }, options).deny, true, command);
+    // In-project deletes and non-recursive deletes stay non-denies.
+    for (const command of ["rm -rf ./build", "rm -rf /project/build", "rm -f ./file"])
+      assert.notEqual(scoreRequest({ ...request, resources: [command] }, options).deny, true, command);
+    // The root guard also accepts GNU long-option abbreviations.
+    for (const command of ["rm --recursi /", "rm --recursiv --no-preserve-root /"])
+      assert.equal(guardShell([command])?.decision, "deny", command);
+  });
+
+  it("detects attached printf -v variable assignment", () => {
+    for (const command of ["printf -vPATH x", "printf -vLD_PRELOAD x", "printf -v PATH x", "printf -vBASH_ENV x"])
+      assert.equal(guardShell([command])?.decision, "deny", command);
+    // `--` ends option parsing, so later `-v` text is a literal format argument.
+    for (const command of ["printf -- -v", "printf -- -vPATH"])
+      assert.notEqual(guardShell([command])?.decision, "deny", command);
+    // Any attached `-v` is an assignment shape, not a read-only invocation.
+    assert.equal(guardShell(["printf -vX text"]), undefined);
+    assert.equal(guardShell(["printf -- -v"])?.decision, "allow");
+  });
+
+  it("keeps low-band reads and path operands inside the project", () => {
+    const root = mkdtempSync(join(tmpdir(), "auto-mode-shell-scope-"));
+    try {
+      mkdirSync(join(root, ".git"));
+      writeFileSync(join(root, "file.txt"), "");
+      const request = { action: "shell" as const, projectDir: root };
+      for (const command of ["cat file.txt", "cat < file.txt", "echo done > /dev/null", "ls -la .", "sed -n 1p file.txt"])
+        assert.equal(scoreRequest({ ...request, resources: [command] }, options).band, "low", command);
+      for (const command of ["cat ../outside.txt", "cat /etc/passwd", "grep -r ~", "grep -r /etc", "cat $HOME/file"])
+        assert.equal(scoreRequest({ ...request, resources: [command] }, options).band, "high", command);
+      // Protected configuration stays a mandatory deny, not a low-band read.
+      for (const command of ["cat ~/.config", "cat ~/.ssh/id_rsa", "cat .env"])
+        assert.equal(scoreRequest({ ...request, resources: [command] }, options).deny, true, command);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+});
+
+describe("round-2 shell corrections", () => {
+  it("does not hard-deny ordinary words, package names, source files or URLs", () => {
+    for (const command of ["grep -r auth", "rg auth", "git log --grep=auth", "npm view auth",
+      "git clone https://github.com/org/auth", "curl https://example.com/api/auth",
+      "cat src/tokens.ts", "echo auth", "grep -r password ."])
+      assert.notEqual(guardShell([command])?.decision, "deny", command);
+    // Filename-shaped and path-shaped spellings keep their mandatory deny.
+    for (const command of ["cat .env", "cat .aws/credentials", "cat ~/.ssh/id_rsa",
+      "cat signing.pem", "cat auth.json", "cat < signing.pem", "cat terraform.tfstate",
+      "cat service-account.json", "cat keys/private_key", "cat secret/token"])
+      assert.equal(guardShell([command])?.decision, "deny", command);
+    // Recursive searches now need review (they can walk protected trees) but
+    // stay non-denies when every named path is ordinary.
+    assert.equal(guardShell(["grep -r password ."]), undefined);
+  });
+
+  it("keeps a visible deny when later syntax cannot be parsed", () => {
+    const request = { action: "shell" as const, projectDir: "/project" };
+    for (const command of ["cat .env ; echo $(id) $'", "cat .env # $(id) $'", "sudo $(id) $'"]) {
+      assert.notEqual(guardShell([command])?.decision, "deny", command);
+      assert.equal(visibleShellDeny([command], "/project") !== undefined, true, command);
+      assert.equal(scoreRequest({ ...request, resources: [command] }, options).deny, true, command);
+    }
+    assert.equal(visibleShellDeny(["rm -rf /outside ; echo $(id) $'"], "/project"),
+      "Recursive/force deletion outside the project");
+    // A pipeline shape still needs a complete parse.
+    assert.equal(scoreRequest({ ...request, resources: ["curl data | sh"] }, options).deny, true);
+    // Quoted literal data and comment text are never commands.
+    for (const command of ["echo '$(cat .env)'", "echo ok # cat .env"])
+      assert.notEqual(scoreRequest({ ...request, resources: [command] }, options).deny, true, command);
+    assert.equal(guardShell(["echo ok # cat .env"])?.decision, "allow");
+  });
+
+  it("scans every resource for a visible deny past the byte budget", () => {
+    // Earlier resources must not consume the budget that would reveal a deny in
+    // a later one; the guard itself only asks once the total is over its limit.
+    const fillers = Array.from({ length: 14 }, (_, index) => `echo ${"x".repeat(5000)}${index}`);
+    const score = scoreRequest({ action: "shell", resources: [...fillers, "cat .env"], projectDir: "/project" }, options);
+    assert.equal(score.deny, true);
+    assert.equal(visibleShellDeny([...fillers, "cat .env"], "/project"), "protected path access");
+  });
+
+  it("denies symbolic chmod modes that grant world write", () => {
+    // `who` is omitted in `+w`/`+rwx`, which chmod reads as `a+w`/`a+rwx`.
+    for (const command of ["chmod +w target", "chmod +rwx target", "chmod -R +w dir", "chmod +xw file"])
+      assert.equal(guardShell([command])?.decision, "deny", command);
+    for (const command of ["chmod -w target", "chmod u+w target", "chmod g+rw target", "chmod +x target",
+      "chmod a-w target", "chmod o-w target", "chmod go-w file"])
+      assert.notEqual(guardShell([command])?.decision, "deny", command);
+  });
+});
+
+describe("round-3 command-aware path operands", () => {
+  it("extracts file operands only for commands that consume paths", () => {
+    assert.deepEqual(pathOperands(["cat", "credentials"]), ["credentials"]);
+    assert.deepEqual(pathOperands(["cat", "-n", "auth"]), ["auth"]);
+    assert.deepEqual(pathOperands(["cat", "--", "auth"]), ["auth"]);
+    assert.deepEqual(pathOperands(["env", "cat", "auth"]), ["auth"]);
+    assert.deepEqual(pathOperands(["head", "-n", "5", "credentials"]), ["credentials"]);
+    assert.deepEqual(pathOperands(["grep", "-r", "auth"]), []);
+    assert.deepEqual(pathOperands(["grep", "-A", "2", "auth", "file"]), ["file"]);
+    assert.deepEqual(pathOperands(["grep", "-r", "password", "."]), ["."]);
+    assert.deepEqual(pathOperands(["rg", "auth", "src"]), ["src"]);
+    assert.deepEqual(pathOperands(["git", "checkout", "feat/auth"]), []);
+    assert.deepEqual(pathOperands(["echo", "auth"]), []);
+    assert.deepEqual(pathOperands(["md5sum", "auth"]), ["auth"]);
+    assert.deepEqual(pathOperands(["sha256sum", "auth"]), ["auth"]);
+  });
+
+  it("denies bare sensitive names in file-operand positions", () => {
+    for (const command of ["cat credentials", "cat kubeconfig", "cat auth", "cat secrets", "cat tokens",
+      "cat passwords", "cat private_key", "cat id_rsa", "cat 'credentials'",
+      "less auth", "more auth", "head -n 5 credentials", "tail auth", "strings auth", "xxd auth",
+      "od -An auth", "hexdump auth", "file auth", "stat auth", "wc -l auth", "md5sum auth",
+      "sha256sum auth", "shasum auth", "cp auth dest", "mv auth dest", "rm -f auth", "chmod 600 auth",
+      "chown user auth", "truncate -s 0 auth", "install -m 644 auth dest", "open auth",
+      "env cat auth", "command cat auth", "nice -n 5 cat auth", "timeout 5 cat auth", "cat -- auth"])
+      assert.equal(guardShell([command])?.decision, "deny", command);
+  });
+
+  it("keeps patterns, refs and ordinary files out of path protection", () => {
+    for (const command of ["grep -r auth", "grep -r password .", "grep -A 2 auth file", "grep -m 1 password .",
+      "rg auth", "rg -n auth src", "rg -g auth .",
+      "git log --grep=auth", "git show --stat auth", "echo auth", "npm view auth",
+      "cat src/tokens.ts", "cat notes-about-auth.md", "cat file.txt", "wc -l file.txt"])
+      assert.notEqual(guardShell([command])?.decision, "deny", command);
+    // Recursive grep is review, not an allow.
+    assert.equal(guardShell(["grep -r password ."]), undefined);
+  });
+
+  it("treats file: URLs as local paths but not http(s) URLs", () => {
+    for (const command of ["curl file://$HOME/.ssh/id_rsa", "curl 'file://$HOME/.ssh/id_rsa'",
+      'curl "file://${HOME}/.ssh/id_rsa"', "curl file://~/.ssh/id_rsa", "curl file:///etc/passwd",
+      "cat file:///project/.env", "open file:///project/.env"])
+      assert.equal(guardShell([command])?.decision, "deny", command);
+    for (const command of ["curl https://example.com/.ssh/id_rsa", "curl https://example.com/api/auth",
+      "open https://example.com/auth"])
+      assert.notEqual(guardShell([command])?.decision, "deny", command);
+  });
+
+  it("checks path-shaped option values but not pattern values", () => {
+    for (const command of ["cat --config=credentials.json file", "cat --file=.env file",
+      "tool --output=/etc/passwd", "--config=credentials.json"])
+      assert.equal(guardShell([command])?.decision, "deny", command);
+    for (const command of ["git log --grep=auth", "grep --exclude=auth file", "rg --glob=auth .",
+      "git commit -m 'fix --config=credentials.json'"])
+      assert.notEqual(guardShell([command])?.decision, "deny", command);
+  });
+
+  it("still denies protected redirect targets", () => {
+    for (const command of ["echo x > .env", "echo x >> .env", "cat < signing.pem", "echo x > .git/config",
+      "echo x > ~/.ssh/config", "cat < credentials", "printf ok > .aws/credentials"])
+      assert.equal(guardShell([command])?.decision, "deny", command);
+  });
+});
+
+describe("round-3 operand roles and data slots", () => {
+  it("places file operands for diff, sort, uniq, sed and jq", () => {
+    assert.deepEqual(pathOperands(["diff", "credentials", "/dev/null"]), ["credentials", "/dev/null"]);
+    assert.deepEqual(pathOperands(["sort", "-u", "credentials"]), ["credentials"]);
+    assert.deepEqual(pathOperands(["uniq", "-c", "credentials"]), ["credentials"]);
+    assert.deepEqual(pathOperands(["sed", "-n", "1p", "credentials"]), ["credentials"]);
+    assert.deepEqual(pathOperands(["sed", "-f", "credentials", "file"]), ["credentials", "file"]);
+    assert.deepEqual(pathOperands(["sed", "-e", "s/x/y/", "credentials"]), ["credentials"]);
+    assert.deepEqual(pathOperands(["jq", ".", "credentials"]), ["credentials"]);
+    assert.deepEqual(pathOperands(["jq", "-f", "credentials", "file"]), ["credentials", "file"]);
+    assert.deepEqual(pathOperands(["jq", "--arg", "name", "value", ".", "file"]), ["file"]);
+    assert.deepEqual(pathOperands(["jq", "--slurpfile", "data", "credentials", ".", "file"]),
+      ["credentials", "file"]);
+  });
+
+  it("denies bare sensitive operands of every file-reading command", () => {
+    for (const command of ["diff credentials /dev/null", "sort credentials", "uniq credentials",
+      "jq . credentials", "sed -n 1p credentials", "sed -f credentials file",
+      "sed --file=credentials file", "sed -e s/x/y/ credentials", "sed -e s/x/y/ --expression=z credentials",
+      "jq --slurpfile data credentials . file", "jq --rawfile data credentials . file",
+      "jq --arg name value . credentials", "diff -- credentials /dev/null"])
+      assert.equal(guardShell([command])?.decision, "deny", command);
+  });
+
+  it("supplies grep patterns from -e/--regexp and reads -f/--file as a path", () => {
+    for (const command of ["grep -e auth -e password .", "grep -eauth -epassword .", "grep --regexp=auth file",
+      "rg -e auth .", "rg -eauth file", "grep -i -e auth src"])
+      assert.notEqual(guardShell([command])?.decision, "deny", command);
+    for (const command of ["grep --file=credentials credentials", "grep -f credentials file",
+      "rg --file=credentials file", "grep -fcredentials file", "grep --file=credentials ."])
+      assert.equal(guardShell([command])?.decision, "deny", command);
+  });
+
+  it("keeps separator-less leading-dot words ordinary except explicit names", () => {
+    for (const command of ["jq .name", "jq .name file", "git add .gitignore", "echo .foo", "mkdir .cache",
+      "echo .name"])
+      assert.notEqual(guardShell([command])?.decision, "deny", command);
+    for (const command of ["cat .env", "cat .npmrc", "cat auth.json", "cat .env.local", "git add .env"])
+      assert.equal(guardShell([command])?.decision, "deny", command);
+  });
+
+  it("skips command data slots even when they spell a path", () => {
+    for (const command of ["grep config/auth file", "grep src/.env file", "rg src/.env file",
+      "sed s/.env/.x/p file", "sed -n 's/.env/.x/p' file", "jq '.name' file", "jq .name file",
+      "git log --grep=config/auth", "git log --format=src/.env", "git log --grep config/auth",
+      "grep --exclude=.env file", "grep --include=config/auth file", "rg --glob=config/auth .",
+      "grep --regexp=config/auth file"])
+      assert.notEqual(guardShell([command])?.decision, "deny", command);
+    // The same names still deny in a file slot or a redirect.
+    for (const command of ["cat .env", "cat --file=.env file", "cat --config=credentials.json file",
+      "echo x > .env", "cat < signing.pem", "cat credentials"])
+      assert.equal(guardShell([command])?.decision, "deny", command);
+  });
+});
+
+describe("round-4 option grammar", () => {
+  it("does not skip a numeric pattern after a plain flag", () => {
+    for (const command of ["grep -v 9 .env", "grep -i 5 .env", "rg -v 9 .env", "grep -A 2 5 .env",
+      "grep -c 5 .env", "grep -n 5 auth credentials"])
+      assert.equal(guardShell([command])?.decision, "deny", command);
+    for (const command of ["grep -A 2 auth file", "grep -m 1 password .", "grep -C 3 auth src",
+      "rg -m 1 auth src", "grep -B 2 auth file"])
+      assert.notEqual(guardShell([command])?.decision, "deny", command);
+  });
+
+  it("parses bundled short options letter by letter", () => {
+    for (const command of ["grep -ifpats .env", "grep -ie5 .env", "grep -gef .env",
+      "grep -Ffcredentials .env", "rg -ie5 credentials"])
+      assert.equal(guardShell([command])?.decision, "deny", command);
+    for (const command of ["grep -in auth src", "grep -iv auth file", "rg -in auth src",
+      "grep -if '*.txt' src"])
+      assert.notEqual(guardShell([command])?.decision, "deny", command);
+    // The attached value is the file, not the whole option word.
+    assert.deepEqual(pathOperands(["grep", "-ifpats", ".env"]), [".env"]);
+    assert.deepEqual(operandRoles(["grep", "-Ffcredentials", ".env"]).pathValues, ["credentials"]);
+  });
+
+  it("resolves unabbreviated and abbreviated long options", () => {
+    for (const command of ["grep --reg=. .env", "grep --rege=. .env", "grep --regex=. .env",
+      "grep --fil=credentials file", "sed --exp=s/x/y/ credentials", "sed --fil=credentials file"])
+      assert.equal(guardShell([command])?.decision, "deny", command);
+    for (const command of ["grep --reg=auth file", "grep --regexp=auth file", "rg --reg=auth src"])
+      assert.notEqual(guardShell([command])?.decision, "deny", command);
+  });
+
+  it("keeps a numeric jq filter after a flag", () => {
+    for (const command of ["jq -e 1 credentials", "jq -r 1 credentials", "jq --tab 1 credentials",
+      "jq -c 1 credentials"])
+      assert.equal(guardShell([command])?.decision, "deny", command);
+    for (const command of ["jq -e 1", "jq .name", "jq --indent 2 .name file"])
+      assert.notEqual(guardShell([command])?.decision, "deny", command);
+  });
+
+  it("reads cut and bat file operands", () => {
+    for (const command of ["cut -d, -f1 credentials", "cut -c1 auth", "bat credentials", "bat .env"])
+      assert.equal(guardShell([command])?.decision, "deny", command);
+    for (const command of ["cut -d, -f1 file", "bat README.md", "bat --style=numbers file"])
+      assert.notEqual(guardShell([command])?.decision, "deny", command);
+  });
+
+  it("treats rg type and grep label/directory values as data", () => {
+    for (const command of ["rg -t ts auth .", "rg -T ts auth .", "rg --type ts config/auth src",
+      "rg --type-not ts config/auth src", "grep --label x config/auth src", "grep -d skip config/auth src",
+      "grep --directories=skip config/auth src", "rg --encoding utf8 config/auth src",
+      "rg --replace .env config/auth src", "rg --type-add .env config/auth src",
+      "rg --type-clear .env config/auth src"])
+      assert.notEqual(guardShell([command])?.decision, "deny", command);
+    assert.equal(guardShell(["rg --type-add credentials auth src"])?.decision, "allow");
+  });
+
+  it("denies a path after a ref colon", () => {
+    for (const command of ["git show HEAD:.env", "git show HEAD:src/.env", "git diff HEAD:.env",
+      "git cat-file -p HEAD:credentials"])
+      assert.equal(guardShell([command])?.decision, "deny", command);
+    for (const command of ["git show HEAD:src/main.ts", "git log --grep=HEAD:.env",
+      "git log --format=HEAD:.env"])
+      assert.notEqual(guardShell([command])?.decision, "deny", command);
+  });
+
+  it("places git message and ref positions as data", () => {
+    for (const command of ["git checkout -b feat/auth", "git switch -c feat/auth", "git branch feat/auth",
+      "git push origin feat/auth", "git fetch origin feat/auth", "git commit -m 'fix: handle src/.env'",
+      "git commit -am 'fix: handle src/.env'", "git tag -m 'release: src/.env' v1",
+      "git checkout feat/auth", "git branch --delete feat/auth"])
+      assert.notEqual(guardShell([command])?.decision, "deny", command);
+    for (const command of ["git add .env", "git checkout -- .env", "git restore .env",
+      "git commit --file=.env", "git commit -F credentials"])
+      assert.equal(guardShell([command])?.decision, "deny", command);
+  });
+});
+
+describe("round-5 read-only policy gaps", () => {
+  it("reviews jq filter files and --run-tests in every spelling", () => {
+    for (const command of ["jq --run-tests .npmrc", "jq -n -f script.jq", "jq -fscript.jq",
+      "jq --from-file=script.jq", "jq --from=script.jq", "jq -nf script.jq"])
+      assert.notEqual(guardShell([command])?.decision, "allow", command);
+    // A protected file in a filter-file slot still denies.
+    assert.equal(guardShell(["jq -f credentials"])?.decision, "deny");
+    // Ordinary filters and explicit value options stay read-only.
+    for (const command of ["jq .name", "jq --indent 2 .name file", "jq -c 1", "jq -e 1"])
+      assert.equal(guardShell([command])?.decision, "allow", command);
+  });
+
+  it("reviews date files instead of reading their paths as dates", () => {
+    for (const command of ["date -f credentials", "date --file credentials", "date -fcredentials",
+      "date --file=credentials", "date --fil credentials"])
+      assert.notEqual(guardShell([command])?.decision, "allow", command);
+    for (const command of ["date +%s", "date -u +%Y-%m-%d", "date -d tomorrow +%s", "date -R",
+      "date -Iseconds", "date --date=@0 +%s"])
+      assert.equal(guardShell([command])?.decision, "allow", command);
+  });
+
+  it("protects grep/rg files of patterns and ignores", () => {
+    for (const command of ["grep --exclude-from .npmrc file", "grep --exclude-f id_rsa file",
+      "grep --exclude-from=.npmrc file", "rg --ignore-file .npmrc src", "rg --ignore-file=.npmrc src"])
+      assert.equal(guardShell([command])?.decision, "deny", command);
+    // The case-insensitive flag is a flag, not an --ignore-file value.
+    assert.equal(guardShell(["rg --ignore-file-case-insensitive auth src"])?.decision, "allow");
+  });
+
+  it("reviews find path-file options", () => {
+    for (const command of ["find . -files0-from credentials", "find . -files0-from=credentials",
+      "find . -fprint out.txt", "find . -fprintf out.txt x"])
+      assert.notEqual(guardShell([command])?.decision, "allow", command);
+    assert.equal(guardShell(["find . -name '*.ts'"])?.decision, "allow");
+  });
+
+  it("reviews du files of paths and excludes", () => {
+    for (const command of ["du --files0-from credentials", "du --files0 credentials",
+      "du --exclude-from credentials", "du -X credentials", "du -hX credentials"])
+      assert.notEqual(guardShell([command])?.decision, "allow", command);
+    for (const command of ["du -sh src", "du -a src"])
+      assert.equal(guardShell([command])?.decision, "allow", command);
+  });
+
+  it("reviews tree input files", () => {
+    for (const command of ["tree --fromfile credentials", "tree --fromtabfile credentials",
+      "tree --fromf credentials"])
+      assert.notEqual(guardShell([command])?.decision, "allow", command);
+    for (const command of ["tree -L 2", "tree src"])
+      assert.equal(guardShell([command])?.decision, "allow", command);
+  });
+});
+
+describe("round-6 indirect file options", () => {
+  it("denies or reviews files read through an option", () => {
+    for (const command of ["sort --files0-from credentials", "sort --files0-from=credentials",
+      "sort --files0 credentials", "sort --files0-f=credentials", "wc --files0-from credentials",
+      "wc --files0-from=credentials", "wc --files0 credentials", "file -f credentials",
+      "file -fcredentials", "file --files-from=credentials", "file --files-f credentials",
+      "file -m credentials", "diff -Xcredentials a b", "diff -X credentials a b",
+      "diff --exclude-from=.npmrc a b", "diff --exclude-f .npmrc a b", "diff --to-file=credentials a",
+      "date --file=credentials", "tree --gitf=credentials",
+      "sort --random-source=credentials file", "sort -ocredentials file", "sort -Tcredentials file"])
+      assert.equal(guardShell([command])?.decision, "deny", command);
+    for (const command of ["sort --files0-from list.txt", "wc --files0-from list.txt", "file -C",
+      "file --compile", "file --comp", "file -nCcredentials", "date -f credentials",
+      "date -fcredentials", "date -rcredentials", "date -urcredentials", "tree --fromfile credentials",
+      "tree --fromtabfile credentials", "tree --gitfile credentials", "du --files0-from credentials",
+      "du --exclude-from credentials", "du -X credentials", "find . -files0-from credentials",
+      "find . -files0-f credentials", "find . -files0-from=credentials",
+      "bat --config-file credentials file", "hostname -F credentials", "jq -f script.jq",
+      "jq --run-tests .npmrc", "rg --ignore-file .npmrc src", "grep --exclude-from .npmrc file"])
+      assert.notEqual(guardShell([command])?.decision, "allow", command);
+    // The separate `-r FILE` form stays a checked word: a path-shaped
+    // reference denies while an ordinary stamp file stays read-only.
+    assert.equal(guardShell(["date -r id_rsa +%s"])?.decision, "deny");
+    assert.equal(guardShell(["date -r build.stamp +%s"])?.decision, "allow");
+  });
+
+  it("keeps ordinary forms read-only", () => {
+    for (const command of ["sort file", "sort -u file", "sort -k 2 file", "wc file", "wc -l file",
+      "file file.txt", "file -b file", "diff a b", "diff -u a b", "diff -x pattern a b",
+      "grep pattern file", "rg pattern .", "jq .name", "date +%s", "date -d tomorrow +%s",
+      "tree -L 2", "du -sh src", "find . -name '*.ts'", "sed -n 1p file", "bat README.md",
+      "hostname -s"])
+      assert.equal(guardShell([command])?.decision, "allow", command);
+  });
+});
+
+describe("round-8 attached long values", () => {
+  it("extracts path-role long values but not data options", () => {
+    assert.deepEqual(operandRoles(["file", "--magic-file=alias/notes.txt", "a"]).pathValues, ["alias/notes.txt"]);
+    assert.deepEqual(operandRoles(["sort", "--random-source=alias/random", "file.txt"]).pathValues,
+      ["alias/random"]);
+    assert.deepEqual(operandRoles(["diff", "--to-file=alias/notes.txt", "a"]).pathValues, ["alias/notes.txt"]);
+    assert.deepEqual(operandRoles(["diff", "--from-file=alias/notes.txt", "a"]).pathValues, ["alias/notes.txt"]);
+    assert.deepEqual(operandRoles(["jq", "--library-path=lib", "-n", "1"]).pathValues, ["lib"]);
+    for (const words of [["git", "log", "--grep=config/auth"], ["grep", "--regexp=auth", "file"],
+      ["grep", "--exclude=.env", "file"], ["grep", "--include=config/auth", "src"],
+      ["rg", "--glob=config/auth", "."], ["diff", "--label=credentials", "a", "b"]])
+      assert.deepEqual(operandRoles(words).pathValues, [], words.join(" "));
+  });
+});
+
+describe("round-9 recursive and new-file searches", () => {
+  it("reviews diff tree and new-file modes", () => {
+    for (const command of ["diff -N . empty", "diff -rN . empty", "diff -urN . empty",
+      "diff -r . empty", "diff -ru . empty", "diff --new-file . empty",
+      "diff --unidirectional-new-file . empty", "diff --recursive . empty",
+      "diff --new-f . empty", "diff --recurs . empty"])
+      assert.notEqual(guardShell([command])?.decision, "allow", command);
+    for (const command of ["diff a b", "diff -u a b", "diff -U 3 a b", "diff -x pattern a b",
+      "diff -Xpatterns a b"])
+      assert.equal(guardShell([command])?.decision, "allow", command);
+    for (const command of ["diff -N credentials empty", "diff -r ~/.ssh empty", "diff -N .env empty"])
+      assert.equal(guardShell([command])?.decision, "deny", command);
+  });
+
+  it("reviews recursive grep searches", () => {
+    for (const command of ["grep -r '' .", "grep -R '' .", "grep --dereference-recursive '' .",
+      "grep -d recurse '' .", "grep --directories=recurse '' .", "grep -drecurse '' .",
+      "grep -r --include=.env '' .", "grep -nr pattern .", "grep --recursi '' ."])
+      assert.notEqual(guardShell([command])?.decision, "allow", command);
+    for (const command of ["grep pattern file", "grep -n pattern file", "grep -iE 'trace|error' file",
+      "grep -d skip pattern file", "grep --directories=skip pattern file", "grep -e auth file"])
+      assert.equal(guardShell([command])?.decision, "allow", command);
+    for (const command of ["grep -r '' .env", "grep -R pattern ~/.ssh/id_rsa", "grep -r '' credentials"])
+      assert.equal(guardShell([command])?.decision, "deny", command);
+  });
+
+  it("reviews rg hidden, unrestricted and follow searches", () => {
+    for (const command of ["rg --hidden pattern .", "rg -u pattern .", "rg -uu pattern .",
+      "rg --no-ignore pattern .", "rg --no-ignore-vcs pattern .", "rg -L pattern .",
+      "rg --follow pattern .", "rg --unrestricted pattern ."])
+      assert.notEqual(guardShell([command])?.decision, "allow", command);
+    for (const command of ["rg pattern .", "rg -n pattern src", "rg -g auth .", "rg -t ts auth .",
+      "rg -l pattern src", "rg -fpatterns ."])
       assert.equal(guardShell([command])?.decision, "allow", command);
   });
 });
