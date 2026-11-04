@@ -134,7 +134,8 @@ it("detects abbreviated and additional Git history changes", () => {
   const request = { action: "shell" as const, projectDir: "/project" };
   for (const command of ["git push --forc", "git push --force-with-leas", "git push --mirror", "git push --prun",
     "git commit --amen -m x", "git reset --har HEAD~1", "git branch --dele feature",
-    "git tag -d v1", "git tag --delete v1"]) {
+    "git push origin :refs/heads/topic", "git branch -f topic HEAD~1", "git branch --force topic HEAD~1",
+    "git tag -f v1 HEAD", "git tag --forc v1 HEAD", "git tag -d v1", "git tag --delete v1"]) {
     const score = scoreRequest({ ...request, resources: [command] }, options);
     assert.equal(score.band, "high", command);
     assert.equal(score.ask, true, command);
@@ -142,6 +143,35 @@ it("detects abbreviated and additional Git history changes", () => {
   }
   // Complete, safe VCS state turns the gate into ordinary review, not an ask.
   const good = { branch: "topic", defaultBranch: "trunk", upstream: "remote/topic", clean: true };
-  for (const command of ["git push --forc", "git push --mirror", "git tag -d v1"])
+  for (const command of ["git push --forc", "git push --mirror", "git push origin :refs/heads/topic",
+    "git branch -f topic HEAD~1", "git branch --force topic HEAD~1", "git tag -f v1 HEAD",
+    "git tag --forc v1 HEAD", "git tag -d v1"])
     assert.equal(scoreRequest({ ...request, resources: [command], gitState: good }, options).ask, undefined, command);
+  assert.equal(scoreRequest({
+    ...request, resources: ["git push origin :refs/heads/trunk"], gitState: good,
+  }, options).ask, true);
+});
+it("checks file operands without treating patterns as paths and guards history message symlinks", () => {
+  const root = mkdtempSync(join(tmpdir(), "auto-mode-shell-paths-"));
+  try {
+    const projectDir = join(root, "project");
+    mkdirSync(join(projectDir, "src"), { recursive: true });
+    writeFileSync(join(projectDir, "src", "file.ts"), "");
+    assert.notEqual(scoreRequest({
+      action: "shell", resources: ["grep -F '/api/v1' src/file.ts"], projectDir,
+    }, options).band, "high");
+
+    const message = join(root, "message.txt");
+    const messageLink = join(projectDir, "message-link");
+    writeFileSync(message, "commit message");
+    symlinkSync(message, messageLink);
+    const result = scoreRequest({
+      action: "shell",
+      resources: ["git commit --amend -F message-link"],
+      projectDir,
+      worktreeRoot: root,
+      gitState: { branch: "topic", defaultBranch: "trunk", upstream: "remote/topic", clean: true },
+    }, options);
+    assert.equal(result.ask, true);
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });

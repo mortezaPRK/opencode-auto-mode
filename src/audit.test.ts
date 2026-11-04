@@ -76,3 +76,16 @@ describe("unsafe opt-in audit log", () => {
     }
   });
 });
+
+describe("reviewer evidence redaction regressions", () => {
+  it("preserves JSON formatting when no evidence is redacted", () => {
+    for (const value of ["[ 1, 2 ]", '{ "command": "pwd", "nested": [ 3, 4 ] }'])
+      assert.equal(redactHttpBodies(value), value);
+  });
+  it("redacts abbreviated wget body options in literal and uncertain syntax", () => {
+    for (const command of ["wget --post-d=TOY_BODY https://example.invalid/", "wget --body-d=TOY_BODY https://example.invalid/", "wget --upload-f=TOY_BODY https://example.invalid/", "wget --execut=TOY_BODY", "wget --conf=TOY_CONFIG", "wget --post-d=TOY_BODY $(printf x)", "wget --conf=TOY_CONFIG $(printf x)"]) {
+      assert.doesNotMatch(redactHttpBodies(command), /TOY_(?:BODY|CONFIG)/, command);
+      assert.match(redactHttpBodies(command), /REDACTED/, command);
+    }
+  });
+});

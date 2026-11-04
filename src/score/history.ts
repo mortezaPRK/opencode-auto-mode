@@ -16,11 +16,11 @@ function hasAnyLong(args: readonly string[], names: readonly string[]): boolean 
 
 function pushRewritesHistory(args: readonly string[]): boolean {
   if (hasAnyLong(args, FORCE_PUSH_OPTIONS)) return true;
-  return args.some((arg) => /^-[^-]*[fd]/.test(arg) || arg.startsWith("+"));
+  return args.some((arg) => /^-[^-]*[fd]/.test(arg) || arg.startsWith("+") || /^:.+/.test(arg));
 }
 
 function deletesRef(args: readonly string[], shortFlag: RegExp): boolean {
-  return hasAnyLong(args, ["--delete"]) || args.some((arg) => shortFlag.test(arg));
+  return hasAnyLong(args, ["--delete", "--force"]) || args.some((arg) => shortFlag.test(arg));
 }
 
 /** True when a parsed Git invocation rewrites or deletes history. */
@@ -31,8 +31,8 @@ export function historyChange(words: readonly string[]): boolean {
   if (first === "push") return pushRewritesHistory(args);
   if (first === "commit") return hasLong(args, "--amend");
   if (first === "reset") return hasLong(args, "--hard");
-  if (first === "branch") return deletesRef(args, /^-[^-]*[dD]/);
-  if (first === "tag") return deletesRef(args, /^-[^-]*d/);
+  if (first === "branch") return deletesRef(args, /^-[^-]*[dDf]/);
+  if (first === "tag") return deletesRef(args, /^-[^-]*[df]/);
   return HISTORY_SUBCOMMANDS.has(first ?? "");
 }
 

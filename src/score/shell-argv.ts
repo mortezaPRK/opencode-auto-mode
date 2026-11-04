@@ -43,19 +43,18 @@ export function scanShell(resources: readonly string[]): ShellScan {
   };
 }
 
-/**
- * Attached option values (`-m/etc/hosts`, `-f../list`, `-X/path`) are file
- * operands the shell word itself hides; they take the same scope and symlink
- * checks as standalone operands.
- */
-function attachedPathValues(commands: readonly (ParsedShellCommands | undefined)[]): string[] {
-  return commands.flatMap((command) =>
-    command?.segments.flatMap((segment) => operandRoles(segment.words).pathValues) ?? []);
-}
-
-/** Every operand that names a file, standalone or attached to an option. */
+/** File targets are command-specific operands, attached path values, and redirects. */
 export function pathTargets(scan: ShellScan): string[] {
-  return [...scan.operands, ...attachedPathValues(scan.commands)];
+  return scan.commands.flatMap((command) => command === undefined ? [] : [
+    ...command.redirects,
+    ...command.segments.flatMap((segment) => {
+      const roles = operandRoles(segment.words);
+      return [
+        ...roles.paths.map((index) => segment.words[index]!),
+        ...roles.pathValues,
+      ];
+    }),
+  ]);
 }
 
 function hasWrapperPrelude(argv: readonly string[]): boolean {

@@ -1,5 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -23,6 +24,14 @@ describe("user-owned policy files", () => {
       const external = join(base, "config.jsonc");
       writeFileSync(external, '{ "ok": true }', { mode: 0o600 });
       assert.match(readUserOwnedFile(external, repo), /"ok": true/);
+    } finally { rmSync(base, { recursive: true, force: true }); }
+  });
+  it("rejects FIFOs without blocking while opening them", { skip: process.platform === "win32" }, () => {
+    const base = realpathSync(mkdtempSync(join(tmpdir(), "auto-mode-user-files-fifo-")));
+    try {
+      const fifo = join(base, "policy.jsonc");
+      execFileSync("mkfifo", ["-m", "600", fifo]);
+      assert.throws(() => readUserOwnedFile(fifo), /must be user-owned, single-linked/);
     } finally { rmSync(base, { recursive: true, force: true }); }
   });
 });

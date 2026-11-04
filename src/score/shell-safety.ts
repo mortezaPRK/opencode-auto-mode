@@ -48,7 +48,7 @@ function protectedPathScore(scan: ShellScan, projectDir?: string): RequestScore 
 
 /** Ordered shell safety pipeline: literal denies, then paths, then executable shape. */
 export function shellSafetyScore(scan: ShellScan, request: PermissionRequest, worktreeRoot?: string): RequestScore | undefined {
-  return literalShellScore(scan, request, worktreeRoot) ??
-    protectedPathScore(scan, request.projectDir) ??
-    executableShapeScore(scan);
+  const literal = literalShellScore(scan, request, worktreeRoot);
+  if (literal?.deny || literal?.ask) return literal;
+  return protectedPathScore(scan, request.projectDir) ?? literal ?? executableShapeScore(scan);
 }

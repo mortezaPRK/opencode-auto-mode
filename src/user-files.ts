@@ -62,7 +62,7 @@ export function readUserOwnedFile(filename: string, projectDir?: string, maxByte
     if (parent === current) break;
     current = parent;
   }
-  const descriptor = openSync(lexical, constants.O_RDONLY | constants.O_NOFOLLOW);
+  const descriptor = openSync(lexical, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
     const stat = fstatSync(descriptor);
     if (!stat.isFile() || stat.nlink !== 1 || stat.size > maxBytes ||
