@@ -70,7 +70,7 @@ const provider = createServer(async (req, res) => {
     if (tool) profile.issued = true;
     const output = completion(reviewer ? profile.reviewer ?? "ALLOW: fixture authorized" : "Ready", body.stream === true, tool, body.model);
     res.writeHead(200, { "content-type": output.type }); res.end(output.body);
-  } catch (error) { res.writeHead(500); res.end("internal error"); }
+  } catch { res.writeHead(500); res.end("internal error"); }
 });
 provider.listen(0, "127.0.0.1");
 await once(provider, "listening");
