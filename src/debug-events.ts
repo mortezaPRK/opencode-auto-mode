@@ -77,6 +77,14 @@ export function serializeDebugValue(value: unknown): string {
   }
 }
 
+/** Opens the sink for append, rejecting FIFOs/devices before the write can block indefinitely. */
+function openRegularFileForAppend(file: string): number {
+  const fd = fs.openSync(file, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_APPEND | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK, 0o600);
+  if (fs.fstatSync(fd).isFile()) return fd;
+  fs.closeSync(fd);
+  throw new Error("Refusing to write to a non-regular file");
+}
+
 /** Opt-in, local-only, best-effort sink. Rotation is controlled by the caller. */
 export function createJsonlLog(setting: DebugLogSetting): JsonlLog | undefined {
   if (!setting) return undefined;
@@ -99,7 +107,7 @@ export function createJsonlLog(setting: DebugLogSetting): JsonlLog | undefined {
             fs.unlinkSync(file);
           }
         } catch { /* No file yet, or rotation unavailable: append rather than lose the event. */ }
-        fd = fs.openSync(file, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_APPEND | fs.constants.O_NOFOLLOW, 0o600);
+        fd = openRegularFileForAppend(file);
         fs.fchmodSync(fd, 0o600);
         fs.writeFileSync(fd, line);
       } catch { /* Audit I/O must never fail a permission or tool request. */ }

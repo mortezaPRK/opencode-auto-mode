@@ -200,7 +200,7 @@ export function resolveExecutable(words: readonly string[]): { name: string; ind
 /** Commands whose non-option operands are files they read or modify. */
 const PATH_OPERAND_COMMANDS = new Set(["cat", "less", "more", "head", "tail", "strings", "xxd", "od",
   "hexdump", "file", "stat", "wc", "md5sum", "diff", "sort", "uniq", "cut", "bat", "cp", "mv", "rm",
-  "chmod", "chown", "truncate", "install", "open"]);
+  "chmod", "chown", "truncate", "install", "open", "ls", "du"]);
 /** Commands whose first non-option operand is a pattern and whose rest are paths. */
 const PATTERN_FIRST_COMMANDS = new Set(["grep", "rg"]);
 /** `shasum`, `sha1sum`, `sha256sum`, `sha384sum`, `sha512sum`. */
@@ -297,6 +297,10 @@ const PLAIN_SHORT_VALUES: Record<string, Record<string, ValueRole>> = {
   more: { n: "data" },
   open: { a: "data", b: "data" },
   file: { f: "path", m: "path", e: "data", F: "data" },
+  // `ls -I PATTERN` is an ignore glob; `-w`/`-T` take column/tab-size numbers.
+  ls: { I: "data", w: "data", T: "data" },
+  // `du -d N`/`--max-depth` is a number; `-X FILE` is the exclude-from file.
+  du: { d: "data", X: "path" },
 };
 /** Git subcommands whose operands this policy can place. */
 const GIT_HANDLED = new Set(["commit", "tag", "branch", "checkout", "switch", "push", "fetch"]);
@@ -582,6 +586,49 @@ function jqRoles(args: readonly string[], base: number, roles: RoleSets): void {
   }
 }
 
+/** `find` tests whose value is a path read for comparison, not a pattern. */
+const FIND_PATH_VALUE_TESTS = new Set(["-newer", "-anewer", "-cnewer", "-samefile",
+  "-fprint", "-fprint0", "-fprintf", "-fls"]);
+/** `find` tests whose value is data: patterns, types, sizes, times, ids. */
+const FIND_DATA_VALUE_TESTS = new Set(["-name", "-iname", "-path", "-ipath", "-regex", "-iregex",
+  "-wholename", "-iwholename", "-type", "-mtime", "-atime", "-ctime", "-mmin", "-amin", "-cmin",
+  "-size", "-perm", "-user", "-group", "-uid", "-gid", "-links", "-inum", "-maxdepth", "-mindepth",
+  "-printf", "-regextype", "-used", "-context"]);
+/** `-exec`/`-execdir`/`-ok`/`-okdir` consume an inline command, not a path test. */
+const FIND_EXEC_TESTS = new Set(["-exec", "-execdir", "-ok", "-okdir"]);
+
+/** True for the tokens (an option, `(`, `)`, `!`) that start `find`'s expression. */
+function startsFindExpression(word: string): boolean {
+  return word === "(" || word === ")" || word === "!" || word.startsWith("-");
+}
+
+/** Marks an inline `-exec ... ;`/`-exec ... +` command as data and returns its end index. */
+function consumeFindExecArgs(args: readonly string[], start: number, base: number, roles: RoleSets): number {
+  let index = start + 1;
+  while (index < args.length && args[index] !== ";" && args[index] !== "+") { roles.data.add(base + index); index++; }
+  return index;
+}
+
+/**
+ * `find [path...] [expression]`: positionals before the first expression
+ * token (an option, `(`, `)` or `!`) are starting paths; `-exec`/`-execdir`/
+ * `-ok`/`-okdir` consume a command up to `;`/`+` as data, and other tests
+ * consume their value as a path or data per the tables above.
+ */
+function findRoles(args: readonly string[], base: number, roles: RoleSets): void {
+  let sawExpression = false;
+  for (let index = 0; index < args.length; index++) {
+    const word = args[index];
+    if (!sawExpression) {
+      if (!startsFindExpression(word)) { roles.paths.add(base + index); continue; }
+      sawExpression = true;
+    }
+    if (FIND_EXEC_TESTS.has(word)) { index = consumeFindExecArgs(args, index, base, roles); continue; }
+    if (FIND_PATH_VALUE_TESTS.has(word) && index + 1 < args.length) { roles.paths.add(base + ++index); continue; }
+    if (FIND_DATA_VALUE_TESTS.has(word) && index + 1 < args.length) { roles.data.add(base + ++index); continue; }
+  }
+}
+
 /**
  * Git subcommands whose operands are refs, messages or other data rather than
  * files: `commit -m` messages, `branch <name>`, `checkout`/`switch` branches,
@@ -641,6 +688,7 @@ export function operandRoles(words: readonly string[]): OperandRoles {
   else if (name === "sed") sedRoles(args, executable.index + 1, roles);
   else if (name === "jq") jqRoles(args, executable.index + 1, roles);
   else if (name === "git") gitRoles(args, executable.index + 1, roles);
+  else if (name === "find") findRoles(args, executable.index + 1, roles);
   else if (PATH_OPERAND_COMMANDS.has(name) || CHECKSUM_COMMAND.test(name))
     plainRoles(name, args, executable.index + 1, roles);
   const ascending = (left: number, right: number) => left - right;

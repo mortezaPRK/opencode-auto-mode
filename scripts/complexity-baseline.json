@@ -21,21 +21,6 @@
     "src/audit.test.ts::max-lines-per-function::anonymous-arrow@11:40": [
       68
     ],
-    "src/audit.ts::complexity::hasHttpBodyEvidence@51:1": [
-      29
-    ],
-    "src/audit.ts::max-depth::block@85:11": [
-      5
-    ],
-    "src/audit.ts::max-depth::block@86:11": [
-      5
-    ],
-    "src/audit.ts::max-depth::block@87:13": [
-      6
-    ],
-    "src/audit.ts::max-depth::block@97:11": [
-      5
-    ],
     "src/classifier.test.ts::max-lines-per-function::anonymous-arrow@15:45": [
       118
     ],
@@ -57,7 +42,7 @@
     "src/debug-events.ts::complexity::anonymous-arrow@25:60": [
       18
     ],
-    "src/debug-events.ts::max-lines-per-function::registerGlobalCapture@143:8": [
+    "src/debug-events.ts::max-lines-per-function::registerGlobalCapture@151:8": [
       69
     ],
     "src/decision.test.ts::max-lines-per-function::anonymous-arrow@13:38": [
@@ -153,103 +138,103 @@
     "src/reviewer.ts::complexity::reviewRequest@83:8": [
       16
     ],
-    "src/shell-policy.ts::complexity::commandLineAt@1062:1": [
+    "src/shell-policy.ts::complexity::commandLineAt@1110:1": [
       20
     ],
-    "src/shell-policy.ts::complexity::denyInvocation@1594:8": [
+    "src/shell-policy.ts::complexity::denyInvocation@1642:8": [
       38
     ],
-    "src/shell-policy.ts::complexity::denyScript@1558:1": [
+    "src/shell-policy.ts::complexity::denyScript@1606:1": [
       12
     ],
-    "src/shell-policy.ts::complexity::escapeLiteralHashes@877:8": [
+    "src/shell-policy.ts::complexity::escapeLiteralHashes@925:8": [
       24
     ],
-    "src/shell-policy.ts::complexity::gitRoles@591:1": [
+    "src/shell-policy.ts::complexity::gitRoles@638:1": [
       30
     ],
-    "src/shell-policy.ts::complexity::grepRoles@455:1": [
+    "src/shell-policy.ts::complexity::grepRoles@459:1": [
       22
     ],
-    "src/shell-policy.ts::complexity::hasAmbiguousDescriptorClose@1420:8": [
+    "src/shell-policy.ts::complexity::hasAmbiguousDescriptorClose@1468:8": [
       23
     ],
-    "src/shell-policy.ts::complexity::hasHeredoc@1039:8": [
+    "src/shell-policy.ts::complexity::hasHeredoc@1087:8": [
       14
     ],
-    "src/shell-policy.ts::complexity::heredocMarkerAt@953:1": [
+    "src/shell-policy.ts::complexity::heredocMarkerAt@1001:1": [
       20
     ],
-    "src/shell-policy.ts::complexity::invocations@1463:1": [
+    "src/shell-policy.ts::complexity::invocations@1511:1": [
       13
     ],
-    "src/shell-policy.ts::complexity::isReadOnlyDate@1691:1": [
+    "src/shell-policy.ts::complexity::isReadOnlyDate@1739:1": [
       21
     ],
-    "src/shell-policy.ts::complexity::isReadOnlyGrep@1755:1": [
+    "src/shell-policy.ts::complexity::isReadOnlyGrep@1803:1": [
       15
     ],
-    "src/shell-policy.ts::complexity::isReadOnlyInvocation@1881:8": [
+    "src/shell-policy.ts::complexity::isReadOnlyInvocation@1929:8": [
       21
     ],
-    "src/shell-policy.ts::complexity::isReadOnlyUniq@1643:1": [
+    "src/shell-policy.ts::complexity::isReadOnlyUniq@1691:1": [
       19
     ],
-    "src/shell-policy.ts::complexity::isRecursiveRootRemoval@728:1": [
+    "src/shell-policy.ts::complexity::isRecursiveRootRemoval@776:1": [
       12
     ],
-    "src/shell-policy.ts::complexity::jqRoles@533:1": [
+    "src/shell-policy.ts::complexity::jqRoles@537:1": [
       28
     ],
-    "src/shell-policy.ts::complexity::logicalLines@1314:8": [
+    "src/shell-policy.ts::complexity::logicalLines@1362:8": [
       29
     ],
-    "src/shell-policy.ts::complexity::normalizeContinuations@1196:8": [
+    "src/shell-policy.ts::complexity::normalizeContinuations@1244:8": [
       27
     ],
-    "src/shell-policy.ts::complexity::plainRoles@433:1": [
+    "src/shell-policy.ts::complexity::plainRoles@437:1": [
       11
     ],
     "src/shell-policy.ts::complexity::resolveExecutable@180:8": [
       12
     ],
-    "src/shell-policy.ts::complexity::scanHeredoc@997:1": [
+    "src/shell-policy.ts::complexity::scanHeredoc@1045:1": [
       17
     ],
-    "src/shell-policy.ts::complexity::sedRoles@495:1": [
+    "src/shell-policy.ts::complexity::sedRoles@499:1": [
       19
     ],
-    "src/shell-policy.ts::complexity::stripDescriptorPrefixes@804:8": [
+    "src/shell-policy.ts::complexity::stripDescriptorPrefixes@852:8": [
       20
     ],
     "src/shell-policy.ts::complexity::wrapperCommand@147:1": [
       16
     ],
-    "src/shell-policy.ts::max-depth::block@1237:11": [
+    "src/shell-policy.ts::max-depth::block@1285:11": [
       5
     ],
-    "src/shell-policy.ts::max-depth::block@1667:11": [
+    "src/shell-policy.ts::max-depth::block@1715:11": [
       5
     ],
-    "src/shell-policy.ts::max-depth::block@471:11": [
+    "src/shell-policy.ts::max-depth::block@475:11": [
       5
     ],
-    "src/shell-policy.ts::max-depth::block@473:11": [
+    "src/shell-policy.ts::max-depth::block@477:11": [
       5
     ],
-    "src/shell-policy.ts::max-depth::block@507:11": [
+    "src/shell-policy.ts::max-depth::block@511:11": [
       5
     ],
-    "src/shell-policy.ts::max-depth::block@555:11": [
+    "src/shell-policy.ts::max-depth::block@559:11": [
       5
     ],
-    "src/shell-policy.ts::max-lines-per-function::escapeLiteralHashes@877:8": [
+    "src/shell-policy.ts::max-lines-per-function::escapeLiteralHashes@925:8": [
       62
     ],
-    "src/shell-policy.ts::max-lines-per-function::logicalLines@1314:8": [
+    "src/shell-policy.ts::max-lines-per-function::logicalLines@1362:8": [
       77
     ],
-    "src/shell-policy.ts::max-lines-per-function::normalizeContinuations@1196:8": [
+    "src/shell-policy.ts::max-lines-per-function::normalizeContinuations@1244:8": [
       90
     ],
     "src/shell.test.ts::complexity::anonymous-arrow@184:84": [
