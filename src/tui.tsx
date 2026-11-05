@@ -1,48 +1,58 @@
 /** @jsxImportSource @opentui/solid */
-import { createSignal, Show } from "solid-js";
+import { createEffect, createSignal, Show } from "solid-js";
 import { Plugin } from "@opencode/plugin/tui";
-import { readConfigError, readDecisions } from "./state.js";
-import { isReviewing } from "./tui-state.js";
+import { AutoMode, type AutoModeStatus } from "./rpc.js";
+import { createDecisionNotifier, createDecisionSubscription, createStatusLoader, pillDescription, pillLabel, pillTone, statusLocationKey, type StatusTarget } from "./gui-state.js";
 
-const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const POLL_MS = 1_000;
 
 export default Plugin.define({
   id: "opencode-auto-mode",
-  setup: async (ctx) => {
+  setup: (ctx) => {
     if (ctx.options.tui === false) return;
-    const [reviewing, setReviewing] = createSignal(false);
-    const [configError, setConfigError] = createSignal(false);
-    let announced = false;
-    const update = () => {
+    const [status, setStatus] = createSignal<AutoModeStatus | undefined>(undefined);
+    const refresh = createStatusLoader(
+      (target, signal) => ctx.client.rpc(AutoMode).status({ sessionID: target.sessionID }, {
+        location: target.location, signal,
+      }) as Promise<AutoModeStatus | undefined>,
+      setStatus,
+    );
+    const target = (): StatusTarget | undefined => {
       const route = ctx.ui.router.current();
-      setReviewing(isReviewing(readDecisions(), route.type === "session" ? route.sessionID : undefined));
-      const error = readConfigError(ctx.location?.directory);
-      setConfigError(error !== undefined);
-      if (error === undefined) announced = false;
-      else if (!announced) {
-        announced = true;
-        ctx.ui.toast.show({
-          variant: "error", title: "auto-mode", duration: 10_000,
-          message: "Invalid configuration; automatic approval is disabled.",
-        });
-      }
+      const location = ctx.location ?? ctx.data.location.default();
+      return route.type === "session" && location !== undefined
+        ? { key: statusLocationKey(route.sessionID, location), sessionID: route.sessionID, ownServer: true, location }
+        : undefined;
     };
-    update();
-    const poll = setInterval(update, 250);
-    const dispose = ctx.ui.slot({
-      append: "app",
-      render: () => (
-        <box position="absolute" top={0} right={0} zIndex={10_000} flexDirection="row" gap={1}>
-          <Show when={configError()}>
-            <text fg={ctx.theme.text.feedback.error.base}>auto-mode: invalid config</text>
-          </Show>
-          <Show when={reviewing()}>
-            <spinner frames={SPINNER_FRAMES} interval={120} color={ctx.theme.text.feedback.warning.base} />
-            <text fg={ctx.theme.text.feedback.warning.base}>auto-mode reviewing</text>
-          </Show>
-        </box>
-      ),
+    const receive = createDecisionNotifier(target, (notice) => {
+      ctx.ui.toast.show({ title: "Auto-mode", message: notice.message,
+        variant: notice.kind === "deny" ? "error" : "warning", duration: 5_000 });
     });
-    return () => { clearInterval(poll); dispose(); };
+    const subscription = createDecisionSubscription(receive);
+    const update = () => {
+      const client = ctx.client;
+      subscription.update(client, (handler, signal) => client.rpc(AutoMode).events.on("decision", handler, { signal }));
+      void refresh(target());
+    };
+    const poll = setInterval(update, POLL_MS);
+    const dispose = ctx.ui.slot({
+      append: "prompt.footer.status",
+      render: () => {
+        // Router changes refresh immediately, independently of the timer.
+        createEffect(update);
+        const color = () => {
+          const tone = pillTone(status());
+          if (tone === "danger") return ctx.theme.text.feedback.error.base;
+          if (tone === "warning") return ctx.theme.text.feedback.warning.base;
+          return ctx.theme.text.base;
+        };
+        return (
+          <Show when={pillLabel(status())}>
+            <text fg={color()}>auto-mode: {pillDescription(status()) ?? pillLabel(status())}</text>
+          </Show>
+        );
+      },
+    });
+    return () => { clearInterval(poll); refresh.dispose(); subscription.dispose(); dispose(); };
   },
 });

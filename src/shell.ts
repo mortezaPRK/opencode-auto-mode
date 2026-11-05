@@ -1,25 +1,19 @@
+import { homedir } from "node:os";
+import { basename, resolve } from "node:path";
 import type { ReviewResult } from "./reviewer.js";
+import { isInProject, isProtected, isProtectedPathOperand, isProtectedShellWord } from "./tiers.js";
 import {
   BALANCED_QUOTES, CONTROL_OPERATORS, DYNAMIC, REDIRECT_OPERATORS, SCRIPT_HOSTS, SHELLS, STATEFUL,
   denyCleanPrefix, denyInvocation, hasAmbiguousDescriptorClose, hasAssembledUndecodedSyntax, hasHeredoc,
-  hasUndecodedSyntax, heredocMarkers, isReadOnlyInvocation, logicalLines, normalizeContinuations, parseShell,
-  rawHeredocScript, resolveExecutable, stripDescriptorPrefixes,
+  hasUndecodedSyntax, heredocMarkers, isLongOption, isReadOnlyInvocation, logicalLines, normalizeContinuations,
+  operandRoles, parseShell, rawHeredocScript, resolveExecutable, stripDescriptorPrefixes,
 } from "./shell-policy.js";
 
 const MAX_COMMAND_CHARS = 4096;
 const MAX_COMMAND_BYTES = 65_536;
-const WRITE_OPERATORS = new Set([">", ">>", ">|", "&>", "&>>", "<>"]);
+const WRITE_OPERATORS = new Set([">", ">>", ">|", "&>", "&>>", "<>", ">&"]);
 const DYNAMIC_SYNTAX = /\$\(|`|\$\(\s*\(|[<>]\(|\$\[/;
 const FORK_BOMB = /:\s*\(\s*\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:/;
-
-export function shellWords(command: string): string[] | undefined {
-  if (!command || command.length > MAX_COMMAND_CHARS || /[$`~\r\n\0{}[\]]/.test(command) ||
-      /[^\S \t]/.test(command) || !BALANCED_QUOTES.test(command)) return undefined;
-  try {
-    const words = parseShell(command);
-    return words.length && words.every((word) => typeof word === "string") ? words as string[] : undefined;
-  } catch { return undefined; }
-}
 
 interface Segment { words: string[]; globs: boolean[]; write: boolean }
 type Verdict = { decision: "deny"; reason: string } | { decision: "allow" | "review" | "ask" };
@@ -51,7 +45,20 @@ function analyzeSegment(segment: Segment): Verdict {
 /** Token shapes this module consumes; `parse` returns a wider union. */
 type Token = string | { comment: string } | { op: string; pattern?: string };
 
-interface ParsedLine { segments: Segment[]; complete: boolean }
+export interface ParsedShellCommands {
+  /** Simple argv lists, excluding redirection operands. */
+  segments: Segment[];
+  /** Includes redirection targets for filesystem safety checks. */
+  operands: string[];
+  /** Redirection targets, including glob patterns: these always name a file. */
+  redirects: string[];
+  /** String tokens no simple command consumed, such as words inside a substitution. */
+  leftovers: string[];
+  /** False for syntax whose execution cannot be bounded by this parser. */
+  complete: boolean;
+  compound: boolean;
+}
+interface ParsedLine { segments: Segment[]; redirects: string[]; leftovers: string[]; complete: boolean }
 
 /** Characters that end an unquoted shell word. JS `\s` is wider than a shell, so the set is explicit. */
 const WORD_DELIMITER = /[ \t\n;|&()<>]/;
@@ -137,24 +144,47 @@ function wordExpansions(command: string): boolean[] {
   return expansions;
 }
 
+/** String tokens that no simple command consumed, such as words inside `$(...)`. */
+function leftoverWords(tokens: readonly Token[], consumed: ReadonlySet<number>): string[] {
+  return tokens.flatMap((token, index) => {
+    if (consumed.has(index)) return [];
+    if (typeof token === "string") return [token];
+    if ("op" in token && token.op === "glob" && token.pattern !== undefined) return [token.pattern];
+    return [];
+  });
+}
+
 /** Splits parsed tokens into simple commands, tracking whether the whole line parsed. */
 function lineSegments(tokens: readonly Token[], expansions: readonly boolean[] = []): ParsedLine {
   const segments: Segment[] = [{ words: [], globs: [], write: false }];
+  const redirects: string[] = [];
+  const consumed = new Set<number>();
   let current = segments[0];
-  let redirect: { write: boolean } | undefined;
+  let redirect: { write: boolean; op: string } | undefined;
+  let uncertainRedirect = false;
   let wordIndex = 0;
+  let position = 0;
   const nextExpansion = () => expansions[wordIndex++] ?? false;
+  const failed = (): ParsedLine => ({ segments, redirects, leftovers: leftoverWords(tokens, consumed), complete: false });
   for (const token of tokens) {
+    const index = position++;
     if (typeof token === "string") {
       if (redirect) {
         const target = token;
-        nextExpansion();
-        if (redirect.write && target !== "/dev/null" && !/^\d+$/.test(target) && !target.startsWith("&"))
+        const expanded = nextExpansion();
+        // Heredoc delimiters are quote-removed, not expanded. Their bodies and
+        // boundaries remain governed by the dedicated heredoc analyzer.
+        uncertainRedirect ||= expanded && !["<<", "<<-"].includes(redirect.op);
+        const descriptorClose = target === "-" && [">&", "<&"].includes(redirect.op);
+        if (redirect.write && target !== "/dev/null" && !descriptorClose)
           current.write = true;
+        redirects.push(target);
+        consumed.add(index);
         redirect = undefined;
       } else {
         current.words.push(token);
         current.globs.push(nextExpansion());
+        consumed.add(index);
       }
       continue;
     }
@@ -163,18 +193,22 @@ function lineSegments(tokens: readonly Token[], expansions: readonly boolean[] =
       if (redirect) {
         // A glob is still a redirection target, so it never becomes a command word.
         nextExpansion();
+        uncertainRedirect = true;
+        redirects.push(token.pattern);
+        consumed.add(index);
         if (redirect.write) current.write = true;
         redirect = undefined;
       } else {
         nextExpansion();
         current.words.push(token.pattern);
         current.globs.push(true);
+        consumed.add(index);
       }
       continue;
     }
     if (CONTROL_OPERATORS.has(token.op)) {
       // A control operator before the redirection target is invalid syntax.
-      if (redirect) return { segments, complete: false };
+      if (redirect) return failed();
       current = { words: [], globs: [], write: false };
       segments.push(current);
       continue;
@@ -182,15 +216,79 @@ function lineSegments(tokens: readonly Token[], expansions: readonly boolean[] =
     if (REDIRECT_OPERATORS.has(token.op)) {
       // Descriptor prefixes (`2>` in `2>/dev/null`) are stripped from the source
       // before parsing, so a numeric word here is an operand and must survive.
-      redirect = { write: WRITE_OPERATORS.has(token.op) };
+      redirect = { write: WRITE_OPERATORS.has(token.op), op: token.op };
       continue;
     }
-    return { segments, complete: false };
+    return failed();
   }
-  return { segments, complete: redirect === undefined };
+  return { segments, redirects, leftovers: leftoverWords(tokens, consumed), complete: redirect === undefined && !uncertainRedirect };
 }
 
-function analyzeLine(command: string): Verdict {
+/** The same token-to-command representation used by the guard and residual scoring. */
+function parsedLine(command: string): ParsedShellCommands {
+  const tokens = parseShell(command);
+  const parsed = lineSegments(tokens, wordExpansions(stripDescriptorPrefixes(command)));
+  return {
+    ...parsed,
+    operands: tokens.flatMap((token) => typeof token === "string" ? [token] :
+      "op" in token && token.op === "glob" && token.pattern !== undefined ? [token.pattern] : []),
+    complete: parsed.complete && !hasAmbiguousDescriptorClose(command) && !DYNAMIC_SYNTAX.test(command),
+    compound: tokens.some((token) => typeof token !== "string" && "op" in token && CONTROL_OPERATORS.has(token.op)),
+  };
+}
+
+/**
+ * Bounded literal commands only. No heredoc/script interpretation or dynamic
+ * expansion is inferred here; callers must retain guardShell's manual floor.
+ * `limits.maxChars` lets the pre-ask deny scan parse an oversized command
+ * without changing the guard's own manual-approval limit.
+ */
+export function parseShellCommands(command: string, limits: { maxChars?: number } = {}): ParsedShellCommands | undefined {
+  const maxChars = limits.maxChars ?? MAX_COMMAND_CHARS;
+  if (!command || command.length > maxChars || hasUndecodedSyntax(command)) return undefined;
+  const normalized = normalizeContinuations(command);
+  if (hasUndecodedSyntax(normalized) || hasHeredoc(normalized)) return undefined;
+  const { lines, certain } = logicalLines(normalized);
+  if (certain < lines.length) return undefined;
+  const result: ParsedShellCommands = { segments: [], operands: [], redirects: [], leftovers: [], complete: true, compound: false };
+  try {
+    for (const line of lines) {
+      if (!line.trim() || line.trim().startsWith("#")) continue;
+      if (!BALANCED_QUOTES.test(line)) return undefined;
+      const parsed = parsedLine(line);
+      result.segments.push(...parsed.segments);
+      result.operands.push(...parsed.operands);
+      result.redirects.push(...parsed.redirects);
+      result.leftovers.push(...parsed.leftovers);
+      result.complete &&= parsed.complete;
+      result.compound ||= parsed.compound;
+    }
+  } catch { return undefined; }
+  result.compound ||= result.segments.filter((segment) => segment.words.length).length > 1;
+  return result;
+}
+
+/**
+ * True when one parsed simple command reads or writes a protected path.
+ *
+ * The command's own grammar decides which words are files, which are data and
+ * which are ordinary options. A data word (`grep auth file`'s pattern, a `sed`
+ * script, a `jq` filter, a `--grep=` value) is never treated as a path, while a
+ * path word is checked with `isProtectedPathOperand` and every other word keeps
+ * the generic shell-word check.
+ */
+export function protectedSegment(segment: { words: readonly string[] }, projectDir?: string): boolean {
+  const roles = operandRoles(segment.words);
+  const data = new Set(roles.data);
+  const paths = new Set(roles.paths);
+  if (roles.pathValues.some((value) => isProtectedPathOperand(value, projectDir))) return true;
+  return segment.words.some((word, index) => {
+    if (data.has(index)) return false;
+    return paths.has(index) ? isProtectedPathOperand(word, projectDir) : isProtectedShellWord(word, projectDir);
+  });
+}
+
+function analyzeLine(command: string, projectDir?: string): Verdict {
   if (!command.trim()) return { decision: "allow" };
   if (!BALANCED_QUOTES.test(command)) return { decision: "ask" };
   if (FORK_BOMB.test(command)) return { decision: "deny", reason: "dangerous shell operation" };
@@ -199,13 +297,28 @@ function analyzeLine(command: string): Verdict {
   try { tokens = parseShell(command); }
   catch { return { decision: "ask" }; }
 
-  const { segments, complete } = lineSegments(tokens, wordExpansions(stripDescriptorPrefixes(command)));
+  const { segments, redirects, leftovers, complete } = parsedLine(command);
+  // A redirection always names a file, so its target takes the full path-aware
+  // check. Each simple command is judged by its own grammar: a pattern, script
+  // or filter is data even when it is spelled like a path, while a file operand
+  // keeps the protected-path check. Tokens no command consumed (words inside a
+  // substitution) keep the generic shell-word check. None of this depends on the
+  // line parsing completely: a deny visible in the literal text must win over the
+  // manual-approval floor.
+  if (redirects.some((target) => isProtected(target, projectDir)) ||
+      segments.some((segment) => protectedSegment(segment, projectDir)) ||
+      leftovers.some((word) => isProtectedShellWord(word, projectDir)))
+    return { decision: "deny", reason: "protected path access" };
   // Deny rules that are already visible must win even when later arguments are
   // dynamic (`sudo id $(...)`) and even when the line only parses partially.
   for (const segment of segments) {
     const blocked = denyInvocation(segment.words);
     if (blocked !== undefined) return { decision: "deny", reason: blocked };
   }
+  if (segments.some((segment) => ["curl", "wget"].includes(resolveExecutable(segment.words)?.name ?? "")) &&
+      segments.some((segment) => SHELLS.has(resolveExecutable(segment.words)?.name ?? "")) &&
+      tokens.some((token) => typeof token !== "string" && "op" in token && ["|", "|&"].includes(token.op)))
+    return { decision: "deny", reason: "remote download piped to a shell" };
   // Bash closes the descriptor and runs the rest of the word as a command
   // (`2>&-sudo id` runs sudo), while shell-quote reads `-sudo` as the redirect
   // target. Neither reading may approve the invocation.
@@ -225,7 +338,7 @@ function analyzeLine(command: string): Verdict {
 }
 
 /** Analyzes every logical line, keeping deny precedence over ask and review. */
-function analyzeLines(command: string): Verdict {
+function analyzeLines(command: string, projectDir?: string): Verdict {
   let ask = false;
   let review = false;
   const { lines, certain } = logicalLines(command);
@@ -235,7 +348,7 @@ function analyzeLines(command: string): Verdict {
   for (const line of lines) {
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith("#")) continue;
-    const verdict = analyzeLine(trimmed);
+    const verdict = analyzeLine(trimmed, projectDir);
     if (verdict.decision === "deny") return verdict;
     if (verdict.decision === "ask") ask = true;
     else if (verdict.decision === "review") review = true;
@@ -244,7 +357,7 @@ function analyzeLines(command: string): Verdict {
   return { decision: review ? "review" : "allow" };
 }
 
-function analyzeHeredoc(command: string): Verdict {
+function analyzeHeredoc(command: string, projectDir?: string): Verdict {
   const lines = command.split("\n");
   const firstLine = lines[0] ?? "";
   const markers = heredocMarkers(firstLine);
@@ -268,7 +381,7 @@ function analyzeHeredoc(command: string): Verdict {
   // the bodies really end where the raw text says. The header is analyzed on its
   // own because its markers have already been consumed above: handing them back
   // to the heredoc scanner would swallow the tail as a second body.
-  const header = analyzeLine(firstLine);
+  const header = analyzeLine(firstLine, projectDir);
   if (header.decision === "deny") return header;
   // An unquoted body is matched against its terminator after the shell removes
   // continuations, so a body line ending in a backslash moves the boundary —
@@ -283,7 +396,7 @@ function analyzeHeredoc(command: string): Verdict {
   // the same way, and a blocked command spanning a quoted newline is still seen
   // whole.
   const tail = lines.slice(index).join("\n");
-  const rest: Verdict = tail ? analyze(tail) : { decision: "allow" };
+  const rest: Verdict = tail ? analyze(tail, projectDir) : { decision: "allow" };
   if (rest.decision === "deny") return rest;
   let ask = header.decision === "ask" || rest.decision === "ask";
   const review = header.decision === "review" || rest.decision === "review";
@@ -304,7 +417,132 @@ function analyzeHeredoc(command: string): Verdict {
   return { decision: review ? "review" : "allow" };
 }
 
-function analyze(command: string): Verdict {
+/**
+ * True when a recursive or forced `rm` targets the user's home directory or a
+ * path outside the project.
+ *
+ * GNU option parsing accepts abbreviations, so `--recursi` and `--forc` are the
+ * same flags as `--recursive` and `--force`. `~` and `~/path` are expanded
+ * against the home directory and prefix-matched by containment; the home
+ * directory itself is always external, and another user's `~user` cannot be
+ * resolved locally, so it also stays external. `$HOME` is not expanded here, and
+ * the parser turns an unquoted `$HOME` into an empty word, so both spellings
+ * count as the home target.
+ */
+export function recursiveExternalDelete(words: readonly string[], projectDir?: string, worktreeRoot = projectDir): boolean {
+  if (words[0] !== "rm") return false;
+  let risky = false;
+  let end = false;
+  const targets: string[] = [];
+  for (const word of words.slice(1)) {
+    if (!end && word === "--") { end = true; continue; }
+    if (!end && word.startsWith("--")) {
+      // Prefix matching covers `--recursi`/`--forc` and other unambiguous prefixes.
+      if (isLongOption(word, "--recursive") || isLongOption(word, "--force")) risky = true;
+      continue;
+    }
+    if (!end && word.startsWith("-") && word.length > 1) {
+      if (/^-[^-]*[rRf]/.test(word)) risky = true;
+      continue;
+    }
+    targets.push(word);
+  }
+  if (!risky || targets.length === 0) return false;
+  const home = homedir();
+  return targets.some((target) => {
+    // `$HOME` is not expanded here, and the parser turns an unquoted `$HOME`
+    // into an empty word; both spellings name the home directory.
+    if (!target || target.startsWith("$HOME") || target.startsWith("${HOME}")) return true;
+    if (target.startsWith("~")) {
+      // `~` and `~/path` expand against the home directory; another user's
+      // `~user` cannot be resolved locally and stays external.
+      const expanded = target === "~" || target === "~/" ? home
+        : target.startsWith("~/") ? resolve(home, target.slice(2)) : undefined;
+      if (expanded === undefined || expanded === home) return true;
+      return !projectDir || !worktreeRoot || !isInProject(expanded, worktreeRoot);
+    }
+    // Without a verified project there is no inside that a delete could be bounded to.
+    if (!projectDir || !worktreeRoot) return true;
+    return !isInProject(resolve(projectDir, target), worktreeRoot);
+  });
+}
+
+/**
+ * The literal prefix of a line that precedes syntax this policy does not decode.
+ * The marker and everything after it are never inspected, because an undecoded
+ * quote or expansion can move word and line boundaries.
+ */
+function visiblePrefix(line: string): string {
+  let cut = line.length;
+  for (const opener of ["$'", '$"', "$["]) {
+    const index = line.indexOf(opener);
+    if (index !== -1 && index < cut) cut = index;
+  }
+  const whitespace = line.search(/[^\S \t]/);
+  if (whitespace !== -1 && whitespace < cut) cut = whitespace;
+  return line.slice(0, cut);
+}
+
+/** The executable name and effective argv after leading wrappers are removed. */
+function effectiveInvocation(words: readonly string[]): { name: string; argv: string[] } {
+  const executable = resolveExecutable(words);
+  const argv = executable ? words.slice(executable.index) : [...words];
+  const name = basename(argv[0] ?? "");
+  return { name, argv: [name, ...argv.slice(1)] };
+}
+
+/**
+ * Mandatory denies visible before the syntax that makes the guard ask.
+ *
+ * The guard cannot approve text it cannot decode, but a deny it can already see
+ * must still win over that manual-approval floor: `cat .env # $'` is still a
+ * protected-path read, `sudo id\necho $'x'` still elevates, and `rm -rf
+ * /outside # $'` still deletes outside the project. Only the literal prefix of
+ * each line is judged; a line that is not certainly script, or whose prefix is
+ * not balanced and static, contributes no deny and keeps the ask.
+ *
+ * The protected-path, blocked-invocation and recursive-delete checks run on
+ * whatever the prefix parsed into; `complete` only gates the pipeline shape that
+ * needs the whole line. Otherwise a trailing `$(...)` or `$'...'` would erase a
+ * deny that is already visible.
+ */
+export function visibleShellDeny(resources: readonly string[], projectDir?: string, worktreeRoot = projectDir): string | undefined {
+  for (const resource of resources) {
+    // Per-resource cap, not a shared budget: an earlier resource must not spend
+    // the bytes that would reveal a deny in a later one.
+    const text = resource.slice(0, MAX_COMMAND_BYTES);
+    const { lines, certain } = logicalLines(normalizeContinuations(text));
+    for (const line of lines.slice(0, certain)) {
+      const visible = visiblePrefix(line).trim();
+      if (!visible || visible.startsWith("#")) continue;
+      if (FORK_BOMB.test(visible)) return "dangerous shell operation";
+      const parsed = parseShellCommands(visible, { maxChars: MAX_COMMAND_BYTES });
+      if (parsed === undefined) continue;
+      if (parsed.redirects.some((target) => isProtected(target, projectDir)) ||
+          parsed.segments.some((segment) => protectedSegment(segment, projectDir)) ||
+          parsed.leftovers.some((word) => isProtectedShellWord(word, projectDir)))
+        return "protected path access";
+      const commands = parsed.segments.map((segment) => effectiveInvocation(segment.words));
+      for (const command of commands) {
+        const blocked = denyInvocation(command.argv);
+        if (blocked !== undefined) return blocked;
+      }
+      if (commands.some((command) => recursiveExternalDelete(command.argv, projectDir, worktreeRoot)))
+        return "Recursive/force deletion outside the project";
+      if (!parsed.complete) continue;
+      if (commands.some((command) => ["curl", "wget"].includes(command.name)) &&
+          commands.some((command) => SHELLS.has(command.name))) {
+        try {
+          if (parseShell(visible).some((token) => typeof token !== "string" && "op" in token &&
+              ["|", "|&"].includes(token.op))) return "remote download piped to a shell";
+        } catch { /* The prefix parse above already succeeded; treat an unknown pipe shape as no deny. */ }
+      }
+    }
+  }
+  return undefined;
+}
+
+function analyze(command: string, projectDir?: string): Verdict {
   // A shell separates words only on space, tab, and newline. JS `\s` (and the
   // parser behind it) also matches CR, FF, VT, NBSP, and Unicode spaces, which
   // can move a heredoc boundary or turn a midword hash into a comment, so any of
@@ -335,7 +573,7 @@ function analyze(command: string): Verdict {
       // The raw line may still carry a `\`-newline that the shell removes before
       // it forms this header; removing it here only reaches the deny pass, and
       // the header line itself is always script.
-      const verdict = analyzeLine(normalizeContinuations(line).trim());
+      const verdict = analyzeLine(normalizeContinuations(line).trim(), projectDir);
       if (verdict.decision === "deny") return verdict;
     }
     return { decision: "ask" };
@@ -353,12 +591,12 @@ function analyze(command: string): Verdict {
   }
   // `logicalLines` must split on the newlines the shell actually treats as
   // separators, and heredoc bodies stay untouched.
-  if (hasHeredoc(normalized)) return analyzeHeredoc(normalized);
-  if (normalized.includes("\n")) return analyzeLines(normalized);
-  return analyzeLine(normalized);
+  if (hasHeredoc(normalized)) return analyzeHeredoc(normalized, projectDir);
+  if (normalized.includes("\n")) return analyzeLines(normalized, projectDir);
+  return analyzeLine(normalized, projectDir);
 }
 
-export function guardShell(resources: readonly string[]): ReviewResult | undefined {
+export function guardShell(resources: readonly string[], projectDir?: string): ReviewResult | undefined {
   if (process.platform === "win32") return { decision: "ask", reason: "Shell dialect requires manual approval" };
   if (!resources.length || resources.length > 256 || resources.some((resource) => resource.length > MAX_COMMAND_CHARS) ||
       resources.reduce((sum, resource) => sum + Buffer.byteLength(resource), 0) > MAX_COMMAND_BYTES)
@@ -366,30 +604,12 @@ export function guardShell(resources: readonly string[]): ReviewResult | undefin
   let ask = false;
   let review = false;
   for (const resource of resources) {
-    const verdict = analyze(resource);
+    const verdict = analyze(resource, projectDir);
     if (verdict.decision === "deny") return { decision: "deny", reason: verdict.reason };
     if (verdict.decision === "ask") ask = true;
     else if (verdict.decision === "review") review = true;
   }
   if (ask) return { decision: "ask", reason: "Shell syntax requires manual approval" };
   return review ? undefined : { decision: "allow", reason: "read-only command" };
-}
-
-export interface ShellClassification {
-  tier: "auto-allow" | "auto-deny" | "review";
-  reason: string;
-}
-
-/**
- * Static tier classification for shell actions. The shell guard is the single
- * source of truth so the classifier can never allow or deny something the guard
- * would not.
- */
-export function classifyShell(resources: readonly string[]): ShellClassification {
-  const verdict = guardShell(resources);
-  if (verdict?.decision === "deny") return { tier: "auto-deny", reason: verdict.reason };
-  if (verdict?.decision === "allow") return { tier: "auto-allow", reason: verdict.reason };
-  if (verdict?.decision === "ask") return { tier: "review", reason: "shell syntax requires manual approval" };
-  return { tier: "review", reason: "evaluate the entire command as one action" };
 }
 

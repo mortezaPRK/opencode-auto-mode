@@ -1,92 +1,50 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { classify, isInProject } from "./tiers.js";
-import { mkdtempSync, rmSync, symlinkSync, writeFileSync, linkSync } from "node:fs";
+import { isDataOption } from "./shell-policy.js";
+import { hasSymlinkTraversal, isInProject, isProtected, isProtectedPathOperand, isProtectedShellWord, isScopedPath, safeTarget } from "./tiers.js";
+import { mkdtempSync, mkdirSync, realpathSync, rmSync, symlinkSync, writeFileSync, linkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 
-describe("classify", () => {
-  it("auto-allows safe read-only shell commands", () => {
-    for (const command of ["ls -la", "pwd", "whoami"]) {
-      assert.equal(classify("shell", [command]).tier, "auto-allow", command);
-    }
-  });
-
-  it("reviews tool actions without verified file targets", () => {
-    for (const action of ["read", "glob", "grep", "websearch"]) {
-      assert.equal(classify(action, ["anything"]).tier, "review", action);
-    }
-  });
-
-  it("auto-denies catastrophic shell patterns", () => {
-    for (const command of [
-      "rm -rf /",
-      "sudo apt install",
-      "mkfs.ext4 /dev/sda1",
-      "shutdown now",
-      "chmod 777 secret",
-    ]) {
-      assert.equal(classify("shell", [command]).tier, "auto-deny", command);
-    }
-  });
-
-  it("uses the shell guard for shell tiers", () => {
-    assert.equal(classify("shell", ["rg sudo src"]).tier, "auto-allow");
-    assert.equal(classify("shell", ["sort -o /tmp/out file"]).tier, "review");
-    assert.equal(classify("shell", ["rg --pre ./p x ."]).tier, "review");
-    assert.equal(classify("shell", ["echo 'chmod 777'"]).tier, "auto-allow");
-  });
-
-  it("sends chained or redirected commands to review as one action", () => {    const result = classify("shell", ["git status && rm -rf /tmp/scratch"]);
-    assert.equal(result.tier, "review");
-    assert.match(result.reason, /one action/);
-  });
-
-  it("sends subagent delegation to review", () => {
-    for (const action of ["task", "subagent"]) {
-      assert.equal(classify(action, ["do research"]).tier, "review", action);
-    }
-  });
-
+describe("safeTarget", () => {
   it("requires explicit opt-in and rejects sensitive paths and symlinks", () => {
     const root = mkdtempSync(join(tmpdir(), "auto-mode-targets-"));
     try {
       writeFileSync(join(root, "a.ts"), "");
       symlinkSync("/etc", join(root, "linked"));
-      linkSync(join(root, "a.ts"), join(root, "hardlinked.ts"));
-      const options = { projectDir: root, allowInProjectEdits: true };
-      assert.equal(classify("edit", ["a.ts"], { projectDir: root }).tier, "review");
+      assert.equal(safeTarget("a.ts", root), true);
+      writeFileSync(join(root, "source.ts"), "");
+      linkSync(join(root, "source.ts"), join(root, "hardlinked.ts"));
       writeFileSync(join(root, "single.ts"), "");
-      assert.equal(classify("edit", ["single.ts"], options).tier, "auto-allow");
-      assert.equal(classify("read", ["single.ts"], options).tier, "auto-allow");
-      for (const target of [".env", ".npmrc", "id_rsa", "key.pem", ".opencode/opencode.jsonc", ".git/hooks/post-commit", "linked/passwd", "hardlinked.ts", "/etc/passwd"])
-        assert.equal(classify("edit", [target], options).tier, "review", target);
-      assert.equal(classify("edit", [root], options).tier, "review");
+      assert.equal(safeTarget("single.ts", root), true);
+      for (const target of [".env", ".npmrc", "id_rsa", "key.pem", ".opencode/opencode.jsonc", ".git/hooks/post-commit"])
+        assert.equal(safeTarget(target, root), false, target);
+      for (const target of ["linked/passwd", "hardlinked.ts", "/etc/passwd"])
+        assert.equal(safeTarget(target, root), false, target);
+      assert.equal(safeTarget(root, root), false);
       if (process.platform !== "win32") {
         execFileSync("mkfifo", [join(root, "pipe")]);
-        assert.equal(classify("read", ["pipe"], options).tier, "review");
-        assert.equal(classify("write", ["pipe"], options).tier, "review");
+        assert.equal(safeTarget("pipe", root), false);
       }
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
+});
 
-  it("reviews shell prefix bypasses and all resources", () => {
-    for (const command of ["find . -delete", "git branch -D feature", "git tag -d v1", "env node -e 'x'", "ls\nchmod 700 a", "ls & touch a", "pwd > a", "ls $(touch a)"])
-      assert.equal(classify("shell", [command]).tier, "review", command);
-    assert.equal(classify("shell", ["ls", "chmod 777 a"]).tier, "auto-deny");
-    assert.equal(classify("shell", ["ls", "touch a"]).tier, "review");
-    assert.equal(classify("shell", []).tier, "review");
-  });
-
-  it("reviews edits when the project directory is unknown", () => {
-    assert.equal(classify("edit", ["src/index.ts"]).tier, "review");
-  });
-
-  it("reviews network fetch and unknown actions", () => {
-    assert.equal(classify("webfetch", ["https://example.com"]).tier, "review");
-    assert.equal(classify("launch-missiles", []).tier, "review");
-  });
+it("resolves file targets against the nested location while containing them in the worktree", () => {
+  const root = mkdtempSync(join(tmpdir(), "auto-mode-nested-targets-"));
+  try {
+    mkdirSync(join(root, ".git"));
+    const nested = join(root, "src");
+    mkdirSync(nested);
+    mkdirSync(join(root, "root-only-dir"));
+    writeFileSync(join(root, "parent.ts"), "");
+    symlinkSync(join(root, "parent.ts"), join(nested, "alias.ts"));
+    assert.equal(safeTarget("../parent.ts", nested), true);
+    assert.equal(safeTarget("../../outside.ts", nested), false);
+    assert.equal(safeTarget("alias.ts", nested), false);
+    assert.equal(safeTarget("root-only-dir", nested), true); // New local file, not the root directory.
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 describe("isInProject", () => {
@@ -100,5 +58,133 @@ describe("isInProject", () => {
     assert.equal(isInProject("../etc/passwd", "/repo"), false);
     assert.equal(isInProject("/repo-other/a.ts", "/repo"), false);
     assert.equal(isInProject("/etc/passwd", "/repo"), false);
+  });
+});
+
+describe("isProtected", () => {
+  it("keeps absolute in-project paths below a dotted ancestor usable", () => {
+    // A project cloned below an unrelated dotted ancestor (`~/.local/share/...`)
+    // is not itself sensitive: only dot components below the project root count.
+    const temp = realpathSync(mkdtempSync(join(tmpdir(), "auto-mode-dotted-")));
+    try {
+      const root = join(temp, ".local", "share", "project");
+      mkdirSync(join(root, ".git"), { recursive: true });
+      mkdirSync(join(root, "src"));
+      mkdirSync(join(root, ".ssh"));
+      mkdirSync(join(root, ".config"));
+      writeFileSync(join(root, "file.txt"), "");
+      writeFileSync(join(root, "src", "a.ts"), "");
+      writeFileSync(join(root, ".env"), "");
+      writeFileSync(join(root, ".ssh", "id_rsa"), "");
+      writeFileSync(join(root, ".config", "config.json"), "");
+      assert.equal(isProtected(join(root, "file.txt"), root), false);
+      assert.equal(isProtected(join(root, "src", "a.ts"), root), false);
+      assert.equal(isProtected("file.txt", root), false);
+      assert.equal(isProtected(join(root, ".env"), root), true);
+      // Named sensitive directories below the root stay protected both by their
+      // spelling and by their resolved components.
+      assert.equal(isProtected(join(root, ".ssh", "id_rsa"), root), true);
+      assert.equal(isProtected(join(root, ".config", "config.json"), root), true);
+    } finally { rmSync(temp, { recursive: true, force: true }); }
+  });
+
+  it("treats a component the filesystem cannot represent as absent", () => {
+    const root = mkdtempSync(join(tmpdir(), "auto-mode-long-name-"));
+    try {
+      const long = "a".repeat(256);
+      assert.equal(hasSymlinkTraversal(long, root), false);
+      assert.equal(isProtected(long, root), false);
+      assert.equal(isProtected(join(root, long), root), false);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+});
+
+describe("isProtectedShellWord", () => {
+  it("applies bare keywords only to words that can name a path", () => {
+    for (const word of ["auth", "password", "tokens", "secrets", "credentials", "private_key",
+      "echo auth", "--grep=auth", "src/tokens.ts", "src/tokenizer.ts", "src/secrets.ts"])
+      assert.equal(isProtectedShellWord(word, "/repo"), false, word);
+    for (const word of [".env", ".aws/credentials", "~/.ssh/id_rsa", "keys/private_key", "secret/token",
+      "signing.pem", "auth.json", "terraform.tfstate", "service-account.json",
+      "src/.env", "src/api-token.txt"])
+      assert.equal(isProtectedShellWord(word, "/repo"), true, word);
+  });
+
+  it("keeps separator-less leading-dot words ordinary except explicit names", () => {
+    for (const word of [".name", ".gitignore", ".cache", ".foo", "jq"])
+      assert.equal(isProtectedShellWord(word, "/repo"), false, word);
+    for (const word of [".env", ".env.local", ".npmrc", "auth.json", "signing.pem", "id_rsa"])
+      assert.equal(isProtectedShellWord(word, "/repo"), true, word);
+  });
+
+  it("treats data option values as data and path option values as paths", () => {
+    for (const word of ["--grep=config/auth", "--format=src/.env", "--regexp=auth", "--exclude=.env",
+      "--include=config/auth", "--glob=*auth*", "--reg=config/auth", "--rege=.env", "--regex=.env"])
+      assert.equal(isProtectedShellWord(word, "/repo"), false, word);
+    for (const word of ["--config=credentials.json", "--file=.env", "--config=credentials",
+      "--fil=.env", "--fil=credentials"])
+      assert.equal(isProtectedShellWord(word, "/repo"), true, word);
+  });
+
+  it("reads a path after a ref colon", () => {
+    for (const word of ["HEAD:.env", "HEAD:src/.env", "origin:credentials", "HEAD:keys/private_key"])
+      assert.equal(isProtectedShellWord(word, "/repo"), true, word);
+    for (const word of ["HEAD:src/main.ts", "HEAD:notes.md", "git@github.com:org/auth",
+      "https://example.com/.env"])
+      assert.equal(isProtectedShellWord(word, "/repo"), false, word);
+  });
+
+  it("skips scheme and scp-style URLs", () => {
+    for (const word of ["https://github.com/org/auth", "https://example.com/api/auth",
+      "ssh://host/repo/.env", "--url=https://example.com/auth", "git@github.com:org/auth"])
+      assert.equal(isProtectedShellWord(word, "/repo"), false, word);
+  });
+
+  it("treats file: URLs as local paths", () => {
+    for (const word of ["file://$HOME/.ssh/id_rsa", "file://${HOME}/.ssh/id_rsa", "file://~/.ssh/id_rsa",
+      "file:///etc/passwd", "file://localhost/etc/passwd", "--config=file:///etc/passwd"])
+      assert.equal(isProtectedShellWord(word, "/repo"), true, word);
+    for (const word of ["https://example.com/.ssh/id_rsa", "https://example.com/api/auth",
+      "file:///repo/src/tokens.ts", "file:notes.txt"])
+      assert.equal(isProtectedShellWord(word, "/repo"), false, word);
+  });
+
+  it("checks path-shaped option values but not pattern values", () => {
+    for (const word of ["--config=credentials.json", "--file=.env", "--output=/etc/passwd", "--src=./.env"])
+      assert.equal(isProtectedShellWord(word, "/repo"), true, word);
+    for (const word of ["--grep=auth", "--exclude=secrets", "--glob=client_secret", "--max=100"])
+      assert.equal(isProtectedShellWord(word, "/repo"), false, word);
+  });
+});
+
+describe("isProtectedPathOperand", () => {
+  it("applies bare names in file positions and extracts attached option values", () => {
+    for (const word of ["credentials", "auth", "id_rsa", "signing.pem", ".env", "keys/private_key",
+      "secret/token", "-fcredentials", "--file=credentials", "file:///etc/passwd"])
+      assert.equal(isProtectedPathOperand(word, "/repo"), true, word);
+    for (const word of [".name", ".gitignore", "notes.md", "src/tokens.ts", "https://example.com/auth",
+      "git@github.com:org/auth"])
+      assert.equal(isProtectedPathOperand(word, "/repo"), false, word);
+  });
+});
+
+describe("isDataOption", () => {
+  it("resolves unambiguous long-option abbreviations", () => {
+    for (const option of ["--regexp", "--reg", "--rege", "--regex", "--format", "--label",
+      "--exclude", "--glob"])
+      assert.equal(isDataOption(option), true, option);
+    for (const option of ["--file", "--fil", "--config", "--re", "--f", "--unknown"])
+      assert.equal(isDataOption(option), false, option);
+  });
+});
+
+describe("isScopedPath", () => {
+  it("requires lexical containment and rejects tilde or expansion spellings", () => {
+    assert.equal(isScopedPath("src/a.ts", "/repo", "/repo"), true);
+    assert.equal(isScopedPath("../outside.ts", "/repo", "/repo"), false);
+    assert.equal(isScopedPath("/etc/passwd", "/repo", "/repo"), false);
+    assert.equal(isScopedPath("~/notes.txt", "/repo", "/repo"), false);
+    assert.equal(isScopedPath("$HOME/notes.txt", "/repo", "/repo"), false);
+    assert.equal(isScopedPath("", "/repo", "/repo"), false);
   });
 });

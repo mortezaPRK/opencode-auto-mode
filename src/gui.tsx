@@ -1,127 +1,76 @@
 /** @jsxImportSource solid-js */
-import { createSignal, For, onCleanup } from "solid-js";
-import { Command, ComposerPill, Panel, Plugin, createKeyed, type PanelTab } from "@opencode/plugin/gui";
+import { createSignal, onCleanup } from "solid-js";
+import { ComposerPill, Plugin, createKeyed } from "@opencode/plugin/gui";
 import { AutoMode, type AutoModeStatus } from "./rpc.js";
-import { createStatusLoader, latest, noticeExpired, panelView, pillLabel, statusTarget } from "./gui-state.js";
+import { createDecisionNotifier, createDecisionSubscription, createModeRunner, createStatusLoader, pillAction, pillDescription, pillLabel, pillTone, statusTarget } from "./gui-state.js";
 
-const POLL_MS = 3_000;
-const NOTICE_MS = 30_000;
-
-const TONE: Record<string, "success" | "warning" | "danger" | undefined> = {
-  allow: "success",
-  ask: "warning",
-  deny: "danger",
-};
+const POLL_MS = 1_000;
 
 export default Plugin.define({
-  i18n: {
-    en: {
-      "command.open": "Open auto-mode decisions",
-      "panel.title": "Auto-mode",
-      "panel.empty": "No decisions in this session yet.",
-      "panel.disabled": "Auto-mode has no valid configuration; automatic review is disabled. Host permissions still apply.",
-      "panel.reviewing": "Reviewing…",
-      "pill.title": "Auto-mode decisions",
-    },
-  },
   setup(ctx) {
-    const [status, setStatus] = createSignal<AutoModeStatus | undefined>(undefined);
-    const refresh = createStatusLoader(
-      (sessionID) => ctx.client.rpc(AutoMode).status({ sessionID }) as Promise<AutoModeStatus | undefined>,
-      setStatus,
-    );
-    // `ctx.client` reads the app's own server, so a session on another server
-    // has no status here; `session.key` keeps the same session id on two
-    // servers apart.
+    const [status, setStatus] = createSignal<{ key: string; value: AutoModeStatus } | undefined>(undefined);
+    const [revision, setRevision] = createSignal(0);
+    // The desktop client reads its own server only. Never query that server for
+    // a routed session belonging to a different server or an unknown location.
     const target = () => statusTarget(ctx.sessions.current());
-    // The pill's notice expiry needs a clock of its own: the loader keeps the
-    // previous snapshot when a poll fails without applying it, so a clock read
-    // only when the snapshot changes would leave an expired decision on screen
-    // while the server is unreachable. Advance it on every tick regardless.
-    const [now, setNow] = createSignal(Date.now());
+    const refresh = createStatusLoader(
+      (selected, signal) => ctx.client.rpc(AutoMode).status({ sessionID: selected.sessionID }, {
+        location: selected.location, signal,
+      }) as Promise<AutoModeStatus | undefined>,
+      (value, selected) => {
+        if (value === undefined) { setStatus(undefined); return; }
+        if (selected !== undefined && target()?.key === selected.key) setStatus({ key: selected.key, value });
+      },
+    );
+    const runner = createModeRunner(
+      (selected, mode, signal) => {
+        refresh.invalidate(); // An older poll must not overwrite a successful mutation.
+        return ctx.client.rpc(AutoMode).setMode({ sessionID: selected.sessionID, mode }, {
+          location: selected.location, signal,
+        }) as Promise<AutoModeStatus>;
+      },
+      (selected, value) => {
+        if (target()?.key === selected.key) setStatus({ key: selected.key, value });
+      },
+      () => ctx.toast.show({ title: "Auto-mode", description: "Could not change auto mode. Try again.", variant: "error", duration: 5_000 }),
+      () => setRevision((value) => value + 1),
+    );
+    const receive = createDecisionNotifier(target, (notice) => {
+      ctx.toast.show({ title: "Auto-mode", description: notice.message,
+        variant: notice.kind === "deny" ? "error" : "default", duration: 5_000 });
+    });
+    const subscription = createDecisionSubscription(receive);
     const poll = () => {
-      setNow(Date.now());
-      void refresh(target());
+      const client = ctx.client;
+      subscription.update(client, (handler, signal) => client.rpc(AutoMode).events.on("decision", handler, { signal }));
+      const selected = target();
+      if (selected === undefined || !runner.pending(selected)) void refresh(selected);
     };
-
     createKeyed(() => target()?.key, poll, { otherwise: poll });
     const timer = setInterval(poll, POLL_MS);
-    onCleanup(() => clearInterval(timer));
-
-    const tab: PanelTab = {
-      id: "decisions",
-      get title() { return ctx.t("panel.title"); },
-      closable: "compact",
-      fallback: true,
-    };
-
-    ctx.add(Panel, {
-      id: "decisions",
-      region: "side",
-      mobile: { get title() { return ctx.t("panel.title"); }, order: 60, kind: "menu", icon: "shield" },
-      list: (input) => (input.open.includes("decisions") ? [tab] : []),
-      render: () => (
-        <div style={{ padding: "8px 12px", "font-size": "12px", display: "flex", "flex-direction": "column", gap: "6px" }}>
-          {status()?.enabled === false
-            ? <div>{ctx.t("panel.disabled")}</div>
-            : null}
-          {panelView(status()) === "empty"
-            ? <div>{ctx.t("panel.empty")}</div>
-            : (
-              <>
-                <For each={[...(status()?.reviewing ?? [])]}>
-                  {(entry) => <div>{ctx.t("panel.reviewing")} {entry.reviewID}</div>}
-                </For>
-                <For each={[...(status()?.recent ?? [])].reverse()}>
-                  {(entry) => (
-                    <div style={{ display: "flex", "flex-direction": "column", gap: "2px" }}>
-                      <span style={{ "font-weight": 600 }}>
-                        {entry.decision}{entry.errorKind === undefined ? "" : ` (${entry.errorKind})`} · {entry.action}
-                      </span>
-                      <span>{entry.reason}</span>
-                      <span style={{ opacity: 0.6 }}>
-                        {entry.stage} · {Math.round(entry.durationMs)}ms · {new Date(entry.at).toLocaleTimeString()}
-                      </span>
-                    </div>
-                  )}
-                </For>
-              </>
-            )}
-        </div>
-      ),
-    });
-
-    ctx.add(Command, () => ({
-      id: "open",
-      title: ctx.t("command.open"),
-      group: "tools",
-      run: () => {
-        const session = ctx.sessions.current();
-        if (session) ctx.layout.toggle(`${ctx.id}:decisions`, session);
-      },
-    }));
+    onCleanup(() => { clearInterval(timer); runner.dispose(); refresh.dispose(); subscription.dispose(); });
 
     ctx.add(ComposerPill, {
       id: "status",
       order: 20,
-      show: () => {
-        const snapshot = status();
-        const label = pillLabel(snapshot);
-        if (label === undefined) return undefined;
-        // `now()` is tracked, so the pill disappears on the tick that passes
-        // the notice window even if no snapshot arrives after it.
-        if (noticeExpired(snapshot, now(), NOTICE_MS)) return undefined;
-        const reviewing = (snapshot?.reviewing.length ?? 0) > 0;
+      show: (input) => {
+        revision();
+        const selected = statusTarget(input.session);
+        const stored = status();
+        const snapshot = selected?.ownServer && stored?.key === selected.key ? stored.value : undefined;
+        const action = pillAction(snapshot);
+        const pending = selected !== undefined && runner.pending(selected);
+        const label = pending ? "changing auto mode…" : pillLabel(snapshot) ?? "status unavailable";
+        const description = pillDescription(snapshot);
         return {
-          label,
-          tone: reviewing ? "warning" : TONE[latest(snapshot)?.decision ?? "allow"],
-          title: ctx.t("pill.title"),
-          rows: (snapshot?.recent ?? []).slice(-5).reverse().map((entry) => ({
-            id: entry.reviewID,
-            label: `${entry.decision} · ${entry.action}`,
-            tone: TONE[entry.decision],
-            detail: entry.reason,
-          })),
+          label, tone: pillTone(snapshot),
+          title: pending ? "Auto-mode: change pending"
+            : description !== undefined ? `Auto-mode: ${description}`
+              : action === undefined ? "Auto-mode unavailable" : `Auto-mode: ${action}`,
+          // Capture this pill's session/location. Never consult the active route
+          // inside a click handler: cached composers and session switches differ.
+          run: !pending && action !== undefined && selected?.ownServer
+            ? () => { void runner.run(selected, action); } : undefined,
         };
       },
     });

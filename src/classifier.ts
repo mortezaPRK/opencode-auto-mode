@@ -1,53 +1,50 @@
-import { classify } from "./tiers.js";
-import type { ClassifierStage } from "./config.js";
+import type { ClassifierOptions } from "./config.js";
+import { errorKindOf } from "./errors.js";
 import type { PermissionRequest, ReviewResult, StageResult } from "./reviewer.js";
-import { guardShell } from "./shell.js";
-import type { ReviewErrorKind } from "./errors.js";
+import type { RequestScore } from "./score.js";
 
-export async function compositeDecision(
-  stages: ClassifierStage[],
-  request: PermissionRequest,
-  review: (stage: Exclude<ClassifierStage, { type: "static" }>) => Promise<StageResult>,
-): Promise<ReviewResult> {
-  const shellResult = request.action === "shell" ? guardShell(request.resources) : undefined;
-  if (shellResult?.decision === "deny") return { ...shellResult, stage: "shell-guard" };
-  for (const stage of stages) {
-    if (stage.type !== "static") continue;
-    const result = classify(request.action, request.resources);
-    if (result.tier === "auto-deny") return { decision: "deny", reason: result.reason, stage: "static" };
-  }
-  if (shellResult) {
-    // Parsed read-only results feed the static stage, but never bypass a model-only pipeline.
-    const hasStatic = stages.some((stage) => stage.type === "static");
-    if (shellResult.decision !== "allow" || hasStatic)
-      return { ...shellResult, stage: shellResult.decision === "allow" ? "static" : "shell-guard" };
-  }
-  let abstained: string | undefined;
-  let abstainedKind: ReviewErrorKind | undefined;
-  for (const stage of stages) {
-    if (stage.type === "static") {
-      const result = classify(request.action, request.resources, {
-        projectDir: request.projectDir, allowInProjectEdits: stage.allowInProjectEdits,
-      });
-      if (result.tier === "auto-allow") return { decision: "allow", reason: result.reason, stage: "static" };
-    } else {
-      const result = await review(stage);
-      if (result.decision === "abstain") {
-        abstained = result.reason;
-        abstainedKind ??= result.errorKind;
-        continue;
+export interface ClassifierCallbacks {
+  /** Whole-pipeline cancellation/deadline, distinct from each stage's timeout. */
+  signal?: AbortSignal;
+  decision(stage: Extract<ClassifierOptions, { type: "decision" }>, request: PermissionRequest): Promise<StageResult>;
+  llm(stage: Extract<ClassifierOptions, { type: "llm" }>, request: PermissionRequest): Promise<StageResult>;
+  onResult?(stage: ClassifierOptions, result: StageResult, index: number): void;
+}
+
+/** Configured order is authoritative. The caller applies mandatory deny/ask guards first. */
+export async function runClassifiers(stages: readonly ClassifierOptions[], request: PermissionRequest, score: RequestScore, callbacks: ClassifierCallbacks): Promise<ReviewResult> {
+  const interrupted = (stage = "classifiers"): ReviewResult => ({
+    decision: "ask", reason: "Classifier pipeline interrupted; human review required", stage,
+    errorKind: callbacks.signal?.reason instanceof DOMException && callbacks.signal.reason.name === "TimeoutError" ? "deadline" : "cancelled",
+  });
+  if (callbacks.signal?.aborted) return interrupted();
+  // Defensive guard: no configured stage may override mandatory scoring effects.
+  if (score.deny || score.ask)
+    return { decision: score.deny ? "deny" : "ask", reason: score.reason, stage: "guard" };
+  let last: StageResult | undefined;
+  for (const [index, stage] of stages.entries()) {
+    if (callbacks.signal?.aborted) return interrupted(stage.type);
+    let result: StageResult;
+    try {
+      if (stage.type === "static") {
+        const editsDisabled = stage.allowInProjectEdits === false && ["edit", "write"].includes(request.action);
+        result = score.band === "low" && !editsDisabled
+          ? { decision: "allow", reason: score.reason, stage: "static" }
+          : { decision: "abstain", reason: "Static classifier requires further review", stage: "static" };
+      } else {
+        // Decisions and LLMs see any unresolved band; never silently reorder or insert stages.
+        result = stage.type === "decision" ? await callbacks.decision(stage, request) : await callbacks.llm(stage, request);
       }
-      const terminal: ReviewResult = {
-        decision: result.decision, reason: result.reason, stage: result.stage ?? stage.type,
-        ...(result.errorKind === undefined ? {} : { errorKind: result.errorKind }),
-      };
-      return terminal;
+    } catch (error) {
+      result = { decision: "abstain", reason: "Classifier unavailable", stage: stage.type, errorKind: errorKindOf(error) };
     }
+    if (callbacks.signal?.aborted) result = interrupted(stage.type);
+    try { callbacks.onResult?.(stage, result, index); } catch { /* Observability must not alter a verdict. */ }
+    // Observers can synchronously trigger cancellation too; never return a stale allow.
+    if (callbacks.signal?.aborted) return interrupted(stage.type);
+    if (result.errorKind === "cancelled" || result.errorKind === "deadline") return { ...result, decision: "ask" };
+    if (result.decision === "allow" || result.decision === "deny") return result as ReviewResult;
+    last = result;
   }
-  return {
-    decision: "ask",
-    reason: abstained ? `No classifier made a decision (${abstained})` : "No classifier made a decision",
-    stage: "none",
-    ...(abstainedKind === undefined ? {} : { errorKind: abstainedKind }),
-  };
+  return { ...last, decision: "ask", reason: last?.reason ?? "No classifier resolved the request", stage: last?.stage ?? "classifiers" };
 }

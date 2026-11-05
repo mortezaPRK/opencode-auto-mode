@@ -1,137 +1,134 @@
 import { Model } from "@opencode/schema/model";
-import type { ReviewPolicy } from "./policy.js";
-import { logsUrl, type OtlpOptions } from "./otlp.js";
 
-export type ReviewerModel = string;
 export type ReviewerModelRef = { id: string; providerID: string; variant?: string };
-export type DecisionProvider = {
-  apiKeyEnv?: string;
-  minConfidence?: number;
-  timeoutMs?: number;
-};
-
-export type DecisionStage = {
-  type: "decision";
-  model: string;
-  endpoint?: string;
-  policy?: Partial<ReviewPolicy>;
-} & DecisionProvider;
-
-export type ClassifierStage =
+export type ClassifierOptions =
   | { type: "static"; allowInProjectEdits?: boolean }
-  | DecisionStage
-  | { type: "llm"; model?: ReviewerModel; policy?: Partial<ReviewPolicy> };
-
+  | { type: "decision"; model: string; timeoutMs?: number; minConfidence?: number }
+  | { type: "llm"; model: string; timeoutMs?: number };
+export interface BreakerOptions { consecutiveDenies: number; windowDenies: number; windowSize: number }
+export interface AuditOptions { enabled: boolean; maxBytes: number }
 export interface AutoModeOptions {
-  classifiers: ClassifierStage[];
-  tui?: boolean;
-  auditLog?: boolean | string;
-  otlp?: boolean | OtlpOptions;
-  reviewTimeoutMs?: number;
+  classifiers: ClassifierOptions[];
+  /** Resolved scoring compatibility field, derived from static stages; not a public option. */
+  allowInProjectEdits: boolean;
+  tui: boolean;
+  reviewTimeoutMs: number;
+  breaker: BreakerOptions;
+  audit: AuditOptions;
 }
 
-/** Longest a single review may block the permission prompt, across every stage. */
-export const DEFAULT_REVIEW_TIMEOUT_MS = 60_000;
+export const DEFAULT_REVIEW_TIMEOUT_MS = 15_000;
 export const MAX_REVIEW_TIMEOUT_MS = 120_000;
+/** Audited JSONL rotation limit; the debug event sink uses the same 10 MiB cap. */
+export const DEFAULT_AUDIT_MAX_BYTES = 10_485_760;
+const DEFAULT_BREAKER: BreakerOptions = { consecutiveDenies: 3, windowDenies: 10, windowSize: 50 };
 
 export function object(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
-
 function text(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0 && value.length <= 4096;
 }
-
-function only(value: Record<string, unknown>, keys: string[]): boolean {
-  return Object.keys(value).every((key) => keys.includes(key));
+function only(value: Record<string, unknown>, keys: readonly string[]): void {
+  const unknown = Object.keys(value).find((key) => !keys.includes(key));
+  if (unknown) throw new Error(`Unknown auto-mode option '${unknown}'`);
 }
-
+function invalid(name: string): never { throw new Error(`Invalid auto-mode ${name}`); }
+function integer(value: unknown, max: number): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= max;
+}
 export function parseReviewerModel(value: string): ReviewerModelRef {
   const ref = Model.Ref.parse(value);
-  return {
-    id: ref.id,
-    providerID: ref.providerID,
-    ...(ref.variant === undefined ? {} : { variant: ref.variant }),
-  };
+  return { id: ref.id, providerID: ref.providerID, ...(ref.variant === undefined ? {} : { variant: ref.variant }) };
 }
-
-function model(value: unknown): value is ReviewerModel {
-  if (typeof value !== "string" || !text(value)) return false;
+function model(value: unknown): value is string {
+  if (!text(value)) return false;
   try { parseReviewerModel(value); return true; } catch { return false; }
 }
 
-function policy(value: unknown): value is Partial<ReviewPolicy> {
-  return object(value) && only(value, ["trusted", "blocks", "exceptions"]) &&
-    Object.values(value).every((list) => Array.isArray(list) && list.length <= 256 && list.every(text));
-}
-
-export function localEndpoint(value: string): string {
-  const url = new URL(value);
-  if (!['http:', 'https:'].includes(url.protocol) ||
-      !['127.0.0.1', '[::1]'].includes(url.hostname) || url.username || url.password || url.search || url.hash ||
-      url.pathname !== '/v1/systemone') throw new Error("Local System One requires a loopback /v1/systemone endpoint");
-  return url.href;
-}
-
-function otlp(value: unknown): value is OtlpOptions {
-  if (!object(value) || !only(value, ["endpoint", "headers", "timeoutMs"])) return false;
-  if (value.endpoint !== undefined) {
-    if (!text(value.endpoint)) return false;
-    try { logsUrl(value.endpoint); } catch { return false; }
+/** One configured pipeline stage. Unknown keys are rejected per stage type. */
+function parseClassifier(stage: unknown): ClassifierOptions {
+  if (!object(stage)) invalid("classifier");
+  if (stage.type === "static") {
+    only(stage, ["type", "allowInProjectEdits"]);
+    if (stage.allowInProjectEdits !== undefined && typeof stage.allowInProjectEdits !== "boolean")
+      invalid("static allowInProjectEdits");
+    return { type: "static", ...(stage.allowInProjectEdits === undefined ? {} : { allowInProjectEdits: stage.allowInProjectEdits }) };
   }
-  if (value.headers !== undefined && (!object(value.headers) || Object.keys(value.headers).length > 32 ||
-      !Object.entries(value.headers).every(([key, header]) => /^[A-Za-z0-9-]{1,128}$/.test(key) && text(header)))) return false;
-  return value.timeoutMs === undefined || (typeof value.timeoutMs === "number" && Number.isInteger(value.timeoutMs) &&
-    value.timeoutMs >= 1 && value.timeoutMs <= 10_000);
+  if (stage.type !== "decision" && stage.type !== "llm") invalid("classifier type");
+  only(stage, stage.type === "decision" ? ["type", "model", "timeoutMs", "minConfidence"] : ["type", "model", "timeoutMs"]);
+  if (!model(stage.model)) invalid("classifier model");
+  if (stage.timeoutMs !== undefined && !integer(stage.timeoutMs, MAX_REVIEW_TIMEOUT_MS)) invalid("classifier timeoutMs");
+  if (stage.type === "decision" && stage.minConfidence !== undefined &&
+      (typeof stage.minConfidence !== "number" || !Number.isFinite(stage.minConfidence) ||
+        stage.minConfidence < 0 || stage.minConfidence > 1))
+    invalid("decision minConfidence");
+  return { type: stage.type, model: stage.model,
+    ...(stage.timeoutMs === undefined ? {} : { timeoutMs: stage.timeoutMs as number }),
+    ...(stage.type === "decision" && stage.minConfidence !== undefined ? { minConfidence: stage.minConfidence as number } : {}) };
 }
 
-export const DECISION_PROVIDERS = ["typesafe-ai", "laya", "openai"] as const;
-
-function decision(value: Record<string, unknown>): value is DecisionStage {
-  if (!only(value, ["type", "model", "apiKeyEnv", "minConfidence", "timeoutMs", "endpoint", "policy"])) return false;
-  if (value.policy !== undefined && !policy(value.policy)) return false;
-  if (!model(value.model)) return false;
-  const ref = parseReviewerModel(value.model);
-  if (ref.variant !== undefined || !(DECISION_PROVIDERS as readonly string[]).includes(ref.providerID)) return false;
-  if (value.apiKeyEnv !== undefined &&
-      (typeof value.apiKeyEnv !== "string" || !/^[A-Z_][A-Z0-9_]{0,127}$/.test(value.apiKeyEnv))) return false;
-  if (value.minConfidence !== undefined &&
-      (typeof value.minConfidence !== "number" || !Number.isFinite(value.minConfidence) ||
-       value.minConfidence < 0 || value.minConfidence > 1)) return false;
-  if (value.timeoutMs !== undefined &&
-      (typeof value.timeoutMs !== "number" || !Number.isInteger(value.timeoutMs) ||
-       value.timeoutMs < 1 || value.timeoutMs > 30_000)) return false;
-  if (value.endpoint !== undefined) {
-    if (ref.providerID !== "laya" || !text(value.endpoint)) return false;
-    try { localEndpoint(value.endpoint); } catch { return false; }
-  }
-  return true;
+/** Required, non-empty, and at most one static stage. Exactly one static stage may
+ * exist: a second is redundant at best and makes the effective project-edit policy
+ * ambiguous. */
+function parseClassifiers(value: unknown): ClassifierOptions[] {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 64) invalid("classifiers");
+  const classifiers = value.map(parseClassifier);
+  if (classifiers.filter((stage) => stage.type === "static").length > 1) invalid("classifiers");
+  return classifiers;
 }
 
-function stage(value: unknown): value is ClassifierStage {
-  if (!object(value)) return false;
-  if (value.type === "static") return only(value, ["type", "allowInProjectEdits"]) &&
-    (value.allowInProjectEdits === undefined || typeof value.allowInProjectEdits === "boolean");
-  if (value.type === "llm") return only(value, ["type", "model", "policy"]) &&
-    (value.model === undefined || model(value.model)) &&
-    (value.policy === undefined || policy(value.policy));
-  return value.type === "decision" && decision(value);
+function parseBreaker(value: unknown): BreakerOptions {
+  if (!object(value)) invalid("breaker");
+  only(value, ["consecutiveDenies", "windowDenies", "windowSize"]);
+  if (!integer(value.consecutiveDenies, 10_000) || !integer(value.windowDenies, 10_000) ||
+      !integer(value.windowSize, 10_000) || value.windowDenies > value.windowSize)
+    invalid("breaker thresholds");
+  return {
+    consecutiveDenies: value.consecutiveDenies,
+    windowDenies: value.windowDenies,
+    windowSize: value.windowSize,
+  };
 }
 
+/** Audit settings are an object only; a bare path or boolean was a removed shape. */
+function parseAudit(value: unknown): AuditOptions {
+  if (!object(value)) invalid("audit");
+  only(value, ["enabled", "maxBytes"]);
+  if (value.enabled !== undefined && typeof value.enabled !== "boolean") invalid("audit enabled");
+  if (value.maxBytes !== undefined && (typeof value.maxBytes !== "number" || !Number.isSafeInteger(value.maxBytes) ||
+      value.maxBytes < 0)) invalid("audit maxBytes");
+  return {
+    enabled: value.enabled === undefined ? false : value.enabled,
+    maxBytes: value.maxBytes === undefined ? DEFAULT_AUDIT_MAX_BYTES : value.maxBytes,
+  };
+}
+
+/** Strict validation only; callers must obtain provenance via loadGlobalOptions,
+ * never from the SDK's project-merged ctx.options. */
 export function parseOptions(value: unknown): AutoModeOptions {
-  if (!object(value)) throw new Error("Invalid auto-mode options");
-  if (!only(value, ["classifiers", "tui", "auditLog", "otlp", "reviewTimeoutMs"]))
-    throw new Error("Unknown auto-mode option");
-  if (value.tui !== undefined && typeof value.tui !== "boolean") throw new Error("Invalid TUI setting");
-  if (value.reviewTimeoutMs !== undefined &&
-      (typeof value.reviewTimeoutMs !== "number" || !Number.isInteger(value.reviewTimeoutMs) ||
-       value.reviewTimeoutMs < 1_000 || value.reviewTimeoutMs > MAX_REVIEW_TIMEOUT_MS))
-    throw new Error("Invalid review timeout");
-  if (value.auditLog !== undefined && typeof value.auditLog !== "boolean" && !text(value.auditLog))
-    throw new Error("Invalid audit log");
-  if (value.otlp !== undefined && typeof value.otlp !== "boolean" && !otlp(value.otlp)) throw new Error("Invalid OTLP options");
-  if (!Array.isArray(value.classifiers) || value.classifiers.length === 0 ||
-      value.classifiers.length > 16 || !value.classifiers.every(stage))
-    throw new Error("A valid nonempty classifiers array is required");
-  return value as unknown as AutoModeOptions;
+  if (!object(value)) invalid("options");
+  only(value, ["classifiers", "reviewTimeoutMs", "breaker", "tui", "audit"]);
+  const classifiers = parseClassifiers(value.classifiers);
+  const result: AutoModeOptions = {
+    classifiers,
+    // In-project edit auto-allow remains the default (owner-approved); a static
+    // stage opts out by setting allowInProjectEdits: false.
+    allowInProjectEdits: classifiers.some((stage) => stage.type === "static" && stage.allowInProjectEdits !== false),
+    tui: true,
+    reviewTimeoutMs: DEFAULT_REVIEW_TIMEOUT_MS,
+    breaker: { ...DEFAULT_BREAKER },
+    audit: { enabled: false, maxBytes: DEFAULT_AUDIT_MAX_BYTES },
+  };
+  if (value.reviewTimeoutMs !== undefined) {
+    if (!integer(value.reviewTimeoutMs, MAX_REVIEW_TIMEOUT_MS)) invalid("reviewTimeoutMs");
+    result.reviewTimeoutMs = value.reviewTimeoutMs;
+  }
+  if (value.tui !== undefined) {
+    if (typeof value.tui !== "boolean") invalid("tui");
+    result.tui = value.tui;
+  }
+  if (value.breaker !== undefined) result.breaker = parseBreaker(value.breaker);
+  if (value.audit !== undefined) result.audit = parseAudit(value.audit);
+  return result;
 }

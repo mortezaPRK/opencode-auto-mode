@@ -1,418 +1,527 @@
+import { randomUUID } from "node:crypto";
 import { Plugin } from "@opencode/plugin";
-import { createLogger } from "./logger.js";
-import { clearConfigError, recordConfigError, recordDecision } from "./state.js";
-import { defaultPolicy } from "./policy.js";
-import { extractReviewContext } from "./transcript.js";
-import { scanResultContent, withInjectionWarning } from "./probe.js";
-import { buildStage1Prompt, buildStage2Prompt, parseDecision, parseStage1, withDenySuffix, type PermissionRequest, type ReviewResult, type StageResult } from "./reviewer.js";
-import { DEFAULT_REVIEW_TIMEOUT_MS, parseOptions, parseReviewerModel, type ReviewerModelRef } from "./config.js";
-import { compositeDecision } from "./classifier.js";
-import { decisionStage, DEFAULT_DECISION_TIMEOUT_MS } from "./decisions.js";
-import { createAuditLog } from "./audit.js";
-import { createOtlpExporter } from "./otlp.js";
-import { createTraceExporter, type ClassifierAttempt } from "./traces.js";
-import { errorKindOf, ReviewFailure, type ReviewErrorKind } from "./errors.js";
-import { withTimeout } from "./timeout.js";
-import { AutoMode, type AutoModeDecision } from "./rpc.js";
+import { DEFAULT_AUDIT_MAX_BYTES, DEFAULT_REVIEW_TIMEOUT_MS, parseOptions } from "./config.js";
+import { reviewRequest, type PermissionRequest, type ReviewResult } from "./reviewer.js";
+import { decisionStage } from "./decision.js";
+import { runClassifiers } from "./classifier.js";
+import { scoreRequest } from "./score.js";
+import { loadGlobalOptions } from "./global-options.js";
+import { getWorktreeScope } from "./worktree.js";
+import { createAuditLog, defaultAuditPath } from "./audit.js";
+import { createEventLog, registerGlobalCapture } from "./debug-events.js";
+import { createModeStore, type FinishDisposition, type FinishOutcome } from "./mode.js";
+import { AutoMode, MAX_SESSION_ID_CHARS, type AutoModeDecision, type AutoModeErrorKind, type AutoModeMode } from "./rpc.js";
 import { createStatusTracker } from "./status.js";
+import { withTimeout } from "./timeout.js";
+import { errorKindOf, ReviewFailure } from "./errors.js";
+import { codeModePermission, codeModeReviewResources } from "./code-mode.js";
+import { scanResultContent, withInjectionWarning } from "./probe.js";
 
-export type { AutoModeOptions, ClassifierStage, DecisionProvider, DecisionStage, ReviewerModel } from "./config.js";
-
-/** Delivered whenever auto-mode abandons a review: only the user can decide now. */
+export type { AutoModeOptions } from "./config.js";
 const INTERRUPTED_REASON = "Auto-mode review was interrupted; please decide yourself";
+const PAUSED_REASON = "Auto mode is paused; please decide yourself";
+const INVALID_CONFIG_ACTION = "Auto-mode review is disabled because its configuration is invalid";
+const NATIVE_DENY_REASON = "Native permission deny";
+const REVIEW_ACTIONS = /^(?:read|edit|write|glob|grep|shell|execute|webfetch|websearch|question|todowrite)$/;
+const SAFER_ALTERNATIVE = "Continue with a safer alternative.";
+function denialMessage(reason: string): string {
+  const trimmed = reason.trim().replace(/[\s.]+$/, "");
+  if (trimmed.endsWith(SAFER_ALTERNATIVE.slice(0, -1))) return `${trimmed}.`;
+  return trimmed ? `${trimmed}. ${SAFER_ALTERNATIVE}` : SAFER_ALTERNATIVE;
+}
 
 export default Plugin.define({
   id: "opencode-auto-mode",
   setup: async (ctx) => {
-    const log = createLogger("events.log");
-    const directory = ctx.location?.directory;
-    let configError: string | undefined;
     let options: ReturnType<typeof parseOptions> | undefined;
-    try {
-      options = parseOptions(ctx.options);
-      if (directory !== undefined) clearConfigError(directory);
-    } catch (error) {
-      const detail = error instanceof Error ? error.message : String(error);
-      configError = detail;
-      log.log(`Invalid configuration; automatic approval disabled: ${detail}`);
-      if (directory !== undefined) recordConfigError(directory, detail);
-    }
+    let configError: string | undefined;
+    try { options = parseOptions(loadGlobalOptions(ctx.location.directory)); }
+    catch (error) { configError = error instanceof Error ? error.message : "Invalid auto-mode configuration"; }
+    const valid = options !== undefined;
     const reviewTimeoutMs = options?.reviewTimeoutMs ?? DEFAULT_REVIEW_TIMEOUT_MS;
-    const sinks = [createAuditLog(options?.auditLog), createOtlpExporter(options?.otlp)].filter((sink) => sink !== undefined);
-    const traces = createTraceExporter(options?.otlp);
-    const counts = new Map<string, number>();
-    // Permission evaluations can overlap in one session; keep every active
-    // controller so an interruption aborts all of them, not only the newest.
-    const running = new Map<string, Set<AbortController>>();
-    const subscriptions = new AbortController();
+    // Audit and raw debug capture are one opt-in: fixed state path, both sinks,
+    // and no work of any kind when disabled.
+    const auditConfig = options?.audit;
+    const auditSetting = auditConfig?.enabled === true
+      ? { path: defaultAuditPath(), maxBytes: auditConfig.maxBytes ?? DEFAULT_AUDIT_MAX_BYTES }
+      : undefined;
+    const audit = createAuditLog(auditSetting);
+    const events = createEventLog(auditSetting);
+    if (events) console.warn("Auto-mode debug logging is unsafe: full prompts, outputs and events may contain secrets. Local audit logging is enabled without redaction.");
+    const modes = createModeStore(ctx.storage, async (sessionID) => {
+      const info = await observe("session.get", { sessionID }, () => withTimeout(ctx.session.get({ sessionID }), reviewTimeoutMs), { sessionID });
+      return info.parentID;
+    });
+    type Correlation = { reviewID?: string; sessionID?: string; callID?: string; stageIndex?: number };
+    const instanceID = randomUUID();
+    const sourceLocation = structuredClone(ctx.location);
+    let callCounter = 0;
+    const debug = (type: string, data: unknown, correlation: Correlation = {}) => {
+      // Local-only, deliberately unredacted. Never forward this data through RPC.
+      if (!events) return;
+      try { events.write({ ts: new Date().toISOString(), type, instanceID, sourceLocation, ...correlation, payload: data }); } catch { /* best effort */ }
+    };
+    const observe = async <T>(type: string, input: unknown, work: () => Promise<T>, correlation: Correlation = {}): Promise<T> => {
+      const envelope = { ...correlation, callID: `call-${instanceID}-${callCounter++}` };
+      debug(`${type}.before`, input, envelope);
+      try { const result = await work(); debug(`${type}.after`, result, envelope); return result; }
+      catch (error) { debug(`${type}.error`, error, envelope); throw error; }
+    };
+    /** Bounded, observed SDK call: every host/provider lookup shares one deadline shape. */
+    const sdk = <T>(type: string, input: unknown, work: () => Promise<T>, signal?: AbortSignal, correlation: Correlation = {}) =>
+      observe(type, input, () => withTimeout(work(), reviewTimeoutMs, signal), correlation);
+    if (events) debug("configuration", { options, valid, configError, reviewTimeoutMs, captureScope: "SDK-exposed events and observed plugin calls only; invisible host activity is not captured" });
     const status = createStatusTracker();
+    const running = new Map<string, Set<AbortController>>();
+    // A failed off write must not restore automation in this plugin instance.
+    const suspended = new Set<string>();
+    const subscriptions = new AbortController();
+    let stopping = false;
     let reviewCounter = 0;
     let rpc: Awaited<ReturnType<typeof ctx.rpc.register<typeof AutoMode>>> | undefined;
-    try {
-      rpc = await ctx.rpc.register(AutoMode, {
-        status: async (input) => {
-          const { sessionID } = input as { sessionID?: string };
-          return status.snapshot({
-            enabled: options !== undefined,
-            ...(configError === undefined ? {} : { configError }),
-            classifiers: options?.classifiers.map((stage) => stage.type) ?? [],
-            reviewTimeoutMs,
-            ...(sessionID === undefined ? {} : { sessionID }),
-          });
-        },
-        decisions: async (input) => {
-          const { limit, sessionID } = input as { limit?: number; sessionID?: string };
-          return status.recent(Number.isFinite(limit) ? Math.min(Math.max(Math.trunc(limit!), 1), 50) : 20, sessionID);
-        },
-      });
-    } catch { log.log("Status RPC is unavailable"); }
-
-    // Status events are only a freshness bonus: clients poll `status`, so a
-    // slow or failing emit must never keep the permission hook waiting. Start
-    // the delivery without awaiting it and observe both a synchronous throw
-    // from `emit` and a rejected promise it returns.
+    const abortSession = (id: string) => { for (const controller of running.get(id) ?? []) controller.abort(); };
     const publish = (payload: Record<string, unknown>) => {
+      try { void Promise.resolve(rpc?.events.emit("decision", payload)).catch(() => {}); } catch { /* best effort */ }
+    };
+    const decisionPayload = (entry: AutoModeDecision, tripped: boolean) => ({
+      reviewID: entry.reviewID, sessionID: entry.sessionID,
+      action: REVIEW_ACTIONS.test(entry.action) ? entry.action : "tool",
+      decision: entry.decision, stage: entry.stage,
+      // Reviewer reasons can quote sensitive evidence: keep those local.
+      reason: tripped ? "Auto mode paused (breaker)" : `Auto-mode decision: ${entry.decision}`,
+      durationMs: entry.durationMs, at: entry.at,
+      ...(entry.errorKind === undefined ? {} : { errorKind: entry.errorKind }),
+    });
+    const snapshot = async (sessionID?: string) => {
+      let mode: AutoModeMode = valid ? "on" : "invalid";
+      let counts = { allow: 0, ask: 0, deny: 0 };
+      let breaker = false;
+      let error = configError;
+      let errorKind: AutoModeErrorKind | undefined = valid ? undefined : "config";
+      if (valid && error === undefined && sessionID) {
+        try {
+          const state = await withTimeout(modes.get(sessionID), reviewTimeoutMs);
+          mode = suspended.has(sessionID) ? "off" : state.mode;
+          counts = state.counts;
+          breaker = mode === "paused";
+        } catch (cause) {
+          debug("status.error", cause, { sessionID });
+          mode = "invalid";
+          error = "Auto-mode session storage unavailable";
+          errorKind = "storage";
+        }
+      }
+      return status.snapshot({ enabled: valid && mode === "on", mode, counts, breaker, reviewTimeoutMs,
+        ...(error === undefined ? {} : { configError: error }), ...(errorKind === undefined ? {} : { errorKind }),
+        ...(sessionID === undefined ? {} : { sessionID }) });
+    };
+    const modeMutations = new Map<string, number>();
+    const setSessionMode = async (sessionID: string, mode: "on" | "off", commandSession = false) => {
+      if (stopping) throw new Error("Auto-mode plugin is stopping");
+      if (!sessionID || !["on", "off"].includes(mode)) throw new Error("Invalid auto-mode change");
+      // Invalid configuration can never enable review. An explicit off may
+      // still be persisted for when the configuration is repaired.
+      if (mode === "on" && !valid) throw new Error("Auto-mode configuration is invalid; review disabled");
+      const mutation = (modeMutations.get(sessionID) ?? 0) + 1;
+      modeMutations.set(sessionID, mutation);
+      // Off wins synchronously, before any await: a review already committing must
+      // see the latch and an in-flight review is aborted immediately.
+      const addedLatch = mode === "off" && !suspended.has(sessionID);
+      if (mode === "off") { suspended.add(sessionID); abortSession(sessionID); }
+      const revertOff = () => {
+        // A failed validation may undo only the latch this request created, and
+        // only when no newer request won. A second failed off must not release
+        // an earlier fail-safe latch whose write already failed.
+        if (addedLatch && modeMutations.get(sessionID) === mutation) suspended.delete(sessionID);
+      };
+      let info: Awaited<ReturnType<typeof ctx.session.get>>;
       try {
-        void Promise.resolve(rpc?.events.emit("decision", payload)).catch(() => {});
-      } catch { /* status delivery is best effort */ }
+        info = await observe("session.get", { sessionID }, () => withTimeout(ctx.session.get({ sessionID }), reviewTimeoutMs), { sessionID });
+      } catch (error) { revertOff(); throw error; }
+      try {
+        const requested = getWorktreeScope(info.location.directory).directory;
+        if (!commandSession && requested !== getWorktreeScope(ctx.location.directory).directory)
+          throw new Error("Session location does not match this auto-mode instance");
+      } catch (error) { revertOff(); throw error; }
+      // An older request whose validation finished late must not overwrite a newer mode.
+      if (modeMutations.get(sessionID) !== mutation) return snapshot(sessionID);
+      try {
+        await withTimeout(modes.set(sessionID, mode), reviewTimeoutMs);
+        if (mode === "on" && modeMutations.get(sessionID) === mutation) suspended.delete(sessionID);
+        return snapshot(sessionID);
+      } catch (error) { debug("mode.set.error", error, { sessionID }); throw error; }
     };
-
-    const abortSession = (sessionID: string) => {
-      const controllers = running.get(sessionID);
-      if (controllers === undefined) return;
-      for (const controller of controllers) controller.abort();
+    const statusInput = (input: unknown): string | undefined => {
+      if (!input || typeof input !== "object" || Array.isArray(input) || Object.keys(input).some((key) => key !== "sessionID"))
+        throw new Error("Invalid auto-mode status request");
+      const { sessionID } = input as { sessionID?: unknown };
+      if (sessionID !== undefined && (typeof sessionID !== "string" || sessionID.length < 1 || sessionID.length > MAX_SESSION_ID_CHARS))
+        throw new Error("Invalid auto-mode status request");
+      return sessionID;
     };
-
-    // Abandon work for a session as soon as the host interrupts it, so a stale
-    // review cannot deliver an approval after the user stopped the turn.
-    const subscribe = (ctx.event as { subscribe?: (input: { types: string[]; signal?: AbortSignal }) => AsyncIterable<unknown> } | undefined)?.subscribe;
-    if (subscribe) {
+    try { rpc = await ctx.rpc.register(AutoMode, {
+      status: async (input) => snapshot(statusInput(input)),
+      setMode: async (input) => {
+        if (!input || typeof input !== "object" || Array.isArray(input) || Object.keys(input).some((key) => !["sessionID", "mode"].includes(key)))
+          throw new Error("Invalid auto-mode change");
+        const { sessionID, mode } = input as { sessionID: string; mode: "on" | "off" | "resume" };
+        if (typeof sessionID !== "string" || !sessionID || sessionID.length > MAX_SESSION_ID_CHARS || !["on", "off", "resume"].includes(mode)) throw new Error("Invalid auto-mode change");
+        return setSessionMode(sessionID, mode === "resume" ? "on" : mode);
+      },
+    }); }
+    catch { /* RPC is an optional UX surface */ }
+    // Cancellation remains local to every loaded instance, independent of audit ownership.
+    void (async () => {
+      try {
+        for await (const event of ctx.event.subscribe({ types: ["session.execution.interrupted"], signal: subscriptions.signal })) {
+          abortSession(event.data.sessionID);
+        }
+      } catch (error) { if (!subscriptions.signal.aborted) debug("interrupt.subscription.error", error); }
+    })();
+    const releaseCapture = events ? registerGlobalCapture(events.sinkPath, (signal, isOwner, handoff, markFailure) => {
+      debug(handoff ? "capture.handoff" : "capture.started", {
+        scope: "process-wide server-global stream per canonical sink path",
+        ...(handoff ? { reason: "Previous owner unloaded, stream failed, or legacy registry retired; potential SDK subscription setup/dispose gap; no replay guarantee" } : {}),
+      });
       void (async () => {
         try {
-          const events = subscribe.call(ctx.event, { types: ["session.execution.interrupted"], signal: subscriptions.signal });
-          for await (const event of events) {
-            const data = (event as { data?: { sessionID?: unknown } }).data;
-            const sessionID = data?.sessionID;
-            if (sessionID !== undefined) abortSession(String(sessionID));
+          for await (const event of ctx.event.subscribe({ signal })) {
+            // A queued event from the retiring subscriber must not duplicate the new owner.
+            if (isOwner()) debug("event", event);
           }
-        } catch { /* the event stream is best effort */ }
+          debug(signal.aborted ? "capture.stopped" : "capture.interrupted", { reason: signal.aborted ? "cleanup or ownership transfer" : "Event subscription ended unexpectedly; capture gap; trying eligible standby owners, or waiting for a new registration" });
+        } catch (error) {
+          if (!signal.aborted) debug("capture.error", error);
+          debug(signal.aborted ? "capture.stopped" : "capture.interrupted", { reason: signal.aborted ? "cleanup or ownership transfer" : "Event subscription failed; capture gap; trying eligible standby owners, or waiting for a new registration" });
+        } finally {
+          if (!signal.aborted) markFailure();
+        }
       })();
-    }
-
-    // Once abandonment starts, an evaluation the host dispatched earlier may
-    // still reach the hook while cleanup is stalled. Record it so the handler
-    // never starts review work the interruption subscription can no longer
-    // cancel.
-    let stopping = false;
-
-    // Stop the event reader and every active review synchronously, before any
-    // cleanup is awaited: a stalled disposal must not leave an in-flight review
-    // able to deliver an allow instead of the cancellation that becomes `ask`.
+    }) : undefined;
     const abandon = () => {
       stopping = true;
       subscriptions.abort();
-      for (const controllers of running.values()) {
-        for (const controller of controllers) controller.abort();
-      }
-      running.clear();
+      releaseCapture?.();
+      for (const id of running.keys()) abortSession(id);
     };
-
-    // A cleanup can throw synchronously instead of rejecting. Turn that into a
-    // rejection so it cannot skip the cleanups started beside it, escape before
-    // the caller awaits them, or replace the original registration error.
-    const start = (cleanup: () => unknown): Promise<unknown> => {
-      try { return Promise.resolve(cleanup()); } catch (error) { return Promise.reject(error); }
-    };
-
-    // Abandon work and start every cleanup before awaiting any of them: a
-    // stalled status RPC or hook disposal must not keep the others alive. Their
-    // failures settle together and never mask the caller's original error.
-    const abandonSetup = async (...cleanups: (() => unknown)[]) => {
+    const registrations: { dispose(): unknown }[] = [];
+    const cleanup = async () => {
       abandon();
-      await Promise.allSettled([start(() => rpc?.dispose()), ...cleanups.map((cleanup) => start(cleanup))]);
+      await Promise.allSettled([rpc, ...registrations].map(async (registration) => registration?.dispose()));
     };
-
-    const permissionRegistration = await registerHook(
-      () => ctx.permission.hook("evaluate", async (event) => {
-        if (event.effect !== "ask") return;
-        // The host can still dispatch an evaluation it decided to ask about
-        // after abandonment started, while a stalled cleanup keeps this hook
-        // registered. The interruption subscription is already gone, so never
-        // start review work here: leave the ask to the user.
-        if (stopping) {
-          event.message = INTERRUPTED_REASON;
-          return;
-        }
-        if (!options) {
-          event.effect = "ask";
-          event.message = "Invalid auto-mode configuration; please decide yourself";
-          return;
-        }
-        const reviewID = `review-${process.pid}-${Date.now()}-${reviewCounter++}`;
-        recordDecision({ requestID: reviewID, sessionID: event.sessionID, decision: "reviewing", action: event.action.slice(0, 128), reason: "", at: Date.now() });
-        status.start(event.sessionID, reviewID, Date.now());
+    try {
+      registrations.push(await ctx.permission.hook("evaluate", async (event) => {
+        // Invalid configuration acts disabled: the native effect and message are
+        // byte-for-byte untouched, with no mode storage, context, model, audit or
+        // debug-capture access and no fail-closed ask.
+        const settings = options;
+        if (!valid || settings === undefined) return;
         const startedAt = Date.now();
-        const trace = traces?.begin(startedAt);
+        const reviewID = `review-${instanceID}-${startedAt}-${reviewCounter++}`;
+        const correlation = { reviewID, sessionID: event.sessionID };
+        debug("permission.evaluate.before", event, correlation);
         const hostEffect = event.effect;
-        const controller = new AbortController();
-        const active = running.get(event.sessionID);
-        if (active === undefined) running.set(event.sessionID, new Set([controller]));
-        else active.add(controller);
-        let failure: string | undefined;
-        let errorKind: ReviewErrorKind | undefined;
-        let expired = false;
-        let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
-        let pendingAttempt: ClassifierAttempt | undefined;
-
-        const review = (async (): Promise<ReviewResult> => {
-          try {
-            const signal = controller.signal;
-            // A cancelled review must not start host or provider work at all.
-            throwIfAborted(signal);
-            let info: Awaited<ReturnType<typeof ctx.session.get>> | undefined;
-            let lookupError: ReviewErrorKind | undefined;
-            try {
-              info = await withTimeout(ctx.session.get({ sessionID: event.sessionID }, { signal }), 3_000, signal);
-            } catch (error) {
-              // The lookup only adds the session model and project directory, so
-              // a failure must not fail the review. Keep its category: when the
-              // missing session model is what prevents model review, the audit
-              // record and spans must still explain that the lookup blocked it.
-              lookupError = errorKindOf(error);
-            }
-            // The session lookup swallow keeps a deadline or interruption from
-            // failing the review, but an interrupted lookup must stop here.
-            throwIfAborted(signal);
-            const request: PermissionRequest = {
-              action: event.action, resources: [...event.resources], agent: event.agent,
-              projectDir: info?.location?.directory, metadata: event.metadata, source: event.source,
-              isDelegation: event.action === "task" || event.action === "subagent",
-            };
-            let contextLoaded = false;
-            let contextComplete = false;
-            let contextReason = "User authorization context is unavailable";
-            return await compositeDecision(options.classifiers, request, async (stage) => {
-              // Fallback stages can be entered after an earlier provider failed
-              // and the review was interrupted; never invoke the provider then.
-              throwIfAborted(signal);
-              if (!contextLoaded) {
-                const messages = await withTimeout(ctx.session.context({ sessionID: event.sessionID }, { signal }), 3_000, signal);
-                throwIfAborted(signal);
-                const context = extractReviewContext(messages);
-                request.transcript = context.transcript;
-                contextComplete = context.complete;
-                contextReason = context.reason ?? contextReason;
-                contextLoaded = true;
-              }
-              if (!contextComplete) {
-                errorKind ??= "context";
-                return { decision: "ask", reason: contextReason, errorKind: "context" };
-              }
-              throwIfAborted(signal);
-              const policy = defaultPolicy(stage.policy);
-              const attemptStartedAt = Date.now();
-              let attempt: ClassifierAttempt | undefined;
-              if (trace !== undefined) {
-                // Register the child span before awaiting the provider so a
-                // deadline can export it even when the provider never settles.
-                attempt = {
-                  index: options.classifiers.indexOf(stage), type: stage.type,
-                  model: stage.model ?? (info?.model ? `${info.model.providerID}/${info.model.id}` : undefined),
-                  startedAt: attemptStartedAt, durationMs: 0,
-                  result: { decision: "abstain", reason: "Review attempt pending", errorKind: "cancelled" },
-                };
-                trace.attempts.push(attempt);
-                pendingAttempt = attempt;
-              }
-              let outcome: StageResult;
-              try {
-                outcome = stage.type === "llm" ? await llmDecision(ctx, request, policy, signal, stage.model, info?.model, lookupError) :
-                  // A typed provider may ignore its abort signal. Bound the stage
-                  // here so an interruption or unload settles as cancelled right
-                  // away instead of waiting for the overall review deadline.
-                  await withTimeout(decisionStage(stage, request, policy, undefined, signal),
-                    stage.timeoutMs ?? DEFAULT_DECISION_TIMEOUT_MS, signal);
-              } catch (error) {
-                const kind = expired ? "deadline" : errorKindOf(error);
-                outcome = { decision: "abstain", reason: `${stage.type} reviewer unavailable`, errorKind: kind };
-              }
-              if (outcome.errorKind !== undefined) errorKind ??= outcome.errorKind;
-              // A deadline or cancellation owns the final cause. Leave the span
-              // pending for the finalizer instead of letting the aborted
-              // provider overwrite an outcome that was already exported.
-              if (attempt !== undefined && pendingAttempt === attempt && !expired && !signal.aborted) {
-                pendingAttempt = undefined;
-                attempt.durationMs = Date.now() - attemptStartedAt;
-                attempt.result = outcome;
-              }
-              return outcome;
-            });
-          } catch (error) {
-            failure = error instanceof Error ? error.message : String(error);
-            errorKind ??= errorKindOf(error);
-            return { decision: "ask", reason: "Auto-mode review failed; please decide yourself", stage: "error" };
-          }
-        })();
-
-        const deadline = new Promise<ReviewResult>((resolve) => {
-          deadlineTimer = setTimeout(() => {
-            expired = true;
-            controller.abort();
-            resolve({ decision: "ask", reason: "Auto-mode review deadline exceeded; please decide yourself", stage: "deadline" });
-          }, reviewTimeoutMs);
-          deadlineTimer.unref?.();
-        });
-
-        let result: ReviewResult;
+        const originalMessage = event.message;
+        const restoreHostMessage = () => {
+          if (originalMessage === undefined) delete event.message;
+          else event.message = originalMessage;
+        };
         try {
-          result = await Promise.race([review, deadline]);
-        } finally {
-          if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
-          const controllers = running.get(event.sessionID);
-          if (controllers !== undefined) {
-            controllers.delete(controller);
-            if (controllers.size === 0) running.delete(event.sessionID);
+          // A runtime value outside the permission union is not a native allow,
+          // ask or deny. Leave it completely untouched and never enter review.
+          if (hostEffect !== "allow" && hostEffect !== "ask" && hostEffect !== "deny") return;
+          // A native deny is final: passive local audit only; no state/context/model access.
+          if (hostEffect === "deny") {
+            try {
+              audit?.write({ ts: new Date().toISOString(), reviewID, sessionID: event.sessionID,
+                ...(event.agent === undefined ? {} : { agent: event.agent }),
+                action: event.action, resources: [...event.resources], hostEffect: "deny", decision: "deny",
+                stage: "native", reason: event.message ?? NATIVE_DENY_REASON, durationMs: 0 });
+            } catch { /* local auditing is best effort */ }
+            return;
           }
-        }
-
-        // The deadline terminated the review even if a provider ignored the abort
-        // and recorded a cancellation or an earlier stage failed first.
-        if (expired) errorKind = "deadline";
-        let decision = result.decision;
-        let reason = result.reason;
-        // A cancelled review may resolve from a provider that ignored the abort,
-        // but it must never approve or deny: only the user can decide now. A
-        // cancellation is the termination cause even if a provider failed first.
-        if (controller.signal.aborted && !expired) {
-          decision = "ask";
-          reason = INTERRUPTED_REASON;
-          errorKind = "cancelled";
-        }
-        // Finalize a child span whose provider is still running so the exported
-        // trace reports the termination cause without waiting for it.
-        if (pendingAttempt !== undefined) {
-          const attempt = pendingAttempt;
-          pendingAttempt = undefined;
-          attempt.durationMs = Date.now() - attempt.startedAt;
-          attempt.result = {
-            decision: "abstain",
-            reason: expired ? "Review deadline exceeded" : "Review cancelled",
-            errorKind: expired ? "deadline" : "cancelled",
+          const reviewsNativeAllow = hostEffect === "allow";
+          // Explicit off wins synchronously over every later unload/failure path.
+          if (suspended.has(event.sessionID)) return;
+          if (stopping) {
+            event.effect = "ask"; event.message = INTERRUPTED_REASON; return;
+          }
+          const controller = new AbortController();
+          const active = running.get(event.sessionID) ?? new Set<AbortController>();
+          active.add(controller);
+          running.set(event.sessionID, active);
+          const signal = controller.signal;
+          const release = () => {
+            controller.abort();
+            active.delete(controller);
+            if (active.size === 0) running.delete(event.sessionID);
           };
-        }
-        // Release any provider request still running after a local timeout.
-        // This runs after cancellation normalization so a completed allow/deny
-        // is delivered unchanged.
-        controller.abort();
-        event.effect = decision;
-        event.message = decision === "deny" ? withDenySuffix(reason) : reason;
-        if (decision === "deny") {
-          const count = (counts.get(event.sessionID) ?? 0) + 1;
-          if (counts.size >= 256 && !counts.has(event.sessionID)) counts.delete(counts.keys().next().value!);
-          counts.set(event.sessionID, count);
-          log.log(`Action denied (${count} in session)`);
-        }
-        const auditRecord = {
-          ts: new Date().toISOString(), reviewID, sessionID: event.sessionID, agent: event.agent,
-          action: event.action, resources: [...event.resources], hostEffect,
-          decision, stage: result.stage ?? "unknown", reason,
-          durationMs: Date.now() - startedAt,
-          ...(errorKind === undefined ? {} : { error: true, errorKind }),
-          ...(failure !== undefined ? { errorDetail: failure } : {}),
-          ...(trace ? { traceID: trace.traceID, spanID: trace.spanID } : {}),
-        };
-        trace?.finish(auditRecord);
-        for (const sink of sinks) sink.write(auditRecord);
-        recordDecision({ requestID: reviewID, sessionID: event.sessionID, decision: event.effect, reason: "", at: Date.now() });
-        const tracked: AutoModeDecision = status.finish({
-          reviewID, sessionID: event.sessionID, action: auditRecord.action, decision,
-          stage: auditRecord.stage, reason, durationMs: auditRecord.durationMs, at: Date.now(),
-          ...(errorKind === undefined ? {} : { errorKind }),
-        });
-        // Clients also poll `status`; a missed event only costs freshness.
-        const payload: Record<string, unknown> = {
-          reviewID: tracked.reviewID, sessionID: tracked.sessionID, action: tracked.action,
-          decision: tracked.decision, stage: tracked.stage, reason: tracked.reason,
-          durationMs: tracked.durationMs, at: tracked.at,
-        };
-        if (tracked.errorKind !== undefined) payload.errorKind = tracked.errorKind;
-        publish(payload);
-      }),
-      abandonSetup,
-    );
-    const toolRegistration = await registerHook(
-      () => ctx.tool.hook("execute.after", (event) => {
+          debug("review.setup", { options: settings, startedAt, deadline: startedAt + reviewTimeoutMs, reviewTimeoutMs }, correlation);
+          let tracked = false;
+          let score: string | undefined;
+          let result: ReviewResult;
+          let tripped = false;
+          let finalDisposition: FinishDisposition = "cancelled";
+          let hostCancelled = false;
+          let abandoned = false;
+          // One predicate for host interruption: our own cleanup abort is not one.
+          const cancelledNow = () => hostCancelled || stopping || (!abandoned && signal.aborted);
+          try {
+            type WorkOutcome =
+              | { kind: "passthrough" }
+              | { kind: "cancelled" }
+              | { kind: "reviewed"; result: ReviewResult };
+            const work = async (): Promise<WorkOutcome> => {
+              const state = await observe("mode.get", { sessionID: event.sessionID }, () => modes.get(event.sessionID), correlation);
+              // Explicit off and persisted off return control to the native host.
+              if (suspended.has(event.sessionID) || state.mode === "off") return { kind: "passthrough" };
+              if (state.mode === "paused") {
+                // A paused breaker asks for host allows. An existing ask already
+                // has its native prompt and needs no synthetic counter.
+                if (!reviewsNativeAllow) return { kind: "passthrough" };
+                return { kind: "reviewed", result: { decision: "ask", reason: PAUSED_REASON, stage: "mode" } };
+              }
+              if (cancelledNow()) return { kind: "cancelled" };
+              status.start(event.sessionID, reviewID, startedAt);
+              tracked = true;
+              // Reject oversized host payloads without passing raw metadata/source to a model.
+              if (Buffer.byteLength(JSON.stringify({ action: event.action, resources: event.resources, metadata: event.metadata, source: event.source })) > 65_536)
+                return { kind: "reviewed", result: { decision: "ask", reason: "Request too large for automatic review", stage: "context" } };
+              const info = await sdk("session.get", { sessionID: event.sessionID }, () => ctx.session.get({ sessionID: event.sessionID }, { signal }), signal, correlation);
+              if (signal.aborted) return { kind: "cancelled" };
+              // Same-model reviewer identity is intentionally not restricted or warned:
+              // the user chooses the reviewer, and this plugin adds no independence gate.
+              const scope = await observe("worktree.scope", info.location, async () => getWorktreeScope(info.location.directory), correlation);
+              const location = { directory: scope.directory };
+              const vcs = await sdk("vcs.get", { location }, () => ctx.vcs.get({ location }, { signal }), signal, correlation);
+              if (signal.aborted) return { kind: "cancelled" };
+              const tree = await sdk("vcs.status", { location }, () => ctx.vcs.status({ location }, { signal }), signal, correlation);
+              if (signal.aborted) return { kind: "cancelled" };
+              let reviewResources: string[];
+              try { reviewResources = codeModeReviewResources(event) ?? [...event.resources]; }
+              catch (error) { throw new ReviewFailure("context", "Code Mode evidence does not match its permission identity", { cause: error }); }
+              const request: PermissionRequest = {
+                action: event.action, resources: reviewResources, agent: event.agent,
+                projectDir: scope.directory, worktreeRoot: scope.worktreeRoot,
+                gitState: { branch: vcs.data.branch.current, defaultBranch: vcs.data.branch.default, clean: tree.data.length === 0 },
+              };
+              if (signal.aborted) return { kind: "cancelled" };
+              const scored = await observe("score", request, async () => scoreRequest(request, settings), correlation);
+              score = scored.band;
+              if ("ask" in scored && scored.ask) return { kind: "reviewed", result: { decision: "ask", reason: scored.reason, stage: "score" } };
+              if (scored.deny) return { kind: "reviewed", result: { decision: "deny", reason: scored.reason, stage: "score" } };
+              let transcript: Promise<string> | undefined;
+              const authorize = async () => {
+                if (cancelledNow()) throw new Error(INTERRUPTED_REASON);
+                transcript ??= (async () => {
+                  // Classifier context is user-only; local debug retains the full response.
+                  const messages = await sdk("session.context", { sessionID: event.sessionID }, () => ctx.session.context({ sessionID: event.sessionID }, { signal }), signal, correlation);
+                  const users = messages.filter((message) => message.type === "user").map((message) => message.text);
+                  if (users.length === 0 || users.some((text) => typeof text !== "string") || Buffer.byteLength(users.join("\n")) > 12_000)
+                    throw new ReviewFailure("context", "User authorization context is unavailable or oversized");
+                  return users.join("\n");
+                })();
+                request.transcript = await transcript;
+                if (cancelledNow()) throw new Error(INTERRUPTED_REASON);
+              };
+              // Observe the native stateless generation boundary, including exact prompts,
+              // complete raw responses and errors. This wrapper never modifies model input.
+              const native = (stageIndex: number) => ({
+                experimental: { generate: {
+                  text: (input: Parameters<typeof ctx.experimental.generate.text>[0], generation: { signal: AbortSignal }) =>
+                    sdk("generate.text", input, () => ctx.experimental.generate.text(input, generation), generation.signal, { ...correlation, stageIndex }),
+                  decisions: (input: Parameters<Parameters<typeof decisionStage>[0]["experimental"]["generate"]["decisions"]>[0], generation: { signal: AbortSignal }) =>
+                    sdk("generate.decisions", input, () => ctx.experimental.generate.decisions(input as Parameters<typeof ctx.experimental.generate.decisions>[0], generation), generation.signal, { ...correlation, stageIndex }),
+                } },
+              });
+              const stageCall = async <T>(stage: typeof settings.classifiers[number], work: (stageIndex: number) => Promise<T>) => {
+                const stageIndex = settings.classifiers.indexOf(stage);
+                const envelope = { ...correlation, stageIndex };
+                debug("classifier.start", stage, envelope);
+                try { await authorize(); const outcome = await work(stageIndex); debug("classifier.end", outcome, envelope); return outcome; }
+                catch (error) { debug("classifier.error", error, envelope); debug("classifier.end", { error }, envelope); throw error; }
+              };
+              const verdict = await runClassifiers(settings.classifiers, request, scored, {
+                signal,
+                decision: (stage) => stageCall(stage, (index) => decisionStage(native(index), stage, request, signal, (error) => debug("classifier.validation.error", error, { ...correlation, stageIndex: index }))),
+                llm: (stage) => stageCall(stage, (index) => reviewRequest(native(index), request, stage.model, signal, stage.timeoutMs ?? reviewTimeoutMs, (error) => debug("classifier.validation.error", error, { ...correlation, stageIndex: index }))),
+                onResult: (stage, outcome, stageIndex) => {
+                  if (stage.type === "static") { debug("classifier.start", stage, { ...correlation, stageIndex }); debug("classifier.end", outcome, { ...correlation, stageIndex }); }
+                  debug("classifier", { stage, outcome }, { ...correlation, stageIndex });
+                },
+              });
+              return { kind: "reviewed", result: verdict };
+            };
+            const proposed = await withTimeout(work(), reviewTimeoutMs, signal);
+            if (proposed.kind !== "reviewed") {
+              release();
+              // Explicit off restores the host effect. Other cancellation/unload
+              // paths fail closed to ask.
+              const off = suspended.has(event.sessionID);
+              finalDisposition = off ? "off" : "cancelled";
+              if (proposed.kind === "cancelled" && !off) {
+                event.effect = "ask";
+                event.message = INTERRUPTED_REASON;
+              }
+              if (tracked) status.finish({ reviewID, sessionID: event.sessionID, action: event.action,
+                decision: off ? hostEffect : "ask",
+                stage: off ? "off" : "cancelled",
+                reason: off ? "Auto mode is off; native permission effect preserved" : INTERRUPTED_REASON,
+                durationMs: Date.now() - startedAt, at: Date.now() });
+              return;
+            }
+            result = proposed.result;
+          } catch (error) {
+            debug("review.error", error, correlation);
+            const category = errorKindOf(error);
+            // Capture host cancellation before our own cleanup aborts the controller.
+            hostCancelled = signal.aborted || stopping;
+            result = { decision: "ask", reason: signal.aborted ? INTERRUPTED_REASON : "Auto-mode review failed or timed out; please decide yourself", stage: "error",
+              errorKind: signal.aborted ? "cancelled" : category === "timeout" ? "deadline" : category };
+            // The total deadline bounds host lookups too. Stop the abandoned work
+            // before waiting for the state commit; it must not start another stage.
+            abandoned = true;
+            controller.abort();
+          }
+          let finishPromise: Promise<FinishOutcome> | undefined;
+          try {
+            // Mode/breaker checks and counters commit atomically. Explicit off wins
+            // over every stale proposal; interruption and timeouts fail closed ask.
+            // The finish commit repairs a cancelled proposal under its own lock.
+            // A signal that aborts while storage is committing settles the host
+            // promptly as an ask; the durable repair still completes in order.
+            finishPromise = modes.finish(event.sessionID, result.decision, settings.breaker,
+              cancelledNow, () => suspended.has(event.sessionID));
+            const final = await withTimeout(finishPromise, reviewTimeoutMs, signal.aborted ? undefined : signal);
+            const cancelled = cancelledNow();
+            const explicitOff = final.disposition === "off" || suspended.has(event.sessionID);
+            // The durable commit may have won the race against a cancellation or
+            // off observed only after finish resolved. Repair that commit before
+            // exposing its counts; explicit off restores the exact pre-review state.
+            if (final.commit !== undefined && (explicitOff || (cancelled && final.disposition === "enforced"))) {
+              try {
+                await withTimeout(modes.revertCancelled(event.sessionID, final, explicitOff ? "off" : "cancelled"), reviewTimeoutMs);
+              } catch (error) { debug("mode.revert.error", error, correlation); }
+            }
+            finalDisposition = explicitOff ? "off" : cancelled ? "cancelled" : final.disposition;
+            tripped = !cancelled && !explicitOff && final.tripped;
+            // Recheck after storage settles, immediately before touching the host.
+            const applyHost = (): { effect: "allow" | "ask" | "deny"; message: string | undefined } => {
+              if (explicitOff) return { effect: hostEffect, message: originalMessage };
+              if (cancelled || final.disposition === "cancelled") return { effect: "ask", message: INTERRUPTED_REASON };
+              if (final.decision === "deny") return { effect: final.decision, message: denialMessage(result.reason) };
+              if (final.disposition === "paused") return hostEffect === "allow"
+                ? { effect: final.decision, message: PAUSED_REASON }
+                : { effect: final.decision, message: originalMessage };
+              if (final.decision === "allow" && hostEffect === "allow") return { effect: final.decision, message: originalMessage };
+              return { effect: final.decision, message: result.reason };
+            };
+            const applied = applyHost();
+            event.effect = applied.effect;
+            if (applied.message === undefined) delete event.message;
+            else event.message = applied.message;
+            if (tripped) abortSession(event.sessionID);
+          } catch (error) {
+            debug("mode.finish.error", error, correlation);
+            result = { ...result, errorKind: errorKindOf(error) };
+            if (suspended.has(event.sessionID)) {
+              finalDisposition = "off";
+              event.effect = hostEffect;
+              restoreHostMessage();
+            } else {
+              finalDisposition = "cancelled";
+              event.effect = "ask";
+              event.message = cancelledNow()
+                ? INTERRUPTED_REASON
+                : "Auto-mode session storage unavailable; please decide yourself";
+            }
+            // The host settles promptly on interruption, but a durable commit may
+            // still complete later. Repair it under the session queue once known.
+            void finishPromise?.then(async (outcome) => {
+              if (outcome.disposition === "off" || outcome.commit === undefined) return;
+              const off = suspended.has(event.sessionID);
+              // A paused/cancelled outcome already counted the ask this path applies.
+              if (!off && outcome.disposition !== "enforced") return;
+              try { await modes.revertCancelled(event.sessionID, outcome, off ? "off" : "cancelled"); }
+              catch (cause) { debug("mode.revert.error", cause, correlation); }
+            }).catch(() => {});
+          }
+          finally {
+            release();
+          }
+          const record = {
+            ts: new Date().toISOString(), reviewID, sessionID: event.sessionID,
+            ...(event.agent === undefined ? {} : { agent: event.agent }),
+            action: event.action, resources: [...event.resources], hostEffect, decision: event.effect,
+            proposedDecision: result.decision, reviewedNativeAllow: reviewsNativeAllow, disposition: finalDisposition,
+            breaker: tripped,
+            stage: tripped ? "breaker" : result.stage ?? "unknown",
+            ...(score === undefined ? {} : { score }),
+            reason: result.reason, durationMs: Date.now() - startedAt,
+            ...(event.message === undefined ? {} : { appliedMessage: event.message }),
+            ...(result.errorKind === undefined ? {} : { errorKind: result.errorKind }),
+          };
+          try { audit?.write(record); } catch { /* local auditing is best effort */ }
+          if (tracked) {
+            const entry = status.finish({ ...record, at: Date.now() });
+            // Explicit off is a native passthrough, not a plugin decision event.
+            if (finalDisposition !== "off") publish(decisionPayload(entry, tripped));
+          }
+        } catch (error) { debug("permission.evaluate.error", error, correlation); throw error; }
+        finally { debug("permission.evaluate.after", event, correlation); }
+      }));
+      registrations.push(await ctx.tool.hook("execute.before", async (event) => {
+        debug("tool.execute.before", event);
+        try {
+          if (event.tool !== "execute") return;
+          // Invalid configuration leaves native execute behavior byte-for-byte untouched.
+          if (!valid) return;
+          if (stopping) throw new Error(INTERRUPTED_REASON);
+          // Hash identities prevent JavaScript '*'/'?' from widening new saved grants.
+          // Actual source remains bound to the identity in metadata for review/display.
+          // Existing saved rules are untouched; legacy source-specific grants may re-ask.
+          await ctx.permission.assert({ ...codeModePermission(event.input), sessionID: event.sessionID, agent: event.agent,
+            source: { type: "tool", messageID: event.messageID, id: event.id } });
+          if (stopping) throw new Error(INTERRUPTED_REASON);
+        } catch (error) { debug("tool.execute.before.error", { event, error }); throw error; }
+      }));
+      registrations.push(await ctx.tool.hook("execute.after", (event) => {
+        // Preserve the complete host output/error before adding any UX injection hint.
+        debug("tool.execute.after", event);
         try {
           if (event.status !== "completed") return;
           const result = event.result as { content?: unknown };
           if (result?.content !== undefined && scanResultContent(result.content))
             result.content = withInjectionWarning(result.content as string | ReadonlyArray<{ type: string; text?: string }>);
-        } catch { log.log("Output screening failed"); }
-      }),
-      async () => {
-        // Begin abandoning before awaiting either cleanup: a stalled permission
-        // disposal or status RPC must not leave the event subscription and
-        // active reviews running, where an in-flight review could deliver an
-        // allow instead of the cancellation that normalizes to `ask`. Both
-        // cleanups start here and settle together; their failures must not
-        // replace the original registration error.
-        await abandonSetup(() => permissionRegistration.dispose());
-      },
-    );
-    log.log("Auto-mode loaded");
-    return async () => {
-      // Start abandonment and both hook disposals together rather than gating
-      // them on the optional status service: a stalled RPC disposal must never
-      // leave a hook registered after the interruption subscription was
-      // aborted, where the host could still start reviews.
-      await abandonSetup(
-        () => permissionRegistration.dispose(),
-        () => toolRegistration.dispose(),
-      );
-      counts.clear();
-      log.log("Auto-mode unloaded");
-    };
+        } catch { /* UX hint only */ }
+      }));
+      registrations.push(await ctx.command.transform((editor) => editor.add({
+        name: "auto-mode", description: "Toggle auto mode or show its status", execute: async ({ sessionID, prompt }) => {
+          const argument = prompt.text.trim().replace(/^\/?auto-mode\b\s*/, "").trim();
+          if (!["", "on", "off", "status"].includes(argument)) {
+            await ctx.session.synthetic({ sessionID, text: "Usage: /auto-mode [on|off|status]" });
+            return;
+          }
+          try {
+            if (argument !== "status") {
+              const current = argument ? undefined : await snapshot(sessionID);
+              const target = argument || (current?.mode === "on" ? "off" : "on");
+              if (!valid && target === "on") {
+                const detail = configError ?? "invalid configuration";
+                await ctx.session.synthetic({ sessionID, text: `${INVALID_CONFIG_ACTION}: ${detail}` });
+                return;
+              }
+              await setSessionMode(sessionID, target as "on" | "off", true);
+            }
+            const now = await snapshot(sessionID);
+            const detail = now.mode === "invalid" && now.configError !== undefined
+              ? now.errorKind === "config" ? ` Review disabled: ${now.configError}` : ` ${now.configError}`
+              : "";
+            await ctx.session.synthetic({ sessionID, text: `Auto mode: ${now.mode}. Reviewing: ${now.reviewing.length}. Today: ${now.counts.allow} allow, ${now.counts.ask} ask, ${now.counts.deny} deny. Breaker: ${now.breaker ? "paused" : "ready"}.${detail}` });
+          } catch (error) { debug("command.error", error, { sessionID }); await ctx.session.synthetic({ sessionID, text: "Could not change auto mode; check /auto-mode status." }); }
+        },
+      })));
+    } catch (error) { await cleanup(); throw error; }
+    return cleanup;
   },
 });
-
-/** Registers a hook, cleaning up partial setup when the host throws or rejects. */
-async function registerHook<T>(register: () => Promise<T>, undo: () => Promise<void>): Promise<T> {
-  try {
-    return await register();
-  } catch (error) {
-    // A cleanup failure or rejection must not mask the registration error the
-    // caller has to see, and must not be reported as an unhandled rejection.
-    await Promise.allSettled([undo()]);
-    throw error;
-  }
-}
-
-interface ReviewerContext {
-  generate: { text(input: { prompt: string; model?: ReviewerModelRef | null }, request?: { signal?: AbortSignal }): Promise<{ text: string }> };
-}
-
-function throwIfAborted(signal: AbortSignal): void {
-  if (signal.aborted) throw new ReviewFailure("cancelled", "Review cancelled");
-}
-
-async function llmDecision(ctx: ReviewerContext, request: PermissionRequest, policy: ReturnType<typeof defaultPolicy>, signal: AbortSignal, model?: string, sessionModel?: ReviewerModelRef, sessionLookupError?: ReviewErrorKind): Promise<StageResult> {
-  const ref = model ? parseReviewerModel(model) : sessionModel;
-  if (!ref) return {
-    decision: "abstain",
-    reason: "Session model is unavailable; configure a reviewer model",
-    // Only a failed lookup explains the missing model; an explicit reviewer or
-    // a static stage is unaffected and must not inherit the lookup's category.
-    ...(sessionLookupError === undefined ? {} : { errorKind: sessionLookupError }),
-  };
-  const prompt = buildStage1Prompt(request, policy);
-  if (Buffer.byteLength(prompt) > 65_536) return { decision: "ask", reason: "Request too large for automatic review" };
-  throwIfAborted(signal);
-  const triage = await withTimeout(ctx.generate.text({ prompt, model: ref }, { signal }), 30_000, signal);
-  if (parseStage1(triage.text) === "allow") return { decision: "allow", reason: "LLM triage approved" };
-  // The triage call may settle after an interruption; do not start stage two.
-  throwIfAborted(signal);
-  const response = await withTimeout(ctx.generate.text({ prompt: buildStage2Prompt(request, policy), model: ref }, { signal }), 30_000, signal);
-  // parseDecision reports malformed output structurally, so a valid verdict
-  // is never reclassified by comparing its reason text.
-  return parseDecision(response.text);
-}
