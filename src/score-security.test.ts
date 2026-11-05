@@ -113,6 +113,24 @@ it("asks for force pushes explicitly targeting the default branch", () => {
   assert.equal(score.deny, undefined);
 });
 
+it("asks for force-create checkouts of the default branch, including attached branch values", () => {
+  const gitState = { branch: "topic", defaultBranch: "trunk", upstream: "remote/topic", clean: true };
+  for (const command of ["git checkout -B trunk HEAD~1", "git checkout -Btrunk HEAD~1",
+    "git switch -Ctrunk HEAD~1", "git switch --force-create=trunk HEAD~1", "git switch --force-create trunk HEAD~1"]) {
+    const score = scoreRequest({ action: "shell", resources: [command], gitState }, options);
+    assert.equal(score.band, "high", command);
+    assert.equal(score.ask, true, command);
+  }
+  const topic = scoreRequest({ action: "shell", resources: ["git checkout -Bfeature HEAD~1"], gitState }, options);
+  assert.equal(topic.ask, undefined);
+});
+
+it("reads find starting paths past the leading symlink-mode options", () => {
+  for (const command of ["find -L /outside -name '*.ts'", "find -H /outside", "find -O2 /outside", "find -D tree /outside"])
+    assert.notEqual(scoreRequest({ action: "shell", resources: [command], projectDir: "/project" }, options).band,
+      "low", command);
+});
+
 it("protects dotfiles, repository configuration and credential-bearing names", () => {
   const root = mkdtempSync(join(tmpdir(), "auto-mode-sensitive-"));
   try {

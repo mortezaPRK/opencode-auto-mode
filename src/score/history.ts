@@ -37,12 +37,64 @@ function resetMovesHead(args: readonly string[]): boolean {
   return rest.filter((arg) => !arg.startsWith("-")).length <= 1;
 }
 
-/** `checkout -B`/`switch -C`/`switch --force-create` reset an existing branch before switching to it. */
+/**
+ * The force-create option of each branch-switching subcommand, with the short
+ * letters that take a value so a bundle like `-bB` is read as `-b B` rather
+ * than as a force create.
+ */
+const FORCE_CREATE: Record<string, { short: string; valueLetters: string; long?: string }> = {
+  checkout: { short: "B", valueLetters: "bB" },
+  switch: { short: "C", valueLetters: "cC", long: "--force-create" },
+};
+
+/** The branch name a short bundle force-creates, or undefined when it creates no branch. */
+function shortForceCreate(word: string, option: { short: string; valueLetters: string },
+  next: string | undefined): { branch?: string } | undefined {
+  const letters = word.slice(1);
+  for (let index = 0; index < letters.length; index++) {
+    if (!option.valueLetters.includes(letters[index])) continue;
+    if (letters[index] !== option.short) return undefined;
+    const attached = letters.slice(index + 1);
+    return { branch: attached.length ? attached : next };
+  }
+  return undefined;
+}
+
+/** True for a short-option bundle (`-qB`), which is where the force-create letter can appear. */
+function isShortBundle(word: string): boolean {
+  return word.startsWith("-") && !word.startsWith("--") && word.length > 1;
+}
+
+/** The branch name a long force-create option attaches (`=trunk`) or takes from the next word. */
+function longForceCreate(word: string, next: string | undefined): string | undefined {
+  const separator = word.indexOf("=");
+  return separator === -1 ? next : word.slice(separator + 1);
+}
+
+/**
+ * `checkout -B`/`switch -C`/`switch --force-create` reset an existing branch
+ * before switching to it. The branch name is the option's attached value
+ * (`-Btrunk`, `--force-create=trunk`) or the following word, so a start point
+ * (`HEAD~1`) is never mistaken for the branch; `--` ends option parsing.
+ */
+function forceCreate(args: readonly string[]): { branch?: string } | undefined {
+  const option = FORCE_CREATE[args[0] ?? ""];
+  if (option === undefined) return undefined;
+  const rest = args.slice(1);
+  for (let index = 0; index < rest.length; index++) {
+    const word = rest[index];
+    if (word === "--") return undefined;
+    if (option.long !== undefined && isLongOption(word, option.long))
+      return { branch: longForceCreate(word, rest[index + 1]) };
+    if (!isShortBundle(word)) continue;
+    const created = shortForceCreate(word, option, rest[index + 1]);
+    if (created !== undefined) return created;
+  }
+  return undefined;
+}
+
 function forceResetsBranch(args: readonly string[]): boolean {
-  const first = args[0];
-  if (first === "checkout") return args.some((arg) => /^-[^-]*B/.test(arg));
-  if (first === "switch") return hasLong(args, "--force-create") || args.some((arg) => /^-[^-]*C/.test(arg));
-  return false;
+  return forceCreate(args) !== undefined;
 }
 
 /** True when a parsed Git invocation rewrites or deletes history. */
@@ -73,9 +125,7 @@ function pushesToDefaultBranch(argv: readonly string[], defaultBranch: string): 
 /** Name of the branch that a force-reset `checkout -B`/`switch -C` would overwrite, if any. */
 function forceResetTarget(argv: readonly string[]): string | undefined {
   if (argv[0] !== "git") return undefined;
-  const args = argv.slice(1);
-  if (!forceResetsBranch(args)) return undefined;
-  return args.slice(1).find((arg) => !arg.startsWith("-"));
+  return forceCreate(argv.slice(1))?.branch;
 }
 
 /** Scores one verified history-changing invocation, or the missing precondition that asks for review. */

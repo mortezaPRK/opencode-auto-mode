@@ -602,6 +602,16 @@ function startsFindExpression(word: string): boolean {
   return word === "(" || word === ")" || word === "!" || word.startsWith("-");
 }
 
+/**
+ * Options `find` accepts before its starting paths: the symlink modes
+ * `-H`/`-L`/`-P`, the optimisation level `-O[level]` and `-D debugopts`.
+ */
+function findLeadingOption(word: string): "flag" | "value" | undefined {
+  if (word === "-H" || word === "-L" || word === "-P") return "flag";
+  if (word === "-D") return "value";
+  return /^-O\d*$/.test(word) ? "flag" : undefined;
+}
+
 /** Marks an inline `-exec ... ;`/`-exec ... +` command as data and returns its end index. */
 function consumeFindExecArgs(args: readonly string[], start: number, base: number, roles: RoleSets): number {
   let index = start + 1;
@@ -609,15 +619,29 @@ function consumeFindExecArgs(args: readonly string[], start: number, base: numbe
   return index;
 }
 
+/** Marks `find`'s leading options as data and returns the index its starting paths begin at. */
+function consumeFindLeadingOptions(args: readonly string[], base: number, roles: RoleSets): number {
+  let index = 0;
+  while (index < args.length) {
+    const option = findLeadingOption(args[index]);
+    if (option === undefined) break;
+    roles.data.add(base + index);
+    if (option === "value" && index + 1 < args.length) roles.data.add(base + ++index);
+    index++;
+  }
+  return index;
+}
+
 /**
- * `find [path...] [expression]`: positionals before the first expression
- * token (an option, `(`, `)` or `!`) are starting paths; `-exec`/`-execdir`/
- * `-ok`/`-okdir` consume a command up to `;`/`+` as data, and other tests
- * consume their value as a path or data per the tables above.
+ * `find [-H|-L|-P|-O[level]|-D debugopts] [path...] [expression]`: positionals
+ * before the first expression token (an option, `(`, `)` or `!`) are starting
+ * paths; `-exec`/`-execdir`/`-ok`/`-okdir` consume a command up to `;`/`+` as
+ * data, and other tests consume their value as a path or data per the tables
+ * above.
  */
 function findRoles(args: readonly string[], base: number, roles: RoleSets): void {
   let sawExpression = false;
-  for (let index = 0; index < args.length; index++) {
+  for (let index = consumeFindLeadingOptions(args, base, roles); index < args.length; index++) {
     const word = args[index];
     if (!sawExpression) {
       if (!startsFindExpression(word)) { roles.paths.add(base + index); continue; }
