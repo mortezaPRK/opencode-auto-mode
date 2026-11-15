@@ -12,5 +12,5 @@ export const low = (reason: string): RequestScore => ({ band: "low", reason });
 export const medium = (reason: string): RequestScore => ({ band: "medium", reason });
 export const high = (reason: string): RequestScore => ({ band: "high", reason });
 export const deny = (reason: string): RequestScore => ({ band: "high", reason, deny: true });
-/** Missing VCS preconditions gate history changes into manual review, not a hard deny. */
+/** Established human gates and unusable envelopes cannot be overridden by models. */
 export const ask = (reason: string): RequestScore => ({ band: "high", reason, ask: true });

@@ -23,7 +23,7 @@ it("checks destructive segments before complex-syntax escalation", () => {
     assert.equal(scoreRequest({ action: "shell", resources: [command], projectDir: "/project" }, options).deny, true, command);
   const forcePush = scoreRequest({ action: "shell", resources: ["git push --force; pwd"], projectDir: "/project" }, options);
   assert.equal(forcePush.band, "high");
-  assert.equal(forcePush.ask, true);
+  assert.equal(forcePush.ask, undefined);
   assert.equal(forcePush.deny, undefined);
   assert.equal(scoreRequest({ action: "shell", resources: ["git -C /project push --force"], projectDir: "/project" }, options).ask, undefined);
   assert.equal(scoreRequest({ action: "shell", resources: ["sudo id $'x'"] }, options).deny, true);
@@ -32,7 +32,7 @@ it("retains later-command deny precedence and executable qualification for compo
   for (const command of ["pwd\ncat .env", "set -e\ncat .env", "pwd && cat .env", "pwd\ncat \\\n .env", "pwd\nenv rm -rf /outside", "pwd\n/usr/bin/rm -rf /outside"]) {
     assert.equal(scoreRequest({ action: "shell", resources: [command], projectDir: "/project" }, options).deny, true, command);
   }
-  assert.equal(scoreRequest({ action: "shell", resources: ["pwd\ncommand git push --force"], projectDir: "/project" }, options).ask, true);
+  assert.equal(scoreRequest({ action: "shell", resources: ["pwd\ncommand git push --force"], projectDir: "/project" }, options).ask, undefined);
   for (const command of ["pwd\n/usr/bin/ls", "pwd; ./ls", "pwd\nenv ./ls"])
     assert.equal(scoreRequest({ action: "shell", resources: [command] }, options).band, "high", command);
   assert.equal(scoreRequest({ action: "shell", resources: ["pwd\ngit -C /project status"] }, options).ask, undefined);
@@ -608,14 +608,14 @@ it("asks for shell resources beyond the scoring size and prompt bounds", () => {
   }
 });
 
-it("keeps non-shell request limit failures high without the manual floor", () => {
+it("keeps malformed or oversized non-shell envelopes terminal", () => {
   const oversized = "a".repeat(65_537);
   const manyBytes = Array.from({ length: 5 }, () => "a".repeat(60_000));
   for (const action of ["read", "edit", "write", "glob", "grep", "webfetch", "websearch", "execute", "unknown-tool"]) {
     for (const resources of [[], Array.from({ length: 257 }, () => "a.ts"), [oversized], manyBytes]) {
       const score = scoreRequest({ action, resources }, options);
       assert.equal(score.band, "high", action);
-      assert.equal(score.ask, undefined, action);
+      assert.equal(score.ask, true, action);
       assert.equal(score.deny, undefined, action);
     }
   }

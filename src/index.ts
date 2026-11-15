@@ -4,6 +4,7 @@ import { DEFAULT_AUDIT_MAX_BYTES, DEFAULT_REVIEW_TIMEOUT_MS, parseOptions } from
 import { reviewRequest, type PermissionRequest, type ReviewResult } from "./reviewer.js";
 import { decisionStage } from "./decision.js";
 import { runClassifiers } from "./classifier.js";
+import { permissionContext } from "./permission-context.js";
 import { scoreRequest } from "./score.js";
 import { loadGlobalOptions } from "./global-options.js";
 import { getWorktreeScope } from "./worktree.js";
@@ -13,7 +14,7 @@ import { createModeStore, type FinishDisposition, type FinishOutcome } from "./m
 import { AutoMode, MAX_SESSION_ID_CHARS, type AutoModeDecision, type AutoModeErrorKind, type AutoModeMode } from "./rpc.js";
 import { createStatusTracker } from "./status.js";
 import { withTimeout } from "./timeout.js";
-import { errorKindOf, ReviewFailure } from "./errors.js";
+import { errorKindOf, EvidenceFailure, ReviewFailure } from "./errors.js";
 import { codeModePermission, codeModeReviewResources } from "./code-mode.js";
 import { scanResultContent, withInjectionWarning } from "./probe.js";
 
@@ -291,19 +292,18 @@ export default Plugin.define({
               if (signal.aborted) return { kind: "cancelled" };
               // Same-model reviewer identity is intentionally not restricted or warned:
               // the user chooses the reviewer, and this plugin adds no independence gate.
-              const scope = await observe("worktree.scope", info.location, async () => getWorktreeScope(info.location.directory), correlation);
-              const location = { directory: scope.directory };
-              const vcs = await sdk("vcs.get", { location }, () => ctx.vcs.get({ location }, { signal }), signal, correlation);
-              if (signal.aborted) return { kind: "cancelled" };
-              const tree = await sdk("vcs.status", { location }, () => ctx.vcs.status({ location }, { signal }), signal, correlation);
+              const facts = await permissionContext(info.location.directory, {
+                scope: (directory) => observe("worktree.scope", { directory }, async () => getWorktreeScope(directory), correlation),
+                branch: async (directory) => (await sdk("vcs.get", { location: { directory } }, () => ctx.vcs.get({ location: { directory } }, { signal }), signal, correlation)).data.branch,
+                status: async (directory) => (await sdk("vcs.status", { location: { directory } }, () => ctx.vcs.status({ location: { directory } }, { signal }), signal, correlation)).data,
+              }, signal);
               if (signal.aborted) return { kind: "cancelled" };
               let reviewResources: string[];
               try { reviewResources = codeModeReviewResources(event) ?? [...event.resources]; }
               catch (error) { throw new ReviewFailure("context", "Code Mode evidence does not match its permission identity", { cause: error }); }
               const request: PermissionRequest = {
                 action: event.action, resources: reviewResources, agent: event.agent,
-                projectDir: scope.directory, worktreeRoot: scope.worktreeRoot,
-                gitState: { branch: vcs.data.branch.current, defaultBranch: vcs.data.branch.default, clean: tree.data.length === 0 },
+                ...facts,
               };
               if (signal.aborted) return { kind: "cancelled" };
               const scored = await observe("score", request, async () => scoreRequest(request, settings), correlation);
@@ -319,8 +319,8 @@ export default Plugin.define({
                   const users = messages.filter((message) => message.type === "user").map((message) => message.text);
                   if (users.length === 0 || users.some((text) => typeof text !== "string") || Buffer.byteLength(users.join("\n")) > 12_000)
                     throw new ReviewFailure("context", "User authorization context is unavailable or oversized");
-                   return (request.userMessages = users).join("\n");
-                })();
+                  return (request.userMessages = users).join("\n");
+                })().catch(unavailableAuthorization);
                 request.transcript = await transcript;
                 if (cancelledNow()) throw new Error(INTERRUPTED_REASON);
               };
@@ -525,3 +525,7 @@ export default Plugin.define({
     return cleanup;
   },
 });
+
+function unavailableAuthorization(error: unknown): never {
+  throw new EvidenceFailure("User authorization evidence is unavailable", { cause: error });
+}

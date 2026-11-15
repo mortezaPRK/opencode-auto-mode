@@ -1,5 +1,5 @@
 import { Model } from "@opencode/schema/model";
-import { errorKindOf, ReviewFailure, type ReviewErrorKind } from "./errors.js";
+import { errorKindOf, EvidenceFailure, terminalEvidence, ReviewFailure, type ReviewErrorKind } from "./errors.js";
 import { withTimeout } from "./timeout.js";
 import { redactHttpBodies } from "./audit.js";
 
@@ -15,9 +15,11 @@ export interface PermissionRequest {
   /** Chronological user messages; boundaries are authorization evidence. */
   userMessages?: readonly string[];
   staticAnalysis?: { band: string; reason: string; findings?: readonly string[] };
+  scopeResolution?: "unknown";
+  shell?: { platform?: string; interpreter?: string };
   metadata?: Record<string, unknown>;
   source?: unknown;
-  gitState?: { branch?: string; defaultBranch?: string; upstream?: string; clean: boolean };
+  gitState?: { branch?: string; defaultBranch?: string; upstream?: string; clean?: boolean };
 }
 
 export type Decision = "allow" | "deny" | "ask";
@@ -27,6 +29,8 @@ export interface StageResult {
   reason: string;
   stage?: string;
   errorKind?: ReviewErrorKind;
+  /** Essential evidence cannot be recovered by trying a later classifier. */
+  terminal?: boolean;
 }
 export interface ReviewResult extends Omit<StageResult, "decision"> { decision: Decision }
 
@@ -48,6 +52,8 @@ export function reviewEvidence(req: PermissionRequest) {
       findings: req.staticAnalysis.findings?.slice(0, 16).map((finding) => finding.slice(0, 500)),
     },
     platform: process.platform,
+    shell: req.shell,
+    scopeResolution: req.scopeResolution,
     gitState: req.gitState === undefined ? undefined : {
       branch: req.gitState.branch,
       defaultBranch: req.gitState.defaultBranch,
@@ -99,15 +105,15 @@ export async function reviewRequest(ctx: ReviewerContext, request: PermissionReq
     if (signal.aborted) throw new ReviewFailure("cancelled", "Review cancelled");
     if (!model.trim() || !Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new ReviewFailure("context", "Reviewer not configured");
     if (request.resources.some((resource) => redactHttpBodies(resource) !== resource))
-      return { decision: "ask", reason: "Inline HTTP body or ambiguous serialized evidence requires human review", stage: "reviewer", errorKind: "context" };
+      return { decision: "ask", terminal: true, reason: "Inline HTTP body or ambiguous serialized evidence requires human review", stage: "reviewer", errorKind: "context" };
     const prompt = buildReviewPrompt(request);
-    if (Buffer.byteLength(prompt) > 65_536) throw new ReviewFailure("context", "Review request too large");
+    if (Buffer.byteLength(prompt) > 65_536) throw new EvidenceFailure("Review request too large");
     bounded = AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]);
     const response = await withTimeout(ctx.experimental.generate.text({ prompt, model: Model.Ref.parse(model) }, { signal: bounded }), timeoutMs, signal);
     return { ...parseDecision(response.text), stage: "reviewer" };
   } catch (error) {
     try { onError?.(error); } catch { /* Debug collection must not affect permission decisions. */ }
     const localTimeout = !signal.aborted && bounded?.aborted && bounded.reason instanceof DOMException && bounded.reason.name === "TimeoutError";
-    return { decision: "ask", reason: "Reviewer unavailable or returned invalid output", stage: "reviewer", errorKind: localTimeout ? "timeout" : signal.aborted ? "cancelled" : errorKindOf(error) };
+    return { ...terminalEvidence(error), decision: "ask", reason: "Reviewer unavailable or returned invalid output", stage: "reviewer", errorKind: localTimeout ? "timeout" : signal.aborted ? "cancelled" : errorKindOf(error) };
   }
 }

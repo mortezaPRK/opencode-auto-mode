@@ -1,5 +1,5 @@
 import type { ClassifierOptions } from "./config.js";
-import { errorKindOf } from "./errors.js";
+import { errorKindOf, terminalEvidence } from "./errors.js";
 import type { PermissionRequest, ReviewResult, StageResult } from "./reviewer.js";
 import type { RequestScore } from "./score.js";
 
@@ -37,13 +37,13 @@ export async function runClassifiers(stages: readonly ClassifierOptions[], reque
         result = stage.type === "decision" ? await callbacks.decision(stage, request) : await callbacks.llm(stage, request);
       }
     } catch (error) {
-      result = { decision: "abstain", reason: "Classifier unavailable", stage: stage.type, errorKind: errorKindOf(error) };
+      result = { ...terminalEvidence(error), decision: "abstain", reason: "Classifier unavailable", stage: stage.type, errorKind: errorKindOf(error) };
     }
     if (callbacks.signal?.aborted) result = interrupted(stage.type);
     try { callbacks.onResult?.(stage, result, index); } catch { /* Observability must not alter a verdict. */ }
     // Observers can synchronously trigger cancellation too; never return a stale allow.
     if (callbacks.signal?.aborted) return interrupted(stage.type);
-    if (result.errorKind === "cancelled" || result.errorKind === "deadline") return { ...result, decision: "ask" };
+    if (isTerminal(result)) return { ...result, decision: "ask" };
     if (result.decision === "allow" || result.decision === "deny") return result as ReviewResult;
     last = retainRationale(stage.type, result, last);
   }
@@ -52,4 +52,8 @@ export async function runClassifiers(stages: readonly ClassifierOptions[], reque
 
 function retainRationale(type: string, result: StageResult, previous?: StageResult): StageResult {
   return type === "static" && previous ? previous : result;
+}
+
+function isTerminal(result: StageResult): boolean {
+  return result.terminal === true || result.errorKind === "cancelled" || result.errorKind === "deadline";
 }

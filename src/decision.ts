@@ -1,6 +1,6 @@
 import { Model } from "@opencode/schema/model";
 import type { Generate } from "@opencode/schema/generate";
-import { errorKindOf, ReviewFailure } from "./errors.js";
+import { errorKindOf, EvidenceFailure, terminalEvidence, ReviewFailure } from "./errors.js";
 import { AUTHORITY_RULES, reviewEvidence, type PermissionRequest, type ReviewErrorObserver, type StageResult } from "./reviewer.js";
 import { withTimeout } from "./timeout.js";
 
@@ -51,7 +51,7 @@ export async function decisionStage(ctx: DecisionContext, options: DecisionOptio
     if (!Number.isFinite(timeoutMs) || timeoutMs <= 0 || !probability(minConfidence))
       throw new ReviewFailure("context", "Invalid decision options");
     const evidence = reviewEvidence(request);
-    if (evidence.incompleteEvidence) throw new ReviewFailure("context", "Incomplete decision evidence");
+    if (evidence.incompleteEvidence) throw new EvidenceFailure("Incomplete decision evidence");
     const input: DecisionInput = {
       model: Model.Ref.parse(options.model),
       input: [{ type: "text", text: JSON.stringify(evidence) }],
@@ -60,13 +60,13 @@ export async function decisionStage(ctx: DecisionContext, options: DecisionOptio
         choices: Object.entries(criteria).map(([value, description]) => ({ value, description })),
       }],
     };
-    if (Buffer.byteLength(JSON.stringify(input)) > 65_536) throw new ReviewFailure("context", "Decision request too large");
+    if (Buffer.byteLength(JSON.stringify(input)) > 65_536) throw new EvidenceFailure("Decision request too large");
     bounded = signal ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]) : AbortSignal.timeout(timeoutMs);
     const response = await withTimeout(ctx.experimental.generate.decisions(input, { signal: bounded }), timeoutMs, signal);
     return verdict(response, minConfidence);
   } catch (error) {
     try { onError?.(error); } catch { /* Debug collection must not affect permission decisions. */ }
     const localTimeout = !signal?.aborted && bounded?.aborted && bounded.reason instanceof DOMException && bounded.reason.name === "TimeoutError";
-    return { decision: "abstain", stage: "decision", reason: "Decision stage unavailable or returned invalid output", errorKind: localTimeout ? "timeout" : signal?.aborted ? "cancelled" : errorKindOf(error) };
+    return { ...terminalEvidence(error), decision: "abstain", stage: "decision", reason: "Decision stage unavailable or returned invalid output", errorKind: localTimeout ? "timeout" : signal?.aborted ? "cancelled" : errorKindOf(error) };
   }
 }

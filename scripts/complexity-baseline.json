@@ -25,7 +25,7 @@
       118
     ],
     "src/classifier.ts::complexity::runClassifiers@15:8": [
-      29
+      28
     ],
     "src/code-mode.ts::complexity::codeModeReviewResources@46:8": [
       12
@@ -54,7 +54,7 @@
     "src/decision.ts::complexity::verdict@22:1": [
       24
     ],
-    "src/errors.ts::complexity::errorKindOf@25:8": [
+    "src/errors.ts::complexity::errorKindOf@34:8": [
       11
     ],
     "src/global-options.ts::complexity::loadGlobalOptions@49:8": [
@@ -85,37 +85,37 @@
       63
     ],
     "src/index.test.ts::max-lines-per-function::anonymous-arrow@154:44": [
-      1000
+      999
     ],
     "src/index.test.ts::max-lines-per-function::setup@46:1": [
       105
     ],
-    "src/index.ts::complexity::anonymous-arrow@119:98": [
+    "src/index.ts::complexity::anonymous-arrow@120:98": [
       18
     ],
-    "src/index.ts::complexity::anonymous-arrow@213:78": [
+    "src/index.ts::complexity::anonymous-arrow@214:78": [
       56
     ],
-    "src/index.ts::complexity::anonymous-arrow@274:57": [
-      16
+    "src/index.ts::complexity::anonymous-arrow@275:57": [
+      15
     ],
-    "src/index.ts::complexity::anonymous-arrow@95:49": [
+    "src/index.ts::complexity::anonymous-arrow@96:49": [
       12
     ],
     "src/index.ts::complexity::execute@499:80": [
       15
     ],
-    "src/index.ts::complexity::setup@35:3": [
+    "src/index.ts::complexity::setup@36:3": [
       14
     ],
-    "src/index.ts::max-lines-per-function::anonymous-arrow@213:78": [
-      225
+    "src/index.ts::max-lines-per-function::anonymous-arrow@214:78": [
+      224
     ],
-    "src/index.ts::max-lines-per-function::anonymous-arrow@274:57": [
-      72
+    "src/index.ts::max-lines-per-function::anonymous-arrow@275:57": [
+      71
     ],
-    "src/index.ts::max-lines-per-function::setup@35:3": [
-      436
+    "src/index.ts::max-lines-per-function::setup@36:3": [
+      435
     ],
     "src/mode.test.ts::max-lines-per-function::anonymous-arrow@11:37": [
       258
@@ -133,16 +133,13 @@
       135
     ],
     "src/reviewer.test.ts::max-lines-per-function::anonymous-arrow@11:35": [
-      179
+      93
     ],
-    "src/reviewer.ts::complexity::reviewRequest@96:8": [
+    "src/reviewer.ts::complexity::reviewRequest@102:8": [
       16
     ],
     "src/shell-policy.ts::complexity::commandLineAt@1207:1": [
       20
-    ],
-    "src/shell-policy.ts::complexity::denyInvocation@1739:8": [
-      38
     ],
     "src/shell-policy.ts::complexity::denyScript@1703:1": [
       12
@@ -168,16 +165,16 @@
     "src/shell-policy.ts::complexity::invocations@1608:1": [
       13
     ],
-    "src/shell-policy.ts::complexity::isReadOnlyDate@1836:1": [
+    "src/shell-policy.ts::complexity::isReadOnlyDate@1851:1": [
       21
     ],
-    "src/shell-policy.ts::complexity::isReadOnlyGrep@1900:1": [
+    "src/shell-policy.ts::complexity::isReadOnlyGrep@1915:1": [
       15
     ],
-    "src/shell-policy.ts::complexity::isReadOnlyInvocation@2026:8": [
+    "src/shell-policy.ts::complexity::isReadOnlyInvocation@2041:8": [
       21
     ],
-    "src/shell-policy.ts::complexity::isReadOnlyUniq@1788:1": [
+    "src/shell-policy.ts::complexity::isReadOnlyUniq@1803:1": [
       19
     ],
     "src/shell-policy.ts::complexity::isRecursiveRootRemoval@873:1": [
@@ -213,7 +210,7 @@
     "src/shell-policy.ts::max-depth::block@1382:11": [
       5
     ],
-    "src/shell-policy.ts::max-depth::block@1812:11": [
+    "src/shell-policy.ts::max-depth::block@1827:11": [
       5
     ],
     "src/shell-policy.ts::max-depth::block@476:11": [
@@ -237,86 +234,59 @@
     "src/shell-policy.ts::max-lines-per-function::normalizeContinuations@1341:8": [
       90
     ],
-    "src/shell.test.ts::complexity::anonymous-arrow@189:84": [
+    "src/shell.test.ts::complexity::anonymous-arrow@197:84": [
       17
     ],
-    "src/shell.test.ts::complexity::anonymous-arrow@253:72": [
+    "src/shell.test.ts::complexity::anonymous-arrow@261:72": [
       14
     ],
-    "src/shell.test.ts::complexity::anonymous-arrow@287:73": [
+    "src/shell.test.ts::complexity::anonymous-arrow@295:73": [
       12
     ],
-    "src/shell.test.ts::complexity::anonymous-arrow@319:75": [
+    "src/shell.test.ts::complexity::anonymous-arrow@327:75": [
       11
     ],
-    "src/shell.test.ts::complexity::anonymous-arrow@379:67": [
+    "src/shell.test.ts::complexity::anonymous-arrow@387:67": [
       11
     ],
-    "src/shell.test.ts::complexity::anonymous-arrow@407:60": [
+    "src/shell.test.ts::complexity::anonymous-arrow@415:60": [
       13
     ],
-    "src/shell.test.ts::complexity::anonymous-arrow@936:62": [
+    "src/shell.test.ts::complexity::anonymous-arrow@944:62": [
       12
     ],
-    "src/shell.test.ts::max-lines-per-function::anonymous-arrow@1183:39": [
+    "src/shell.test.ts::max-lines-per-function::anonymous-arrow@1192:39": [
       67
     ],
-    "src/shell.test.ts::max-lines-per-function::anonymous-arrow@52:37": [
+    "src/shell.test.ts::max-lines-per-function::anonymous-arrow@60:37": [
       371
     ],
-    "src/shell.test.ts::max-lines-per-function::anonymous-arrow@519:40": [
+    "src/shell.test.ts::max-lines-per-function::anonymous-arrow@527:40": [
       336
     ],
-    "src/shell.ts::complexity::analyzeHeredoc@372:1": [
+    "src/shell.ts::complexity::analyzeHeredoc@371:1": [
       27
     ],
-    "src/shell.ts::complexity::analyzeLine@305:1": [
-      20
+    "src/shell.ts::complexity::analyzeLine@306:1": [
+      18
     ],
-    "src/shell.ts::complexity::anonymous-arrow@464:32": [
-      14
-    ],
-    "src/shell.ts::complexity::guardShell@609:8": [
+    "src/shell.ts::complexity::guardShell@588:8": [
       12
     ],
-    "src/shell.ts::complexity::lineSegments@158:1": [
-      20
+    "src/shell.ts::complexity::lineSegments@161:1": [
+      19
     ],
-    "src/shell.ts::complexity::parseShellCommands@246:8": [
+    "src/shell.ts::complexity::parseShellCommands@247:8": [
       17
     ],
-    "src/shell.ts::complexity::recursiveExternalDelete@444:8": [
-      16
+    "src/shell.ts::complexity::recursiveExternalDelete@443:8": [
+      15
     ],
-    "src/shell.ts::complexity::visibleShellDeny@521:8": [
-      17
-    ],
-    "src/shell.ts::complexity::wordExpansions@85:1": [
-      29
-    ],
-    "src/shell.ts::max-depth::block@546:11": [
-      5
-    ],
-    "src/shell.ts::max-lines-per-function::lineSegments@158:1": [
-      62
-    ],
-    "src/shell.ts::max-lines-per-function::wordExpansions@85:1": [
-      62
+    "src/shell.ts::complexity::visibleShellDeny@504:8": [
+      14
     ],
     "src/status.test.ts::max-lines-per-function::anonymous-arrow@7:31": [
       99
-    ],
-    "src/tiers.ts::complexity::hasSymlinkTraversal@114:8": [
-      11
-    ],
-    "src/tiers.ts::complexity::isProtected@134:8": [
-      16
-    ],
-    "src/tiers.ts::complexity::isProtectedShellWord@237:8": [
-      15
-    ],
-    "src/tiers.ts::complexity::safeTarget@296:8": [
-      20
     ],
     "src/user-files.ts::complexity::parseJSONC@6:8": [
       23

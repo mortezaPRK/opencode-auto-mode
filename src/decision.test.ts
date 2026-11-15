@@ -2,7 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { decisionStage, type DecisionContext } from "./decision.js";
 import { ReviewFailure } from "./errors.js";
-import { AUTHORITY_RULES } from "./reviewer.js";
+import { AUTHORITY_RULES, buildReviewPrompt } from "./reviewer.js";
 import { runClassifiers } from "./classifier.js";
 
 const options = { model: "test-provider/test-model", timeoutMs: 20, minConfidence: 0.9 };
@@ -155,4 +155,20 @@ describe("native decision stage", () => {
     assert.equal((await pending).errorKind, "cancelled");
     assert.equal(bounded?.aborted, true);
   });
+});
+
+it("gives both model stages identical bounded findings, resolution and user-message boundaries", async () => {
+  const evidenceRequest = { ...request, userMessages: ["Use old-name. Never publish.", "Correction: use new-name."],
+    staticAnalysis: { band: "high", reason: "Path resolution requires review", findings: ["ordinary: resolved=/synthetic/outside", "x".repeat(900)] },
+    scopeResolution: "unknown" as const, shell: { platform: "fixture", interpreter: "fish" },
+  };
+  const expected = JSON.parse(buildReviewPrompt(evidenceRequest).split("\n")[2]);
+  let seen = false;
+  await decisionStage(context(async (input) => {
+    seen = true;
+    assert.deepEqual(JSON.parse(input.input[0].text), expected);
+    assert.equal(expected.staticAnalysis.findings[1].length, 500);
+    return answer("allow");
+  }), options, evidenceRequest);
+  assert.equal(seen, true);
 });

@@ -1,6 +1,7 @@
 import type { PermissionRequest } from "../reviewer.js";
-import { protectedSegment, recursiveExternalDelete, segmentNeedsPathReview, type ParsedShellCommands } from "../shell.js";
+import { protectedSegment, recursiveExternalDelete, segmentNeedsPathReview, segmentPathPolicies, type ParsedShellCommands } from "../shell.js";
 import { classifyPath, isProtected } from "../tiers.js";
+import { pathFindings } from "../path-policy.js";
 import { historyChange, historyScore, isGitGlobalOption } from "./history.js";
 import { executableShapeScore, type ShellScan } from "./shell-argv.js";
 import { deny, high, type RequestScore } from "./types.js";
@@ -31,7 +32,7 @@ function literalShellScore(scan: ShellScan, request: PermissionRequest, worktree
   return undefined;
 }
 
-/** Credential/config paths deny; Git metadata is left to configured reviewers. */
+/** Known stores deny; uncertain path roles and configuration reach reviewers. */
 function protectedPathScore(scan: ShellScan, projectDir?: string): RequestScore | undefined {
   // Wrappers do not erase destructive semantics (env rm / command git push).
   // Each simple command is judged by its own grammar, so a pattern/script/filter
@@ -42,8 +43,16 @@ function protectedPathScore(scan: ShellScan, projectDir?: string): RequestScore 
     return deny("Protected path access");
   if (scan.commands.some((command) => command?.segments.some((segment) => segmentNeedsPathReview(segment, projectDir)) ||
       command?.redirects.some((target) => classifyPath(target, projectDir).review)))
-    return { ...high("Path role or resolution requires further review"), findings: ["Configuration, ambiguous operand role or unresolved metadata; no established prohibition"] };
+    return { ...high("Path role or resolution requires further review"), findings: shellPathFindings(scan, projectDir) };
   return undefined;
+}
+
+function shellPathFindings(scan: ShellScan, directory?: string): string[] {
+  const facts = scan.commands.flatMap((command) => command === undefined ? [] : [
+    ...command.redirects.map((target) => classifyPath(target, directory)),
+    ...command.segments.flatMap((segment) => segmentPathPolicies(segment, directory)),
+  ]);
+  return pathFindings(facts);
 }
 
 /** Ordered shell safety pipeline: literal denies, then paths, then executable shape. */

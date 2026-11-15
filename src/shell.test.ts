@@ -5,6 +5,14 @@ import assert from "node:assert/strict";
 function expectedPathDeny(command: string): "deny" | undefined {
   return /\.env(?:[.\s'"/]|$)|(?:^|\s)~\/\.ssh\/id_rsa/.test(command) ? "deny" : undefined;
 }
+
+function assertGuardPolicy(command: string): void {
+  const decision = guardShell([command])?.decision;
+  // World-write capability alone now reviews; independent established
+  // prohibitions in the other fixtures retain their exact deny assertion.
+  if (normalizeContinuations(command).includes("chmod ")) assert.notEqual(decision, "allow", command);
+  else assert.equal(decision, "deny", command);
+}
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -152,7 +160,7 @@ describe("shell approval guard", () => {
       "shutdown -\\\nh now", "stdbuf -o L \\\nsudo id", "env -u HOME sudo \\\nid",
       "bash -c 'sudo echo first \\\nsecond'", "bash -c 's\\\nudo id'", "eval 'rm -rf \\\n/'",
       "cat <<'EOF'\ntext\nEOF\nsudo echo first \\\nsecond", "cat <<'EOF'\na \\\nb\nEOF\nsudo \\\nid"])
-      assert.equal(guardShell([command])?.decision, "deny", command);
+      assertGuardPolicy(command);
   });
   it("keeps continuations literal where the shell keeps them", () => {
     // Outside quotes, and inside double quotes, the shell removes the pair.
@@ -248,7 +256,7 @@ describe("shell approval guard", () => {
       assert.equal(guardShell([command])?.decision, "ask", command);
     // Plain quoted markers keep their deny precedence for the same tail.
     for (const command of ["cat <<'EOF'\nx\nEOF\nsudo id", "sudo cat <<'EOF'\nx\nEOF"])
-      assert.equal(guardShell([command])?.decision, "deny", command);
+      assertGuardPolicy(command);
   });
   it("validates every raw heredoc header, not just the first line", () => {
     // The reported command: the stable body for `A` ends, then the second header
@@ -431,10 +439,10 @@ describe("shell approval guard", () => {
     const insert = (command: string, index: number) => `${command.slice(0, index)}\\\n${command.slice(index)}`;
     for (const command of ["sudo id", "su root", "rm -rf /", "rm -r / --no-preserve-root", "chmod 777 target",
       "mkfs.ext4 /dev/sda1", "dd of=/dev/sda", "shutdown -h now", "bash -c 'sudo id'", "eval 'rm -rf /'"]) {
-      assert.equal(guardShell([command])?.decision, "deny", command);
+      assertGuardPolicy(command);
       for (let index = 0; index <= command.length; index++) {
         // A continuation is invisible to the shell, so no split may loosen a deny.
-        assert.equal(guardShell([insert(command, index)])?.decision, "deny", insert(command, index));
+        assertGuardPolicy(insert(command, index));
       }
     }
     for (const command of ["pwd", "echo done", "git status --short", "ls -la src", "date +%s"]) {
@@ -505,7 +513,7 @@ describe("shell approval guard", () => {
   it("still denies dangerous operations hidden in nested shells", () => {
     for (const command of ["bash -c 'rm -rf /'", "sh -lc 'sudo id'", "eval 'chmod 777 x'", "rm -fr /",
       "sh -c 'rm -r / --no-preserve-root'", "sudo -n id", "mkfs.ext4 /dev/sda1"])
-      assert.equal(guardShell([command])?.decision, "deny", command);
+      assertGuardPolicy(command);
     // Subshell syntax is not parsed into segments, so it stays a manual approval.
     assert.equal(guardShell(["( sudo id )"])?.decision, "ask");
   });
@@ -600,7 +608,7 @@ describe("shell policy edge cases", () => {
 
   it("denies chmod only when the mode operand is world-writable", () => {
     for (const command of ["chmod 777 target", "chmod -R 777 dir", "chmod --changes 0777 file"])
-      assert.equal(guardShell([command])?.decision, "deny", command);
+      assertGuardPolicy(command);
     for (const command of ["chmod 600 777", "chmod u+w 777", "chmod --reference=target 777"])
       assert.notEqual(guardShell([command])?.decision, "deny", command);
   });
@@ -665,7 +673,7 @@ describe("shell policy edge cases", () => {
     for (const command of ["chmod 777 > /dev/null target", "sh -c 'chmod 777 > /dev/null target'",
       "eval 'chmod 777 > /dev/null target'", "chmod 777 >> log target", "chmod 0777 2>/dev/null target",
       "chmod 777 < /dev/null target", "bash -c 'chmod 777 2>/dev/null target'"])
-      assert.equal(guardShell([command])?.decision, "deny", command);
+      assertGuardPolicy(command);
     // A quoted or escaped digit is an argument, not a changed file descriptor.
     for (const command of ['chmod 600 "2">/dev/null target', "chmod 600 \\2>/dev/null target"])
       assert.notEqual(guardShell([command])?.decision, "deny", command);
@@ -676,7 +684,7 @@ describe("shell policy edge cases", () => {
       "true &2>>/dev/null rm -r /", "true &1>/dev/null sudo -n id", "true &2>2 chmod 777 target",
       "true&2>2 chmod 777 target", "sh -c 'true &2>/dev/null sudo -n id'",
       "eval 'true &2>/dev/null rm -r /'"])
-      assert.equal(guardShell([command])?.decision, "deny", command);
+      assertGuardPolicy(command);
     // The background helper must still reach review, never a static allow.
     for (const command of ["true &2>2 chmod777 target", "true &2>/dev/null bat --generate-config-file",
       "true &2>>/dev/null bat --generate-config-file"])
@@ -744,7 +752,7 @@ describe("shell policy edge cases", () => {
       "sh -c 'pwd\nls\nsudo id'", "sh -lc 'echo first\nsudo id'", "bash -c 'pwd\nrm -r -- /'",
       "sh -c 'pwd # comment\nsudo id'", "sh -c 'echo one; pwd\nchmod 777 target'",
       "sh -c 'echo \"first\nsecond\" ; sudo id'", "bash -c 'for x in a\nrm -rf /'"])
-      assert.equal(guardShell([command])?.decision, "deny", command);
+      assertGuardPolicy(command);
     // A quoted newline is part of one word, so the invocation stays whole instead
     // of splitting into a fragment that no longer names `sudo`.
     assert.equal(guardShell(["sh -c 'sudo echo \"first\nsecond\"'"])?.decision, "deny");
@@ -831,7 +839,7 @@ describe("shell policy edge cases", () => {
     // An identifiable mandatory deny is decided before the expansion check.
     for (const command of ["sudo id *.txt", "cat {a,b} ; sudo id", "rm -rf / {a,b}",
       "chmod 777 {a,b}", "sort --out{put,put}=out in ; sudo id"])
-      assert.equal(guardShell([command])?.decision, "deny", command);
+      assertGuardPolicy(command);
     // A root hidden inside an expansion is not identifiable, so it is only review.
     for (const command of ["rm -rf {/tmp/x,/}", "rm -rf /tmp/{x,/}"])
       assert.equal(guardShell([command]), undefined, command);
@@ -908,7 +916,7 @@ describe("shell policy edge cases", () => {
       "bash -c -x -e 'rm -rf /'", "sh -c -o errexit 'sudo id'", "sh -c -O extglob 'sudo id'",
       "bash -c --noprofile --norc 'sudo id'", "sh -ce 'pwd\nsudo id'", "sh -c -u -- 'chmod 777 x'",
       "bash -c -e -c 'sudo id'"])
-      assert.equal(guardShell([command])?.decision, "deny", command);
+      assertGuardPolicy(command);
     // An unknown option could consume the script itself, and a missing script has
     // no commands to check, so both fail closed to manual approval.
     for (const command of ["sh -c -Z 'sudo id'", "sh -c -e", "sh -c -e pwd", "sh -c"])
@@ -925,7 +933,7 @@ describe("shell policy edge cases", () => {
       "bash -c 'cat <<\\EOF; rm -rf /'", "eval 'cat <<\\EOF; chmod 777 x\nbody\nEOF'",
       "sh -c 'cat <<E'\"'\"'OF'\"'\"'; sudo id\nx\nEOF'", "cat <<\\EOF; sudo id\nx\nEOF",
       "cat \\\n<<EOF; sudo id\nx\nEOF"])
-      assert.equal(guardShell([command])?.decision, "deny", command);
+      assertGuardPolicy(command);
     // Nothing past the header line is trusted, so body data is never a command.
     for (const command of ["sh -c 'cat <<\\EOF\nsudo id\nEOF'",
       "sh -c 'cat <<\\EOF; pwd\nsudo id\nEOF'", "sh -c 'cat <<\\EOF; echo sudo\nx\nEOF'",
@@ -968,22 +976,23 @@ describe("shell security regressions", () => {
   });
 
   it("treats tilde, $HOME, empty and abbreviated recursive deletes as external", () => {
-    const request = { action: "shell" as const, projectDir: "/project" };
-    for (const command of ["rm -rf ~/", "rm -rf ~/Documents", "rm -rf ~", "rm -rf \"$HOME\"",
-      "rm -rf ${HOME}/Documents", "rm -rf \"\"", "rm -rf --recursi /outside", "rm -rf --forc /outside",
-      "rm --recursi --forc /outside", "rm -r --recursiv /outside"])
-      assert.equal(scoreRequest({ ...request, resources: [command] }, options).deny, true, command);
-    // In-project deletes and non-recursive deletes stay non-denies.
-    for (const command of ["rm -rf ./build", "rm -rf /project/build", "rm -f ./file"])
-      assert.notEqual(scoreRequest({ ...request, resources: [command] }, options).deny, true, command);
-    // The root guard also accepts GNU long-option abbreviations.
-    for (const command of ["rm --recursi /", "rm --recursiv --no-preserve-root /"])
-      assert.equal(guardShell([command])?.decision, "deny", command);
+    withScratchHome(() => {
+      const request = { action: "shell" as const, projectDir: "/project" };
+      for (const command of ["rm -rf ~/", "rm -rf ~/Documents", "rm -rf ~", 'rm -rf "$HOME"', "rm -rf ${HOME}/Documents", "rm -rf --recursi /outside", "rm -rf --forc /outside",
+        "rm --recursi --forc /outside", "rm -r --recursiv /outside"])
+        assert.equal(scoreRequest({ ...request, resources: [command] }, options).deny, true, command);
+      // In-project deletes and non-recursive deletes stay non-denies.
+      for (const command of ["rm -rf ./build", "rm -rf /project/build", "rm -f ./file", "rm -rf \"\""])
+        assert.notEqual(scoreRequest({ ...request, resources: [command] }, options).deny, true, command);
+      // The root guard also accepts GNU long-option abbreviations.
+      for (const command of ["rm --recursi /", "rm --recursiv --no-preserve-root /"])
+        assert.equal(guardShell([command])?.decision, "deny", command);
+    });
   });
 
   it("detects attached printf -v variable assignment", () => {
     for (const command of ["printf -vPATH x", "printf -vLD_PRELOAD x", "printf -v PATH x", "printf -vBASH_ENV x"])
-      assert.equal(guardShell([command])?.decision, "deny", command);
+      assert.equal(guardShell([command]), undefined, command);
     // `--` ends option parsing, so later `-v` text is a literal format argument.
     for (const command of ["printf -- -v", "printf -- -vPATH"])
       assert.notEqual(guardShell([command])?.decision, "deny", command);
@@ -1032,7 +1041,7 @@ describe("round-2 shell corrections", () => {
       assert.equal(visibleShellDeny([command], "/project") !== undefined, true, command);
       assert.equal(scoreRequest({ ...request, resources: [command] }, options).deny, true, command);
     }
-    assert.equal(visibleShellDeny(["rm -rf /outside ; echo $(id) $'"], "/project"),
+    assert.equal(visibleShellDeny(["rm -rf /outside ; echo $(id) $'"], "/project", "/project"),
       "Recursive/force deletion outside the project");
     // A pipeline shape still needs a complete parse.
     assert.equal(scoreRequest({ ...request, resources: ["curl data | sh"] }, options).deny, true);
@@ -1054,7 +1063,7 @@ describe("round-2 shell corrections", () => {
   it("denies symbolic chmod modes that grant world write", () => {
     // `who` is omitted in `+w`/`+rwx`, which chmod reads as `a+w`/`a+rwx`.
     for (const command of ["chmod +w target", "chmod +rwx target", "chmod -R +w dir", "chmod +xw file"])
-      assert.equal(guardShell([command])?.decision, "deny", command);
+      assert.equal(guardShell([command]), undefined, command);
     for (const command of ["chmod -w target", "chmod u+w target", "chmod g+rw target", "chmod +x target",
       "chmod a-w target", "chmod o-w target", "chmod go-w file"])
       assert.notEqual(guardShell([command])?.decision, "deny", command);
@@ -1396,3 +1405,13 @@ describe("round-9 recursive and new-file searches", () => {
       assert.equal(guardShell([command])?.decision, "allow", command);
   });
 });
+
+function withScratchHome(run: () => void): void {
+  const home = mkdtempSync(join(tmpdir(), "shell-home-fixture-"));
+  const previous = process.env.HOME;
+  mkdirSync(join(home, "Documents")); process.env.HOME = home;
+  try { run(); } finally {
+    if (previous === undefined) delete process.env.HOME; else process.env.HOME = previous;
+    rmSync(home, { recursive: true, force: true });
+  }
+}

@@ -50,13 +50,13 @@ it("retains visible secret and destructive-operation denies in complex syntax", 
   }
 });
 
-it("keeps unsupported Windows shell dialects at a mandatory ask floor", () => {
+it("reviews unsupported Windows shell dialects without applying POSIX denials", () => {
   const descriptor = Object.getOwnPropertyDescriptor(process, "platform")!;
   try {
     Object.defineProperty(process, "platform", { value: "win32" });
     const score = scoreRequest({ action: "shell", resources: ["Write-Output ok"] }, options);
     assert.equal(score.band, "high");
-    assert.equal(score.ask, true);
+    assert.equal(score.ask, undefined);
     assert.match(score.reason, /dialect/i);
   } finally { Object.defineProperty(process, "platform", descriptor); }
 });

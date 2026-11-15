@@ -13,6 +13,10 @@ type ResourceType = "directory" | "file" | "other" | "missing";
 interface Resolution { resolved?: string; designation?: string; envDesignation?: boolean; type?: ResourceType; symlink: boolean; uncertain: boolean }
 interface Store { target: string; subtree?: boolean }
 
+export function pathFindings(facts: readonly PathPolicy[]): string[] {
+  return facts.slice(0, 16).map((fact) => `${fact.kind}: ${fact.reason}; resolved=${fact.resolved ?? "unknown"}`);
+}
+
 export function policyRoots(): PolicyRoots {
   const home = process.env.HOME || homedir();
   return { home, config: process.env.XDG_CONFIG_HOME || path.join(home, ".config"),

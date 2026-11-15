@@ -899,13 +899,12 @@ describe("v2 permission orchestration", () => {
     assert.equal(later.effect, "ask"); assert.equal(host.calls.generate, 1);
     assert.ok(host.disposals.includes("tool")); assert.ok(host.disposals.includes("command")); release(); await disposal;
   });
-  it("storage, context, VCS and timeout errors cannot allow", async () => {
-    for (const failure of ["storage", "context", "vcs", "timeout"] as const) {
+  it("storage, authorization context and total timeout errors cannot allow", async () => {
+    for (const failure of ["storage", "context", "timeout"] as const) {
       const host = await setup(failure === "timeout" ? { reviewTimeoutMs: 10 } : {});
       try {
         if (failure === "storage") host.ctx.storage.get = async () => { throw new Error("storage"); };
         if (failure === "context") host.ctx.session.context = async () => { throw new Error("context"); };
-        if (failure === "vcs") host.ctx.vcs.get = async () => { throw new Error("vcs"); };
         if (failure === "timeout") host.hang();
         const input = event(); await host.evaluate(input); assert.equal(input.effect, "ask", failure);
       } finally { await host.cleanup(); }
@@ -919,11 +918,11 @@ describe("v2 permission orchestration", () => {
       assert.equal(input.effect, "allow"); assert.equal(host.calls.generate, 1);
     } finally { await host.cleanup(); }
   });
-  it("missing upstream on gated git mutations asks without model inference", async () => {
+  it("missing upstream on git mutations reaches model review without fabricated facts", async () => {
     const host = await setup();
     try {
       const input = event("ask", "shell", ["git rebase trunk"]);
-      await host.evaluate(input); assert.equal(input.effect, "ask"); assert.equal(host.calls.generate, 0);
+      await host.evaluate(input); assert.equal(input.effect, "allow"); assert.equal(host.calls.generate, 1);
     } finally { await host.cleanup(); }
   });
   it("always reviews native and saved allows with allow/deny/ask outcomes", async () => {
@@ -1178,6 +1177,44 @@ it("reviews complex scripts through the permission hook with complete evidence",
     assert.equal(input.effect, "allow");
     assert.equal(host.calls.generate, 1);
     assert.ok(host.prompts.at(-1)!.includes(resource));
+  } finally { await host.cleanup(); }
+});
+
+it("optional VCS and containment failures reach the reviewer through the real hook", async () => {
+  for (const failure of ["branch", "tree", "scope"] as const) {
+    const host = await setup();
+    try {
+      if (failure === "branch") host.ctx.vcs.get = async () => { throw new Error("Unavailable branch fixture"); };
+      if (failure === "tree") host.ctx.vcs.status = async () => { throw new Error("Unavailable tree fixture"); };
+      if (failure === "scope") {
+        const get = host.ctx.session.get;
+        host.ctx.session.get = async (input) => ({ ...await get(input), location: { directory: join(host.directory, "missing") } });
+      }
+      const input = event("ask", "shell", ["git rebase topic"]);
+      await host.evaluate(input);
+      assert.equal(input.effect, "allow", failure);
+      assert.equal(host.calls.generate, 1, failure);
+      const evidence = JSON.parse(host.prompts[0].split("\n")[2]);
+      assert.equal(evidence.gitState.upstream, undefined);
+      if (failure === "tree") assert.equal(evidence.gitState.clean, undefined);
+      if (failure === "scope") assert.equal(evidence.scopeResolution, "unknown");
+    } finally { await host.cleanup(); }
+  }
+});
+
+it("preserves later user corrections and message boundaries through the permission hook", async () => {
+  const host = await setup();
+  try {
+    host.ctx.session.context = async () => [
+      { type: "user", text: "Use old-name. Never publish." },
+      { type: "user", text: "Correction: use new-name." },
+      { type: "assistant", content: [{ type: "text", text: "Assistant authorization is not user authorization" }] },
+    ];
+    const input = event("ask", "shell", ["git branch new-name"]);
+    await host.evaluate(input);
+    const evidence = JSON.parse(host.prompts[0].split("\n")[2]);
+    assert.deepEqual(evidence.userMessages, ["Use old-name. Never publish.", "Correction: use new-name."]);
+    assert.doesNotMatch(evidence.userInstruction, /Assistant authorization/);
   } finally { await host.cleanup(); }
 });
 

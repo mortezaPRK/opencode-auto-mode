@@ -4,6 +4,7 @@ import { scanShell, type ShellScan } from "./shell-argv.js";
 import { scoreShellBaseline } from "./shell-baseline.js";
 import { shellSafetyScore } from "./shell-safety.js";
 import { ask, deny, high, type RequestScore } from "./types.js";
+import { supportsPosixReview } from "../shell-policy.js";
 
 /** Preserve visible denies; parser uncertainty must reach configured reviewers. */
 function guardScore(guarded: ReviewResult | undefined, resources: readonly string[],
@@ -21,6 +22,7 @@ function guardScore(guarded: ReviewResult | undefined, resources: readonly strin
 /** Scores one shell request: visible denies, safety checks, then residual band. */
 export function scoreShellRequest(request: PermissionRequest, worktreeRoot?: string): RequestScore {
   const { resources, projectDir } = request;
+  if (!supportsPosixReview(request.shell)) return { ...high("Shell dialect requires model review"), findings: ["Full raw command retained; POSIX-derived denials not applied"] };
   const guarded = guardShell(resources, projectDir);
   const rejected = guardScore(guarded, resources, projectDir, worktreeRoot);
   if (rejected) return rejected;

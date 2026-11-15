@@ -121,7 +121,7 @@ const WRAPPER_GRAMMARS: Record<string, WrapperGrammar> = {
 export const WRAPPERS = new Set(Object.keys(WRAPPER_GRAMMARS));
 
 const DANGEROUS = "dangerous shell operation";
-const FORK_BOMB = /:\s*\(\s*\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:/;
+const FORK_BOMB = /^:\s*\(\s*\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:/;
 const MAX_NESTING = 2;
 
 const DENY_EXECUTABLES = new Set(["sudo", "doas", "su", "shutdown", "reboot", "halt", "poweroff"]);
@@ -1741,31 +1741,46 @@ export function denyInvocation(words: readonly string[], depth = 0): string | un
   const executable = resolveExecutable(words);
   if (executable === undefined) return undefined;
   const args = words.slice(executable.index + 1);
-  if (executable.name === "sshpass" || executable.name === "printenv" ||
-      (executable.name === "env" && args.length === 0)) return DANGEROUS;
-  if (["terraform", "tofu", "pulumi"].includes(executable.name) && args.includes("destroy")) return DANGEROUS;
-  if (executable.name === "printf") {
-    // `printf -vPATH x` sets a variable exactly like `printf -v PATH x`; `--` ends
-    // option parsing, so `printf -- -v` prints the literal text.
-    const flag = args[0] ?? "";
-    const variable = flag === "-v" ? args[1] : flag.startsWith("-v") && flag.length > 2 ? flag.slice(2) : undefined;
-    if (variable !== undefined && /^(?:PATH|CDPATH|ENV|BASH_ENV|SHELLOPTS|LD_.*|DYLD_.*)$/.test(variable)) return DANGEROUS;
-  }
-  if (executable.name === "jq" && args.some((arg) => /(?:^|[^a-zA-Z_])(?:env|\$ENV)(?:$|[^a-zA-Z_])/.test(arg))) return DANGEROUS;
-  if (executable.name === "gh" && ((args[0] === "auth" && args[1] === "token") ||
-      (args[0] === "api" && args.some((arg) => /^(?:-[fF]|--(?:raw-)?field(?:=|$)|--input(?:=|$))/.test(arg))))) return DANGEROUS;
-  if (["npm", "pnpm", "yarn", "bun", "node"].includes(executable.name) &&
-      args.some((arg) => /^(?:--(?:preload|require|import)(?:=|$)|-r)/.test(arg))) return DANGEROUS;
-  if (executable.name.startsWith("mkfs")) return DANGEROUS;
-  if (DENY_EXECUTABLES.has(executable.name)) return DANGEROUS;
-  if (executable.name === "chmod" && isWorldWritableMode(chmodMode(args) ?? "")) return DANGEROUS;
-  if (executable.name === "rm" && isRecursiveRootRemoval(args)) return DANGEROUS;
-  if (executable.name === "dd" && args.some((arg) => /^of=\/(?:dev|sd|nvme|hd)/.test(arg))) return DANGEROUS;
-  if (SHELLS.has(executable.name) || executable.name === "eval") {
+  if (directProhibition(executable.name, args)) return DANGEROUS;
+  if (POSIX_SHELLS.has(executable.name) || executable.name === "eval") {
     const script = scriptArgument(executable.name, args);
     if (script !== undefined) return denyScript(script, depth + 1);
   }
   return undefined;
+}
+
+const POSIX_SHELLS = new Set(["sh", "bash", "dash", "zsh", "ksh"]);
+export function supportsPosixReview(shell?: { platform?: string; interpreter?: string }): boolean {
+  const platform = shell?.platform ?? process.platform;
+  return platform !== "win32" && (shell?.interpreter === undefined || POSIX_SHELLS.has(basename(shell.interpreter)));
+}
+
+function directProhibition(name: string, args: readonly string[]): boolean {
+  return !helpOnly(args) && (DENY_EXECUTABLES.has(name) || (name === "gh" && args[0] === "auth" && args[1] === "token") ||
+    (name === "rm" && isRecursiveRootRemoval(args)) || deviceDestruction(name, args));
+}
+
+const RAW_DEVICE = /^\/dev\/(?:[shv]d[a-z]+\d*|xvd[a-z]+\d*|nvme\d+n\d+(?:p\d+)?|r?disk\d+(?:s\d+)*|mapper\/[^/]+|mmcblk\d+(?:p\d+)?)$/;
+function deviceDestruction(name: string, args: readonly string[]): boolean {
+  if (/^mkfs(?:\.[a-z0-9]+)?$/.test(name)) return RAW_DEVICE.test(mkfsTarget(args) ?? "");
+  return name === "dd" && args.some((arg) => arg.startsWith("of=") && RAW_DEVICE.test(arg.slice(3)));
+}
+
+/** Powerful capabilities are review evidence, not proof of a prohibited action. */
+export function capabilityNeedsReview(words: readonly string[]): boolean {
+  const executable = resolveExecutable(words);
+  if (!executable) return true;
+  const name = executable.name;
+  const args = words.slice(executable.index + 1);
+  return ["sshpass", "printenv", "env", "terraform", "tofu", "pulumi"].includes(name) ||
+    runtimeCapability(name, args) || (name === "chmod" && isWorldWritableMode(chmodMode(args) ?? ""));
+}
+
+function runtimeCapability(name: string, args: readonly string[]): boolean {
+  if (name === "printf") return args[0]?.startsWith("-v") === true;
+  if (name === "jq") return args.some((arg) => /\b(?:env|ENV)\b/.test(arg));
+  return ["npm", "pnpm", "yarn", "bun", "node"].includes(name) &&
+    args.some((arg) => /^(?:--(?:preload|require|import)(?:=|$)|-r)/.test(arg));
 }
 
 const UNIQ_FLAGS = new Set(["c", "d", "D", "i", "u"]);
@@ -2053,3 +2068,35 @@ export function isReadOnlyInvocation(words: readonly string[], globs: readonly b
 
 const REVISION_REQUIRED = ["--date", "--encoding"];
 const REVISION_OPTIONAL = ["--format", "--pretty", "--abbrev", "--stat", "--decorate", "--color", "--word-diff", "--unified"];
+function helpOnly(args: readonly string[]): boolean {
+  return args.length === 1 && ["--help", "--version"].includes(args[0]);
+}
+
+function mkfsTarget(args: readonly string[]): string | undefined {
+  let end = false;
+  const operands: string[] = [];
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index];
+    if (!end && arg === "--") { end = true; continue; }
+    if (!end && arg.startsWith("-")) {
+      const skip = mkfsOptionArity(arg);
+      if (skip === undefined) return undefined;
+      index += skip;
+    } else operands.push(arg);
+  }
+  return mkfsOperandTarget(operands);
+}
+
+function mkfsOperandTarget(operands: readonly string[]): string | undefined {
+  if (operands.length > 2) return undefined;
+  if (operands[1] !== undefined && !/^\d+$/.test(operands[1])) return undefined;
+  return operands[0];
+}
+
+function mkfsOptionArity(arg: string): number | undefined {
+  if (arg === "-n") return undefined; // Explicit no-write mode is review, not formatting.
+  if (/^-[FqvcV]+$/.test(arg)) return 0;
+  if (/^-[tLUbimNIOEMJGgel]$/.test(arg)) return 1;
+  if (/^-[tLUbimNIOEMJGgel].+/.test(arg)) return 0;
+  return undefined;
+}

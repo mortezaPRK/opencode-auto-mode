@@ -157,9 +157,11 @@ static abstention preserves the last model rationale. This contract does not gua
 that a model will reason correctly about authorization.
 
 Stages run in array order. The first decisive allow or deny stops the chain.
-Abstention, low confidence, invalid output, provider errors, and timeouts continue
-to the next stage. A chain that cannot decide asks the user. Per-stage timeouts
-are bounded by `reviewTimeoutMs`.
+Abstention, low confidence, invalid output, provider errors, and stage-local timeouts
+continue to the next stage. A chain that cannot decide asks the user. Essential
+evidence loss, malformed/oversized envelopes, Code Mode identity mismatch,
+cancellation, and the total deadline are terminal asks, never fallback allows.
+Per-stage timeouts are bounded by `reviewTimeoutMs`.
 
 ## Decision behavior
 
@@ -197,9 +199,14 @@ database basenames are not protected by name alone. Canonical aliases are checke
 without reading secret contents; this is not a sandbox or TOCTOU guarantee.
 Git global options and complex/dynamic POSIX shell syntax stay
 HIGH and reach configured decision/LLM stages; static review abstains instead of
-forcing a user prompt. Visible blocked operations still win, and malformed or
-oversized requests remain bounded. Windows shell dialects retain a mandatory
-ask floor. Loading a `skill` is LOW because it only loads instructions; subsequent
+forcing a user prompt. Missing VCS or containment facts reach review rather than
+inventing an upstream or clean-tree status. Deliberate history gates for a known
+default branch or known dirty tree still require human approval. Powerful capabilities
+(preload flags, ordinary API fields, broad environment access or world-write modes)
+are not by themselves prohibited actions. Visible established prohibitions still win.
+Complete commands beyond the parser's 4096-character limit can reach bounded model
+review; unsupported dialects retain their raw text and known platform/interpreter
+without applying POSIX-derived denials. Loading a `skill` is LOW because it only loads instructions; subsequent
 tool calls are checked independently. `glob` and `grep` scope is not verified,
 so static review abstains. `webfetch`, `websearch`,
 `execute`, and unknown tools remain HIGH.

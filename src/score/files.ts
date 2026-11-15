@@ -1,6 +1,7 @@
 import type { AutoModeOptions } from "../config.js";
 import { classifyPath, isScopedPath, projectRoot, safeTarget } from "../tiers.js";
 import { deny, high, low, type RequestScore } from "./types.js";
+import { pathFindings } from "../path-policy.js";
 
 /** Tools whose resources are filesystem paths this scorer can verify. */
 const FILE_ACTIONS = new Set(["read", "edit", "write", "glob", "grep"]);
@@ -12,7 +13,7 @@ export function isFileAction(action: string): boolean {
 /** Only established stores deny. Configuration and resolution uncertainty review. */
 function pathApproval(resources: readonly string[], projectDir?: string): RequestScore | undefined {
   const facts = resources.map((target) => classifyPath(target, projectDir));
-  const findings = facts.slice(0, 16).map((fact) => `${fact.kind}: ${fact.reason}`);
+  const findings = pathFindings(facts);
   if (facts.some((fact) => fact.kind === "protected")) return { ...deny("Protected path access"), findings };
   if (facts.some((fact) => fact.review)) return { ...high("Path role or resolution requires further review"), findings };
   return undefined;
