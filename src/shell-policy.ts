@@ -303,7 +303,7 @@ const PLAIN_SHORT_VALUES: Record<string, Record<string, ValueRole>> = {
   du: { d: "data", X: "path" },
 };
 /** Git subcommands whose operands this policy can place. */
-const GIT_HANDLED = new Set(["commit", "tag", "branch", "checkout", "switch", "push", "fetch"]);
+const GIT_HANDLED = new Set(["add", "restore", "commit", "tag", "branch", "checkout", "switch", "push", "fetch"]);
 const GIT_LONG_VALUES: Record<string, Record<string, ValueRole>> = {
   commit: { "--message": "data", "--file": "path", "--author": "data", "--date": "data",
     "--reuse-message": "data", "--reedit-message": "data", "--fixup": "data", "--squash": "data" },
@@ -341,9 +341,10 @@ export interface OperandRoles {
   data: number[];
   /** File values attached to an option (`-fFILE`, `--file=FILE`). */
   pathValues: string[];
+  pathValueSources: { value: string; index: number }[];
 }
 
-interface RoleSets { paths: Set<number>; data: Set<number>; pathValues: string[] }
+interface RoleSets { paths: Set<number>; data: Set<number>; pathValues: string[]; pathValueSources: { value: string; index: number }[] }
 
 interface ShortValue { letter: string; role: ValueRole; attached?: string }
 
@@ -389,7 +390,7 @@ function shortFlags(word: string, table: Record<string, ValueRole>): string {
 function takeShortValue(parsed: ShortValue, index: number, base: number,
   args: readonly string[], roles: RoleSets): number {
   if (parsed.role === "path") {
-    if (parsed.attached !== undefined) roles.pathValues.push(parsed.attached);
+    if (parsed.attached !== undefined) recordPathValue(roles, parsed.attached, base + index);
     else if (index + 1 < args.length) {
       roles.paths.add(base + index + 1);
       return index + 1;
@@ -403,7 +404,7 @@ function takeShortValue(parsed: ShortValue, index: number, base: number,
 
 /** Marks attached (`--grep=X`) and separate (`--grep X`) data option values. */
 function dataOptionRoles(args: readonly string[], base: number): RoleSets {
-  const roles: RoleSets = { paths: new Set(), data: new Set(), pathValues: [] };
+  const roles: RoleSets = { paths: new Set(), data: new Set(), pathValues: [], pathValueSources: [] };
   let endOfOptions = false;
   for (let index = 0; index < args.length; index++) {
     const arg = args[index];
@@ -420,16 +421,16 @@ function dataOptionRoles(args: readonly string[], base: number): RoleSets {
 }
 
 /** Marks attached (`--file=X`) path option values as file operands. */
-function pathOptionRoles(args: readonly string[], roles: RoleSets): void {
+function pathOptionRoles(args: readonly string[], base: number, roles: RoleSets): void {
   let endOfOptions = false;
-  for (const arg of args) {
+  for (const [index, arg] of args.entries()) {
     if (endOfOptions) continue;
     if (arg === "--") { endOfOptions = true; continue; }
     const part = longOptionPart(arg);
     if (part === undefined || part.attached === undefined) continue;
     const resolved = resolveLongOption(part.option);
     if (resolved === undefined || LONG_OPTION_VALUES.get(resolved) !== "path") continue;
-    roles.pathValues.push(part.attached);
+    recordPathValue(roles, part.attached, base + index);
   }
 }
 
@@ -472,7 +473,7 @@ function grepRoles(name: string, args: readonly string[], base: number, roles: R
         // `--exclude-from`/`--ignore-file` (files of patterns). Only `--file`
         // supplies the pattern; the others leave the next positional a pattern.
         if (resolved !== undefined && LONG_OPTION_VALUES.get(resolved) === "path") {
-          if (part?.attached !== undefined) roles.pathValues.push(part.attached);
+          if (part?.attached !== undefined) recordPathValue(roles, part.attached, base + index);
           else if (index + 1 < args.length) roles.paths.add(base + ++index);
           if (resolved === "--file") seenPattern = true;
           continue;
@@ -508,7 +509,7 @@ function sedRoles(args: readonly string[], base: number, roles: RoleSets): void 
         const resolved = part === undefined ? undefined : resolveLongOption(part.option);
         if (resolved === "--expression") { scripted = true; continue; }
         if (resolved === "--file") {
-          if (part?.attached !== undefined) roles.pathValues.push(part.attached);
+          if (part?.attached !== undefined) recordPathValue(roles, part.attached, base + index);
           else if (index + 1 < args.length) roles.paths.add(base + ++index);
           scripted = true;
           continue;
@@ -556,7 +557,7 @@ function jqRoles(args: readonly string[], base: number, roles: RoleSets): void {
         const option = part?.option;
         const resolved = part === undefined ? undefined : resolveLongOption(part.option);
         if (resolved === "--from-file") {
-          if (part?.attached !== undefined) roles.pathValues.push(part.attached);
+          if (part?.attached !== undefined) recordPathValue(roles, part.attached, base + index);
           else if (index + 1 < args.length) roles.paths.add(base + ++index);
           filterSupplied = true;
           continue;
@@ -568,7 +569,7 @@ function jqRoles(args: readonly string[], base: number, roles: RoleSets): void {
           continue;
         }
         if (option === "--args" || option === "--jsonargs") { positionalData = true; continue; }
-        if (option === "--library-path") { index = takeValues(index, 1, "path"); continue; }
+        if (option === "--library-path") { index = jqLibraryPath(part, index, args, base, roles); continue; }
         if (option === "--indent") { index = takeValues(index, 1, "data"); continue; }
         continue;
       }
@@ -587,6 +588,13 @@ function jqRoles(args: readonly string[], base: number, roles: RoleSets): void {
 }
 
 /** `find` tests whose value is a path read for comparison, not a pattern. */
+function jqLibraryPath(part: { attached?: string } | undefined, index: number, args: readonly string[], base: number, roles: RoleSets): number {
+  const attached = part?.attached;
+  if (attached !== undefined) recordPathValue(roles, attached, base + index);
+  else if (index + 1 < args.length) roles.paths.add(base + ++index);
+  return index;
+}
+
 const FIND_PATH_VALUE_TESTS = new Set(["-newer", "-anewer", "-cnewer", "-samefile",
   "-fprint", "-fprint0", "-fprintf", "-fls"]);
 /** `find` tests whose value is data: patterns, types, sizes, times, ids. */
@@ -676,7 +684,7 @@ function gitRoles(args: readonly string[], base: number, roles: RoleSets): void 
       const role = part === undefined ? undefined : long[part.option];
       if (part === undefined || role === undefined) continue;
       if (part.attached !== undefined) {
-        if (role === "path") roles.pathValues.push(part.attached);
+        if (role === "path") recordPathValue(roles, part.attached, position);
         else roles.data.add(position);
         continue;
       }
@@ -703,10 +711,10 @@ function gitRoles(args: readonly string[], base: number, roles: RoleSets): void 
 /** The path and data roles of one simple command's argv. */
 export function operandRoles(words: readonly string[]): OperandRoles {
   const executable = resolveExecutable(words);
-  if (executable === undefined) return { paths: [], data: [], pathValues: [] };
+  if (executable === undefined) return { paths: [], data: [], pathValues: [], pathValueSources: [] };
   const args = words.slice(executable.index + 1);
   const roles = dataOptionRoles(args, executable.index + 1);
-  pathOptionRoles(args, roles);
+  if (hasFileGrammar(executable.name)) pathOptionRoles(args, executable.index + 1, roles);
   const name = executable.name;
   if (PATTERN_FIRST_COMMANDS.has(name)) grepRoles(name, args, executable.index + 1, roles);
   else if (name === "sed") sedRoles(args, executable.index + 1, roles);
@@ -715,12 +723,77 @@ export function operandRoles(words: readonly string[]): OperandRoles {
   else if (name === "find") findRoles(args, executable.index + 1, roles);
   else if (PATH_OPERAND_COMMANDS.has(name) || CHECKSUM_COMMAND.test(name))
     plainRoles(name, args, executable.index + 1, roles);
+  extraFileRoles(name, args, executable.index + 1, roles);
   const ascending = (left: number, right: number) => left - right;
   return {
     paths: [...roles.paths].sort(ascending),
     data: [...roles.data].sort(ascending),
     pathValues: [...new Set(roles.pathValues)],
+    pathValueSources: roles.pathValueSources,
   };
+}
+
+function hasFileGrammar(name: string): boolean {
+  return PATH_OPERAND_COMMANDS.has(name) || PATTERN_FIRST_COMMANDS.has(name) ||
+    CHECKSUM_COMMAND.test(name) || ["git", "jq", "sed", "find"].includes(name);
+}
+
+function extraFileRoles(name: string, args: readonly string[], base: number, roles: RoleSets): void {
+  if (["curl", "wget"].includes(name)) {
+    args.forEach((arg, index) => { if (/^file:/i.test(arg)) roles.paths.add(base + index); });
+  }
+  if (name === "git" && ["show", "diff"].includes(args[0])) {
+    gitRevisionFiles(args, base, roles);
+  }
+  if (name === "gh" && args[0] === "api") ghApiFileRoles(args.slice(1), base + 1, roles);
+  if (name === "date") dateFileRoles(args, base, roles);
+}
+
+function dateFileRoles(args: readonly string[], base: number, roles: RoleSets): void {
+  for (let index = 0; index < args.length; index++) {
+    const parsed = shortOption(args[index], { r: "path", f: "path" });
+    if (parsed) index = takeShortValue(parsed, index, base, args, roles);
+  }
+}
+
+function ghApiFileRoles(args: readonly string[], base: number, roles: RoleSets): void {
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index];
+    if (arg === "--input") { if (args[index + 1]) recordPathValue(roles, args[++index], base + index); continue; }
+    if (arg.startsWith("--input=")) { recordPathValue(roles, arg.slice(8), base + index); continue; }
+    const typed = /^(?:-F|--field=)(.+)$/.exec(arg)?.[1] ??
+      (["-F", "--field"].includes(arg) ? args[++index] : undefined);
+    const file = typedFile(typed);
+    if (file) recordPathValue(roles, file, base + index);
+  }
+}
+
+function typedFile(value?: string): string | undefined { return value?.match(/^[^=]+=@(.+)$/)?.[1]; }
+
+function recordPathValue(roles: RoleSets, value: string, index: number): void {
+  roles.pathValues.push(value);
+  roles.pathValueSources.push({ value, index });
+}
+
+function gitRevisionFiles(args: readonly string[], base: number, roles: RoleSets): void {
+  for (let index = 1; index < args.length; index++) {
+    const word = args[index];
+    if (word === "--") return;
+    if (word.startsWith("-")) {
+      const skip = revisionOptionValue(word);
+      if (skip === undefined) return;
+      index += skip;
+      continue;
+    }
+    if (/^[^:]+:.+/.test(word)) recordPathValue(roles, word.slice(word.indexOf(":") + 1), base + index);
+  }
+}
+
+function revisionOptionValue(word: string): number | undefined {
+  if (REVISION_REQUIRED.includes(word)) return 1;
+  if (REVISION_OPTIONAL.includes(word)) return 0;
+  if ([...REVISION_REQUIRED, ...REVISION_OPTIONAL].some((option) => word.startsWith(`${option}=`))) return 0;
+  return ["-p", "-s", "--patch", "--no-patch", "--stat", "--name-only", "--name-status"].includes(word) ? 0 : undefined;
 }
 
 /** The standalone words one simple command consumes as files. */
@@ -1477,7 +1550,7 @@ export function logicalLines(command: string): LogicalScript {
  */
 export function parseShell(command: string): ParseEntry[] {
   if (hasNonShellWhitespace(command)) throw new Error("shell whitespace is not supported");
-  return parse(escapeLiteralHashes(stripDescriptorPrefixes(normalizeContinuations(command))));
+  return parse(escapeLiteralHashes(stripDescriptorPrefixes(normalizeContinuations(command))), (key) => `$${key}`);
 }
 
 /**
@@ -1977,3 +2050,6 @@ export function isReadOnlyInvocation(words: readonly string[], globs: readonly b
     return args[0] === "test" || (args[0] === "run" && (args[1] === "lint" || args[1] === "typecheck"));
   return false;
 }
+
+const REVISION_REQUIRED = ["--date", "--encoding"];
+const REVISION_OPTIONAL = ["--format", "--pretty", "--abbrev", "--stat", "--decorate", "--color", "--word-diff", "--unified"];

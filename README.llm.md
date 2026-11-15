@@ -183,11 +183,19 @@ are bounded by `reviewTimeoutMs`.
 ## Guardrails and Code Mode
 
 Built-in guards are not a policy language and are not user-extensible. They cover
-protected repository/config paths, credential paths, risky shell structure,
-recursive external deletion, history changes, symlink traversal, project scope,
-and ambiguous syntax. Credential/config shell operands are a hard deny; their
-`read`/`edit` targets and symlink traversal have a mandatory ask floor. `.git`
-metadata access, Git global options, and complex/dynamic POSIX shell syntax stay
+known credential stores, risky shell structure, recursive external deletion,
+history changes, symlink traversal, project scope, and ambiguous syntax. Established
+credential-store access denies for file tools and grammar-established shell file
+operands alike. Runtime `.env` and `.env.*` files are protected; `.env.example`,
+`.env.sample`, `.env.template`, and `.env.<environment>.{example,sample,template}`
+are reviewed, not assumed safe. Generic auth/key names, dotfiles, ordinary
+configuration (including `.github`, `.git`, `.opencode`, editor/CI hooks and
+`.npmrc`), and unresolved metadata are review evidence, not proof of credentials.
+Known stores include anchored private-key/auth locations and the documented
+OpenCode database (including exact SQLite sidecars) or legacy auth file; arbitrary
+database basenames are not protected by name alone. Canonical aliases are checked
+without reading secret contents; this is not a sandbox or TOCTOU guarantee.
+Git global options and complex/dynamic POSIX shell syntax stay
 HIGH and reach configured decision/LLM stages; static review abstains instead of
 forcing a user prompt. Visible blocked operations still win, and malformed or
 oversized requests remain bounded. Windows shell dialects retain a mandatory

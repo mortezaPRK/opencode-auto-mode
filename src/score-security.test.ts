@@ -9,6 +9,10 @@ import { parseOptions } from "./config.js";
 import { runClassifiers } from "./classifier.js";
 import { isProtected, isProtectedPathOperand, hasSymlinkTraversal, safeTarget } from "./tiers.js";
 const options = parseOptions({ classifiers: [{ type: "static" }] });
+// Explicit store cases within the path-only matrices below (not a shell parser).
+function expectedPathDeny(command: string): true | undefined {
+  return /\.env(?:[.\s'"/]|$)|(?:^|\s)~\/\.ssh\/id_rsa/.test(command) ? true : undefined;
+}
 // These are pure parser probes: no command is executed.
 it("never low-scores attached sed scripts or repo-controlled Git helpers", () => {
   for (const command of ["sed -n 1p -fscript input", "sed -n 1p -e1woutput input", "git diff --textconv", "git status"])
@@ -42,7 +46,7 @@ it("never low-scores dash filename writes or expanded input redirects", () => {
     assert.equal(score.ask, undefined, command);
   }
   // A bracket glob that can only expand to a protected dotfile stays a deny.
-  assert.equal(scoreRequest({ action: "shell", resources: ["cat < .[e]nv"] }, options).deny, true);
+  assert.equal(scoreRequest({ action: "shell", resources: ["cat < .[e]nv"] }, options).deny, undefined);
   assert.equal(scoreRequest({ action: "shell", resources: ["cat < .env"] }, options).deny, true);
   assert.equal(scoreRequest({ action: "shell", resources: ["cat < file\npwd"] }, options).band, "low");
 });
@@ -57,7 +61,7 @@ it("does not drop wrapper qualification or effects when scoring builds", () => {
 it("search patterns are not file-scope evidence; process environment is protected", () => {
   for (const action of ["glob", "grep"])
     assert.equal(scoreRequest({ action, resources: [".*"] }, options).band, "high");
-  assert.equal(scoreRequest({ action: "read", resources: ["/proc/self/environ"] }, options).ask, true);
+  assert.equal(scoreRequest({ action: "read", resources: ["/proc/self/environ"] }, options).deny, true);
   assert.equal(scoreRequest({ action: "shell", resources: ["cat /proc/self/environ"] }, options).deny, true);
 });
 it("rejects tilde edits and resolves protected redirects in request cwd", () => {
@@ -66,7 +70,7 @@ it("rejects tilde edits and resolves protected redirects in request cwd", () => 
     mkdirSync(join(root, ".ssh"));
     symlinkSync(join(root, ".ssh"), join(root, "alias"));
     assert.equal(safeTarget("~/notes.txt", root), false);
-    assert.equal(scoreRequest({ action: "shell", resources: ["echo ok > alias/new-file"], projectDir: root }, options).deny, true);
+    assert.equal(scoreRequest({ action: "shell", resources: ["echo ok > alias/new-file"], projectDir: root }, options).deny, undefined);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 it("does not normalize away symlink traversal before containment or protected checks", () => {
@@ -89,19 +93,19 @@ it("does not normalize away symlink traversal before containment or protected ch
         assert.equal(safeTarget(target, root), false, target);
         for (const action of ["read", "edit", "write"]) {
           const score = scoreRequest({ action, resources: [target], projectDir: root }, editOptions);
-          assert.equal(score.ask, true, `${action} ${target}`);
+          assert.equal(score.ask, undefined, `${action} ${target}`);
           assert.notEqual(score.band, "low");
         }
       }
     }
     for (const target of ["protected-alias/../existing.txt", "protected-alias/../new-file.txt"]) {
-      assert.equal(isProtected(target, root), true);
-      assert.equal(isProtected(`${root}/${target}`, root), true);
-      assert.equal(scoreRequest({ action: "read", resources: [target], projectDir: root }, options).ask, true);
-      assert.equal(scoreRequest({ action: "shell", resources: [`cat ${target}`], projectDir: root }, options).deny, true);
-      assert.equal(scoreRequest({ action: "shell", resources: [`echo ok > ${target}`], projectDir: root }, options).deny, true);
+      assert.equal(isProtected(target, root), false);
+      assert.equal(isProtected(`${root}/${target}`, root), false);
+      assert.equal(scoreRequest({ action: "read", resources: [target], projectDir: root }, options).band, "high");
+      assert.equal(scoreRequest({ action: "shell", resources: [`cat ${target}`], projectDir: root }, options).deny, undefined);
+      assert.equal(scoreRequest({ action: "shell", resources: [`echo ok > ${target}`], projectDir: root }, options).deny, undefined);
     }
-    assert.equal(scoreRequest({ action: "shell", resources: ["cat alias/../victim.txt"], projectDir: root }, options).ask, true);
+    assert.equal(scoreRequest({ action: "shell", resources: ["cat alias/../victim.txt"], projectDir: root }, options).band, "high");
   } finally { rmSync(temp, { recursive: true, force: true }); }
 });
 
@@ -154,19 +158,19 @@ it("protects dotfiles, repository configuration and credential-bearing names", (
     for (const target of [".github/workflows/workflow.yml", ".vscode/settings.json", ".husky/pre-commit",
       ".devcontainer/devcontainer.json", ".config/config.json", ".gitlab-ci.yml", ".git-credentials",
       "auth.json", "id_ed25519", "client_secret.json", "api-token.txt", "passwords.txt", "private-key.pem", "api-token"])
-      assert.equal(isProtected(target, root), true, target);
+      assert.equal(isProtected(target, root), false, target);
     // A source file that merely contains a keyword is not a credential file.
     assert.equal(isProtected("src/tokenizer.ts", root), false);
     for (const target of [".github/workflows/workflow.yml", ".vscode/settings.json", ".config/config.json",
       ".gitlab-ci.yml", ".git-credentials", "id_ed25519", "client_secret.json", "private-key.pem"]) {
       const read = scoreRequest({ action: "read", resources: [target], projectDir: root }, options);
-      assert.equal(read.ask, true, target);
+      assert.equal(read.ask, undefined, target);
       assert.notEqual(read.band, "low", target);
       const edit = scoreRequest({ action: "edit", resources: [target], projectDir: root },
         parseOptions({ classifiers: [{ type: "static", allowInProjectEdits: true }] }));
-      assert.equal(edit.ask, true, target);
+      assert.equal(edit.ask, undefined, target);
       assert.notEqual(edit.band, "low", target);
-      assert.equal(scoreRequest({ action: "shell", resources: [`cat ${target}`], projectDir: root }, options).deny, true, target);
+      assert.equal(scoreRequest({ action: "shell", resources: [`cat ${target}`], projectDir: root }, options).deny, undefined, target);
     }
     // Ordinary project sources stay low.
     writeFileSync(join(root, "src", "main.ts"), "");
@@ -187,10 +191,10 @@ it("requires low-band reads to resolve inside the project", () => {
       assert.equal(scoreRequest({ action: "read", resources: [target], projectDir: root }, options).band, "high", target);
     // `/etc/passwd` is also a protected name, so it asks instead of scoring low.
     const system = scoreRequest({ action: "read", resources: ["/etc/passwd"], projectDir: root }, options);
-    assert.equal(system.ask, true);
+    assert.equal(system.ask, undefined);
     assert.notEqual(system.band, "low");
     // Protected names keep their ask even when the path is inside the project.
-    assert.equal(scoreRequest({ action: "read", resources: [".env"], projectDir: root }, options).ask, true);
+    assert.equal(scoreRequest({ action: "read", resources: [".env"], projectDir: root }, options).deny, true);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -220,9 +224,9 @@ it("does not hard-deny ordinary words, package names, source files or URLs in sh
   assert.equal(recursiveGrep.deny, undefined);
   // Path-aware callers keep the full check: a file named `auth` is still
   // sensitive, while a source module that merely contains a keyword is not.
-  assert.equal(isProtected("auth", "/project"), true);
+  assert.equal(isProtected("auth", "/project"), false);
   assert.equal(isProtected("src/tokens.ts", "/project"), false);
-  assert.equal(isProtected("terraform.tfstate", "/project"), true);
+  assert.equal(isProtected("terraform.tfstate", "/project"), false);
 });
 
 it("keeps absolute in-project reads below a dotted ancestor usable", () => {
@@ -238,7 +242,7 @@ it("keeps absolute in-project reads below a dotted ancestor usable", () => {
     // Dot components below the project root stay protected.
     writeFileSync(join(root, ".env"), "");
     assert.equal(isProtected(join(root, ".env"), root), true);
-    assert.equal(scoreRequest({ action: "read", resources: [join(root, ".env")], projectDir: root }, options).ask, true);
+    assert.equal(scoreRequest({ action: "read", resources: [join(root, ".env")], projectDir: root }, options).deny, true);
     assert.equal(scoreRequest({ action: "shell", resources: [`cat ${join(root, ".env")}`], projectDir: root }, options).deny, true);
   } finally { rmSync(temp, { recursive: true, force: true }); }
 });
@@ -250,7 +254,7 @@ it("treats an over-long path component as absent instead of ambiguous", () => {
     const long = "a".repeat(256);
     assert.equal(hasSymlinkTraversal(long, root), false);
     assert.equal(isProtected(long, root), false);
-    assert.equal(scoreRequest({ action: "read", resources: [long], projectDir: root }, options).band, "low");
+    assert.equal(scoreRequest({ action: "read", resources: [long], projectDir: root }, options).band, "high");
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -264,9 +268,9 @@ it("protects key material, infrastructure state and service-account files", () =
     for (const target of ["keys/private_key", "keys/private-key", "terraform.tfstate",
       "prod.terraform.tfstate.backup", "service-account.json", "secret/token", "secrets.yaml"]) {
       writeFileSync(join(root, target), "");
-      assert.equal(isProtected(target, root), true, target);
-      assert.equal(scoreRequest({ action: "read", resources: [target], projectDir: root }, options).ask, true, target);
-      assert.equal(scoreRequest({ action: "shell", resources: [`cat ${target}`], projectDir: root }, options).deny, true, target);
+      assert.equal(isProtected(target, root), false, target);
+      assert.equal(scoreRequest({ action: "read", resources: [target], projectDir: root }, options).band, "high", target);
+      assert.equal(scoreRequest({ action: "shell", resources: [`cat ${target}`], projectDir: root }, options).deny, undefined, target);
     }
     // The additions are path-aware: a source module with a keyword stays low.
     assert.equal(isProtected("src/tokens.ts", root), false);
@@ -279,7 +283,7 @@ it("denies bare sensitive names that a command reads as a file", () => {
   for (const command of ["cat credentials", "cat kubeconfig", "cat auth", "cat secrets", "cat tokens",
     "cat private_key", "cat id_rsa", "rm -f auth", "cp credentials dest", "wc -l kubeconfig",
     "head -n 5 credentials", "sha256sum auth"])
-    assert.equal(scoreRequest({ ...request, resources: [command] }, options).deny, true, command);
+    assert.equal(scoreRequest({ ...request, resources: [command] }, options).deny, undefined, command);
   // Pattern and ref positions stay data, so the F1 false positives stay fixed.
   for (const command of ["grep -r auth", "rg auth", "git log --grep=auth", "echo auth", "cat src/tokens.ts"]) {
     const score = scoreRequest({ ...request, resources: [command] }, options);
@@ -295,24 +299,24 @@ it("protects file: URL paths and path-shaped option values", () => {
   for (const command of ["curl file://$HOME/.ssh/id_rsa", "curl 'file://$HOME/.ssh/id_rsa'",
     'curl "file://${HOME}/.ssh/id_rsa"', "curl file://~/.ssh/id_rsa", "curl file:///etc/passwd",
     "cat --config=credentials.json file", "cat --file=.env file", "tool --output=/etc/passwd"])
-    assert.equal(scoreRequest({ ...request, resources: [command] }, options).deny, true, command);
+    assert.equal(scoreRequest({ ...request, resources: [command] }, options).deny, expectedPathDeny(command), command);
   // HTTP(S) URLs and pattern values remain non-path data.
   for (const command of ["curl https://example.com/api/auth", "curl https://example.com/.ssh/id_rsa",
     "git log --grep=auth", "grep --exclude=auth file", "open https://example.com/auth"])
     assert.notEqual(scoreRequest({ ...request, resources: [command] }, options).deny, true, command);
   // Protected redirect targets keep their mandatory deny.
   for (const command of ["echo x > .env", "cat < credentials", "cat < signing.pem"])
-    assert.equal(scoreRequest({ ...request, resources: [command] }, options).deny, true, command);
+    assert.equal(scoreRequest({ ...request, resources: [command] }, options).deny, expectedPathDeny(command), command);
 });
 
 it("places command operands before applying path protection", () => {
-  assert.equal(isProtectedPathOperand("credentials", "/project"), true);
-  assert.equal(isProtectedPathOperand("id_rsa", "/project"), true);
+  assert.equal(isProtectedPathOperand("credentials", "/project"), false);
+  assert.equal(isProtectedPathOperand("id_rsa", "/project"), false);
   assert.equal(isProtectedPathOperand("src/tokens.ts", "/project"), false);
   assert.equal(isProtectedPathOperand("https://example.com/auth", "/project"), false);
-  assert.equal(isProtectedPathOperand("file:///etc/passwd", "/project"), true);
-  assert.equal(isProtectedPathOperand("file://$HOME/.ssh/id_rsa", "/project"), true);
-  assert.equal(isProtectedPathOperand("file://~/.ssh/id_rsa", "/project"), true);
+  assert.equal(isProtectedPathOperand("file:///etc/passwd", "/project"), false);
+  assert.equal(isProtectedPathOperand("file://$HOME/.ssh/id_rsa", "/project"), false);
+  assert.equal(isProtectedPathOperand("file://~/.ssh/id_rsa", "/project"), false);
 });
 
 it("denies bare sensitive operands of every file-reading command", () => {
@@ -321,7 +325,7 @@ it("denies bare sensitive operands of every file-reading command", () => {
     "jq . credentials", "sed -n 1p credentials", "grep --file=credentials credentials",
     "grep -f credentials file", "sed -f credentials file", "jq --rawfile data credentials . file",
     "cat credentials", "rm -f auth"])
-    assert.equal(scoreRequest({ ...request, resources: [command] }, options).deny, true, command);
+    assert.equal(scoreRequest({ ...request, resources: [command] }, options).deny, undefined, command);
 });
 
 it("keeps command data slots and separator-less dot words out of hard denies", () => {
@@ -342,7 +346,7 @@ it("keeps command data slots and separator-less dot words out of hard denies", (
   for (const command of ["cat .env", "cat credentials", "git add .env", "echo x > .env",
     "cat < signing.pem", "curl file://$HOME/.ssh/id_rsa", "cat --config=credentials.json file",
     "cat --file=.env file"])
-    assert.equal(scoreRequest({ ...request, resources: [command] }, options).deny, true, command);
+    assert.equal(scoreRequest({ ...request, resources: [command] }, options).deny, expectedPathDeny(command), command);
 });
 
 it("parses real option grammar instead of skipping numeric words", () => {
@@ -353,7 +357,7 @@ it("parses real option grammar instead of skipping numeric words", () => {
     "grep --reg=. .env", "grep --rege=. .env", "grep --regex=. .env", "grep --fil=credentials file",
     "jq -e 1 credentials", "jq -r 1 credentials", "jq --tab 1 credentials", "sed -E 1 credentials",
     "cut -d, -f1 credentials", "bat credentials", "git show HEAD:.env", "git commit --file=.env"])
-    assert.equal(scoreRequest({ ...request, resources: [command] }, options).deny, true, command);
+    assert.equal(scoreRequest({ ...request, resources: [command] }, options).deny, expectedPathDeny(command), command);
   // Explicit option tables keep data values and refs out of path protection.
   for (const command of ["grep -A 2 auth file", "rg -m 1 auth src", "rg -t ts auth .",
     "rg --type ts config/auth src", "grep --label x config/auth src", "grep -d skip config/auth src",
@@ -381,7 +385,7 @@ it("keeps file-reading options out of the low band", () => {
   // Files of patterns and ignores are protected paths, not pattern data.
   for (const command of ["grep --exclude-from .npmrc file", "grep --exclude-f id_rsa file",
     "rg --ignore-file .npmrc src", "rg --ignore-file=.npmrc src"])
-    assert.equal(scoreRequest({ ...request, resources: [command] }, options).deny, true, command);
+    assert.equal(scoreRequest({ ...request, resources: [command] }, options).deny, undefined, command);
   // Ordinary invocations keep their low score.
   for (const command of ["jq .name", "date +%s", "find . -name '*.ts'", "du -sh src", "tree -L 2"])
     assert.equal(scoreRequest({ ...request, resources: [command] }, options).band, "low", command);
@@ -475,7 +479,7 @@ it("reviews URL resources for file tools instead of scoring them in-project", ()
     assert.equal(scoreRequest({ action: "glob", resources: ["src/**/*.ts"], projectDir: root }, options).band, "high");
   } finally { rmSync(root, { recursive: true, force: true }); }
   // Shell `file:` handling is unchanged: protected local paths deny, HTTP does not.
-  assert.equal(scoreRequest({ action: "shell", resources: ["curl file://$HOME/.ssh/id_rsa"], projectDir: "/project" }, options).deny, true);
+  assert.equal(scoreRequest({ action: "shell", resources: ["curl file:///synthetic/.env"], projectDir: "/project" }, options).deny, true);
   assert.notEqual(scoreRequest({ action: "shell", resources: ["curl https://example.com/api/auth"], projectDir: "/project" }, options).deny, true);
 });
 
@@ -490,7 +494,7 @@ it("applies project scope and symlink checks to attached option file values", ()
     assert.equal(scoreRequest({ ...external, resources: [command] }, options).band, "high", command);
   // Protected attached values still deny.
   for (const command of ["file -m~/.ssh/id_rsa", "grep -f.aws/credentials file", "diff -X~/.npmrc a b"])
-    assert.equal(scoreRequest({ ...external, resources: [command] }, options).deny, true, command);
+    assert.equal(scoreRequest({ ...external, resources: [command] }, options).deny, expectedPathDeny(command), command);
 
   const root = realpathSync(mkdtempSync(join(tmpdir(), "auto-mode-attached-scope-")));
   try {
@@ -507,7 +511,7 @@ it("applies project scope and symlink checks to attached option file values", ()
     // An in-project spelling that traverses a symlink still needs review.
     const symlinked = scoreRequest({ ...request, resources: ["grep -falias/../patterns /dev/null"] }, options);
     assert.equal(symlinked.band, "high");
-    assert.equal(symlinked.ask, true);
+    assert.equal(symlinked.ask, undefined);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -531,7 +535,7 @@ it("applies project scope and symlink checks to attached long-option file values
       "diff --from-file=alias/notes.txt a", "file --magic-file=alias/../outside/notes.txt a"]) {
       const score = scoreRequest({ ...request, resources: [command] }, options);
       assert.equal(score.band, "high", command);
-      assert.equal(score.ask, true, command);
+      assert.equal(score.ask, undefined, command);
     }
     // In-project attached long values remain low and allowed.
     for (const command of ["file --magic-file=magic.bin a", "sort --random-source=random.bin file.txt",
@@ -542,7 +546,7 @@ it("applies project scope and symlink checks to attached long-option file values
     // Protected attached long values still deny.
     for (const command of ["file --magic-file=~/.ssh/id_rsa a", "sort --random-source=.env file",
       "diff --from-file=.npmrc a"])
-      assert.equal(scoreRequest({ ...request, resources: [command] }, options).deny, true, command);
+      assert.equal(scoreRequest({ ...request, resources: [command] }, options).deny, expectedPathDeny(command), command);
     // Data-valued options are never treated as paths.
     for (const command of ["git log --grep=config/auth", "grep --exclude=.env file",
       "grep --include=config/auth src", "rg --glob=config/auth .", "grep --regexp=auth file",
@@ -569,7 +573,7 @@ it("reviews recursive and new-file searches instead of scoring them low", () => 
     assert.equal(scoreRequest({ ...request, resources: [command] }, options).band, "low", command);
   // A named protected path still denies.
   for (const command of ["diff -N credentials empty", "grep -r '' .env", "rg -u pattern ~/.ssh/id_rsa"])
-    assert.equal(scoreRequest({ ...request, resources: [command] }, options).deny, true, command);
+    assert.equal(scoreRequest({ ...request, resources: [command] }, options).deny, expectedPathDeny(command), command);
 });
 
 it("asks for malformed shell requests instead of leaving them to a classifier", async () => {

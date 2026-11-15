@@ -1,19 +1,18 @@
 import type { PermissionRequest } from "../reviewer.js";
-import { protectedSegment, recursiveExternalDelete, type ParsedShellCommands } from "../shell.js";
-import { hasSymlinkTraversal, isProtected, isProtectedShellWord } from "../tiers.js";
+import { protectedSegment, recursiveExternalDelete, segmentNeedsPathReview, type ParsedShellCommands } from "../shell.js";
+import { classifyPath, isProtected } from "../tiers.js";
 import { historyChange, historyScore, isGitGlobalOption } from "./history.js";
-import { executableShapeScore, pathTargets, type ShellScan } from "./shell-argv.js";
-import { ask, deny, high, type RequestScore } from "./types.js";
+import { executableShapeScore, type ShellScan } from "./shell-argv.js";
+import { deny, high, type RequestScore } from "./types.js";
 
-function commandTouchesProtected(command: ParsedShellCommands | undefined, projectDir?: string, includeGit = true): boolean {
+function commandTouchesProtected(command: ParsedShellCommands | undefined, projectDir?: string): boolean {
   if (!command) return false;
-  return command.segments.some((segment) => protectedSegment(segment, projectDir, includeGit)) ||
-    command.leftovers.some((word) => isProtectedShellWord(word, projectDir, includeGit));
+  return command.segments.some((segment) => protectedSegment(segment, projectDir));
 }
 
 /** A redirection always names a file, so its target takes the full path-aware check. */
-function redirectsProtected(commands: readonly (ParsedShellCommands | undefined)[], projectDir?: string, includeGit = true): boolean {
-  return commands.some((command) => command?.redirects.some((target) => isProtected(target, projectDir, includeGit)));
+function redirectsProtected(commands: readonly (ParsedShellCommands | undefined)[], projectDir?: string): boolean {
+  return commands.some((command) => command?.redirects.some((target) => isProtected(target, projectDir)));
 }
 
 /** Denies and asks that depend only on the literal parsed command text. */
@@ -38,14 +37,12 @@ function protectedPathScore(scan: ShellScan, projectDir?: string): RequestScore 
   // Each simple command is judged by its own grammar, so a pattern/script/filter
   // is data even when spelled like a path, while tokens outside any command keep
   // the generic word check.
-  if (redirectsProtected(scan.commands, projectDir, false) ||
-      scan.commands.some((command) => commandTouchesProtected(command, projectDir, false)))
-    return deny("Protected path access");
-  if (pathTargets(scan).some((arg) => hasSymlinkTraversal(arg, projectDir)))
-    return ask("Symlink traversal requires human approval");
   if (redirectsProtected(scan.commands, projectDir) ||
       scan.commands.some((command) => commandTouchesProtected(command, projectDir)))
-    return high("Git metadata access requires further review");
+    return deny("Protected path access");
+  if (scan.commands.some((command) => command?.segments.some((segment) => segmentNeedsPathReview(segment, projectDir)) ||
+      command?.redirects.some((target) => classifyPath(target, projectDir).review)))
+    return { ...high("Path role or resolution requires further review"), findings: ["Configuration, ambiguous operand role or unresolved metadata; no established prohibition"] };
   return undefined;
 }
 

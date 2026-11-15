@@ -122,9 +122,10 @@ Stage shapes:
    are re-reviewed but never deleted or rewritten.
 3. Built-in guards run first: protected paths and credentials, risky shell
    structure, recursive external deletion, history changes, and ambiguous syntax.
-   These guards are not user-extensible. Git metadata (`.git`), Git global
+   These guards are not user-extensible. Ordinary configuration, ambiguous
+   credential-like names, unresolved paths, Git metadata (`.git`), Git global
    options, and complex POSIX shell syntax are left to the configured decision/LLM
-   stages, not automatically denied or forced to a user prompt. Credential
+   stages, not automatically denied or forced to a user prompt. Established credential-store
    protections and visible blocked operations still take precedence. Unsupported
    Windows shell dialects still require manual approval. Loading a skill is
    low-risk: it loads instructions, not executable code; later tool calls are

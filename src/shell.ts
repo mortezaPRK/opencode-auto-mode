@@ -1,7 +1,8 @@
 import { homedir } from "node:os";
 import { basename, resolve } from "node:path";
 import type { ReviewResult } from "./reviewer.js";
-import { isInProject, isProtected, isProtectedPathOperand, isProtectedShellWord } from "./tiers.js";
+import { isInProject, isProtected, pathOperandPolicy, shellPathSpelling, shellWordNeedsReview } from "./tiers.js";
+import type { PathPolicy } from "./path-policy.js";
 import {
   BALANCED_QUOTES, CONTROL_OPERATORS, DYNAMIC, REDIRECT_OPERATORS, SCRIPT_HOSTS, SHELLS, STATEFUL,
   denyCleanPrefix, denyInvocation, hasAmbiguousDescriptorClose, hasAssembledUndecodedSyntax, hasHeredoc,
@@ -15,7 +16,7 @@ const WRITE_OPERATORS = new Set([">", ">>", ">|", "&>", "&>>", "<>", ">&"]);
 const DYNAMIC_SYNTAX = /\$\(|`|\$\(\s*\(|[<>]\(|\$\[/;
 const FORK_BOMB = /:\s*\(\s*\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:/;
 
-interface Segment { words: string[]; globs: boolean[]; write: boolean }
+interface Segment { words: string[]; globs: boolean[]; homes: boolean[]; write: boolean }
 type Verdict = { decision: "deny"; reason: string } | { decision: "allow" | "review" | "ask" };
 
 /** True when the effective executable is a shell, a dynamic builtin, or a stateful builtin. */
@@ -81,67 +82,66 @@ const WORD_DELIMITER = /[ \t\n;|&()<>]/;
  * escaped `\$` are literal and stay safe. Matching the flags by position keeps
  * the raw text out of the parsed logic.
  */
-function wordExpansions(command: string): boolean[] {
-  const expansions: boolean[] = [];
-  let present = false;
-  let expansion = false;
-  let wordStart = true;
-  let quote: "'" | '"' | "$'" | undefined;
+interface WordFact { dynamic: boolean; home: boolean }
+interface WordState extends WordFact { present: boolean; homeEnd: number; quote?: "'" | '"' | "$'" }
+function wordExpansions(command: string): WordFact[] {
+  const expansions: WordFact[] = [];
+  const state: WordState = { present: false, dynamic: false, home: false, homeEnd: 0 };
   const flush = () => {
-    if (!present) return;
-    expansions.push(expansion);
-    present = false;
-    expansion = false;
+    if (state.present) expansions.push({ dynamic: state.dynamic, home: state.home });
+    state.present = false; state.dynamic = false; state.home = false;
   };
   for (let index = 0; index < command.length; index++) {
     const character = command[index];
-    if (quote === "'") {
-      if (character === "'") quote = undefined;
-      continue;
-    }
-    if (quote === "$'") {
-      if (character === "\\") index++;
-      else if (character === "'") quote = undefined;
-      continue;
-    }
-    if (quote === '"') {
-      if (character === "\\") index++;
-      else if (character === '"') quote = undefined;
-      else if (character === "$") expansion = true;
-      continue;
-    }
-    if (character === "\\") {
-      present = true;
-      if (index + 1 < command.length && command[++index] !== "\n") wordStart = false;
-      continue;
-    }
-    if (character === "'" || character === '"' || (character === "$" && command[index + 1] === "'")) {
-      present = true;
-      wordStart = false;
-      if (character === "'" || character === '"') quote = character;
-      else { quote = "$'"; index++; }
-      continue;
-    }
-    if (character === "#" && wordStart) {
+    if (state.quote) { index = quotedWordCharacter(command, index, state); continue; }
+    if (character === "#" && !state.present) {
       const end = command.indexOf("\n", index);
-      flush();
       if (end === -1) break;
       index = end;
-      wordStart = true;
       continue;
     }
-    if (WORD_DELIMITER.test(character)) {
-      flush();
-      wordStart = true;
-      continue;
-    }
-    if (character === "*" || character === "?" || character === "[" || character === "{" ||
-        character === "$") expansion = true;
-    present = true;
-    wordStart = false;
+    if (WORD_DELIMITER.test(character)) { flush(); continue; }
+    if (!state.present) startWord(command, index, state);
+    state.present = true;
+    index = unquotedWordCharacter(command, index, state);
   }
   flush();
   return expansions;
+}
+
+function startWord(command: string, index: number, state: WordState): void {
+  const prefix = /^(?:~(?=\/|$|[\s;|&()<>])|\$(?:HOME|\{HOME\})(?=\/|$|[\s;|&()<>])|"\$(?:HOME|\{HOME\})(?=\/|"))/.exec(command.slice(index))?.[0];
+  state.home = prefix !== undefined;
+  state.homeEnd = index + (prefix?.length ?? 0);
+  state.dynamic = command[index] === "~" && !state.home;
+}
+
+function markExpansion(state: WordState, index: number): void {
+  state.dynamic = true;
+  state.home = state.home && index < state.homeEnd;
+}
+
+function unquotedWordCharacter(command: string, index: number, state: WordState): number {
+  const character = command[index];
+  if (character === "\\") return index + 1;
+  if (character === "'" || character === '"') state.quote = character;
+  else if (character === "$" && command[index + 1] === "'") { state.quote = "$'"; return index + 1; }
+  else if (/[*?[{$]/.test(character)) markExpansion(state, index);
+  return index;
+}
+
+function quotedWordCharacter(command: string, index: number, state: WordState): number {
+  const character = command[index];
+  if (state.quote === "'") {
+    if (character === "'") state.quote = undefined;
+    return index;
+  }
+  if (character === "\\") return index + 1;
+  if (state.quote === "$'") {
+    if (character === "'") state.quote = undefined;
+  } else if (character === '"') state.quote = undefined;
+  else if (character === "$") markExpansion(state, index);
+  return index;
 }
 
 /** String tokens that no simple command consumed, such as words inside `$(...)`. */
@@ -155,8 +155,8 @@ function leftoverWords(tokens: readonly Token[], consumed: ReadonlySet<number>):
 }
 
 /** Splits parsed tokens into simple commands, tracking whether the whole line parsed. */
-function lineSegments(tokens: readonly Token[], expansions: readonly boolean[] = []): ParsedLine {
-  const segments: Segment[] = [{ words: [], globs: [], write: false }];
+function lineSegments(tokens: readonly Token[], expansions: readonly WordFact[] = []): ParsedLine {
+  const segments: Segment[] = [{ words: [], globs: [], homes: [], write: false }];
   const redirects: string[] = [];
   const consumed = new Set<number>();
   let current = segments[0];
@@ -164,26 +164,25 @@ function lineSegments(tokens: readonly Token[], expansions: readonly boolean[] =
   let uncertainRedirect = false;
   let wordIndex = 0;
   let position = 0;
-  const nextExpansion = () => expansions[wordIndex++] ?? false;
+  const nextExpansion = () => expansions[wordIndex++] ?? { dynamic: false, home: false };
   const failed = (): ParsedLine => ({ segments, redirects, leftovers: leftoverWords(tokens, consumed), complete: false });
   for (const token of tokens) {
     const index = position++;
     if (typeof token === "string") {
       if (redirect) {
-        const target = token;
-        const expanded = nextExpansion();
+        const { target, expanded } = redirectWord(token, nextExpansion());
         // Heredoc delimiters are quote-removed, not expanded. Their bodies and
         // boundaries remain governed by the dedicated heredoc analyzer.
         uncertainRedirect ||= expanded && !["<<", "<<-"].includes(redirect.op);
         const descriptorClose = target === "-" && [">&", "<&"].includes(redirect.op);
         if (redirect.write && target !== "/dev/null" && !descriptorClose)
           current.write = true;
-        redirects.push(target);
+        addPathRedirect(redirects, target, redirect.op, expanded);
         consumed.add(index);
         redirect = undefined;
       } else {
         current.words.push(token);
-        current.globs.push(nextExpansion());
+        addWordFact(current, nextExpansion());
         consumed.add(index);
       }
       continue;
@@ -202,6 +201,7 @@ function lineSegments(tokens: readonly Token[], expansions: readonly boolean[] =
         nextExpansion();
         current.words.push(token.pattern);
         current.globs.push(true);
+        current.homes.push(false);
         consumed.add(index);
       }
       continue;
@@ -209,7 +209,7 @@ function lineSegments(tokens: readonly Token[], expansions: readonly boolean[] =
     if (CONTROL_OPERATORS.has(token.op)) {
       // A control operator before the redirection target is invalid syntax.
       if (redirect) return failed();
-      current = { words: [], globs: [], write: false };
+      current = { words: [], globs: [], homes: [], write: false };
       segments.push(current);
       continue;
     }
@@ -277,21 +277,29 @@ export function parseShellCommands(command: string, limits: { maxChars?: number 
  * path word is checked with `isProtectedPathOperand` and every other word keeps
  * the generic shell-word check.
  */
-export function protectedSegment(segment: { words: readonly string[] }, projectDir?: string, includeGit = true): boolean {
+export function segmentPathPolicies(segment: { words: readonly string[]; globs?: readonly boolean[]; homes?: readonly boolean[] }, projectDir?: string): PathPolicy[] {
   const roles = operandRoles(segment.words);
-  const data = new Set(roles.data);
-  const paths = new Set(roles.paths);
-  if (roles.pathValues.some((value) => isProtectedPathOperand(value, projectDir, includeGit))) return true;
-  return segment.words.some((word, index) => {
-    if (data.has(index)) return false;
-    return paths.has(index) ? isProtectedPathOperand(word, projectDir, includeGit) : isProtectedShellWord(word, projectDir, includeGit);
-  });
+  const executable = resolveExecutable(segment.words);
+  const followFinal = !(executable?.name === "git" && segment.words[executable.index + 1] === "add");
+  const values = [...roles.pathValueSources, ...roles.paths.map((index) => ({ value: segment.words[index], index }))];
+  return values.filter(({ index }) => resolvedWord(segment, index))
+    .map(({ value, index }) => pathOperandPolicy(value, projectDir, followFinal, segment.homes?.[index]));
 }
 
-function protectedCommands(parsed: ParsedLine, projectDir?: string, includeGit = true): boolean {
-  return parsed.redirects.some((target) => isProtected(target, projectDir, includeGit)) ||
-    parsed.segments.some((segment) => protectedSegment(segment, projectDir, includeGit)) ||
-    parsed.leftovers.some((word) => isProtectedShellWord(word, projectDir, includeGit));
+export function protectedSegment(segment: { words: readonly string[] }, projectDir?: string): boolean {
+  return segmentPathPolicies(segment, projectDir).some((fact) => fact.kind === "protected");
+}
+
+function protectedCommands(parsed: ParsedLine, projectDir?: string): boolean {
+  return parsed.redirects.some((target) => isProtected(target, projectDir)) ||
+    parsed.segments.some((segment) => protectedSegment(segment, projectDir));
+}
+
+export function segmentNeedsPathReview(segment: { words: readonly string[] }, directory?: string): boolean {
+  if (segmentPathPolicies(segment, directory).some((fact) => fact.review)) return true;
+  const roles = operandRoles(segment.words);
+  return segment.words.some((word, index) => !roles.paths.includes(index) && !roles.data.includes(index) &&
+    shellWordNeedsReview(word, directory));
 }
 
 function analyzeLine(command: string, projectDir?: string): Verdict {
@@ -311,7 +319,7 @@ function analyzeLine(command: string, projectDir?: string): Verdict {
   // substitution) keep the generic shell-word check. None of this depends on the
   // line parsing completely: a deny visible in the literal text must win over the
   // parser uncertainty.
-  if (protectedCommands({ segments, redirects, leftovers, complete }, projectDir, false))
+  if (protectedCommands({ segments, redirects, leftovers, complete }, projectDir))
     return { decision: "deny", reason: "protected path access" };
   // Deny rules that are already visible must win even when later arguments are
   // dynamic (`sudo id $(...)`) and even when the line only parses partially.
@@ -330,7 +338,7 @@ function analyzeLine(command: string, projectDir?: string): Verdict {
   if (!complete || DYNAMIC_SYNTAX.test(command)) return { decision: "ask" };
 
   let ask = false;
-  let review = protectedCommands({ segments, redirects, leftovers, complete }, projectDir);
+  let review = commandsNeedPathReview(redirects, segments, projectDir);
   for (const segment of segments) {
     const verdict = analyzeSegment(segment);
     if (verdict.decision === "deny") return verdict;
@@ -522,7 +530,7 @@ export function visibleShellDeny(resources: readonly string[], projectDir?: stri
       if (FORK_BOMB.test(visible)) return "dangerous shell operation";
       const parsed = parseShellCommands(visible, { maxChars: MAX_COMMAND_BYTES });
       if (parsed === undefined) continue;
-      if (protectedCommands(parsed, projectDir, false))
+      if (protectedCommands(parsed, projectDir))
         return "protected path access";
       const commands = parsed.segments.map((segment) => effectiveInvocation(segment.words));
       for (const command of commands) {
@@ -613,4 +621,28 @@ export function guardShell(resources: readonly string[], projectDir?: string): R
   }
   if (ask) return { decision: "ask", reason: "Shell syntax requires further review" };
   return review ? undefined : { decision: "allow", reason: "read-only command" };
+}
+
+function addPathRedirect(redirects: string[], target: string, operator: string, expanded: boolean): void {
+  if (expanded || ["<<", "<<-", "<<<"].includes(operator)) return;
+  if ([">&", "<&"].includes(operator) && /^(?:\d+|-)$/.test(target)) return;
+  redirects.push(target);
+}
+
+function addWordFact(segment: Segment, fact: WordFact): void {
+  segment.globs.push(fact.dynamic);
+  segment.homes.push(fact.home);
+}
+
+function redirectWord(word: string, fact: WordFact): { target: string; expanded: boolean } {
+  return { target: shellPathSpelling(word, fact.home), expanded: fact.dynamic && !fact.home };
+}
+
+function resolvedWord(segment: { globs?: readonly boolean[]; homes?: readonly boolean[] }, index: number): boolean {
+  return !segment.globs?.[index] || segment.homes?.[index] === true;
+}
+
+function commandsNeedPathReview(redirects: string[], segments: Segment[], directory?: string): boolean {
+  return redirects.some((target) => pathOperandPolicy(target, directory).review) ||
+    segments.some((segment) => segmentNeedsPathReview(segment, directory));
 }

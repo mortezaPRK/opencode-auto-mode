@@ -15,7 +15,7 @@ review expectations.
 | `src/score.ts`, `src/score/` | `src/score.ts` is the public `scoreRequest` compatibility re-export. Implementation lives under `src/score/` (`index`, `types`, `limits`, `files`, `history`, `shell`, `shell-argv`, `shell-safety`, `shell-baseline`). Hand-written shell, path, credential, VCS, and tool routing guards live in this ownership area. |
 | `src/shell.ts` | Parsed shell guard: deny/ask classification, protected operands, recursive deletion, history changes, ambiguity floors. |
 | `src/shell-policy.ts` | Shell grammar and command policy vocabulary. Large on purpose; it models parser behavior rather than matching raw text. |
-| `src/tiers.ts` | Protected paths, credential names, symlink traversal, project/worktree containment, safe edit targets. |
+| `src/path-policy.ts`, `src/tiers.ts` | Anchored credential-store roles and metadata resolution; shell operand adapters, containment, and safe edit targets. |
 | `src/worktree.ts` | Discovers the session's current worktree root and canonical location. |
 | `src/gates.ts` | VCS preconditions for history-changing commands. Missing facts fail toward review. |
 | `src/classifier.ts` | Ordered classifier pipeline. First decisive allow/deny wins; otherwise ask. |

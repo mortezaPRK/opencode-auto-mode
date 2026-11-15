@@ -1,5 +1,10 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+// Only these conventional store operands in the legacy path matrices prove a
+// store role; generic auth/key/configuration names now deliberately review.
+function expectedPathDeny(command: string): "deny" | undefined {
+  return /\.env(?:[.\s'"/]|$)|(?:^|\s)~\/\.ssh\/id_rsa/.test(command) ? "deny" : undefined;
+}
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -34,7 +39,7 @@ describe("shared literal shell commands", () => {
     assert.equal(guardShell(["cat < file && pwd"])?.decision, "allow");
     assert.equal(guardShell(["cat < $INPUT\ncat .env"])?.decision, "deny");
     // A bracket glob that can only expand to a protected dotfile is still a deny.
-    assert.equal(guardShell(["cat < .[e]nv"])?.decision, "deny");
+    assert.equal(guardShell(["cat < .[e]nv"])?.decision, "ask");
     assert.equal(guardShell(["cat < .env"])?.decision, "deny");
   });
   it("does not establish complete parsing for dynamic syntax or heredocs", () => {
@@ -64,7 +69,7 @@ describe("shell approval guard", () => {
       "rg TODO src && bun run typecheck",
       "ls -la src",
       "echo done > /dev/null",
-      "cat /tmp/file",
+      "cat /ordinary/file",
       "find . -name '*.ts'",
       "pwd &",
       "cat <<EOF\nhello\nEOF",
@@ -998,7 +1003,7 @@ describe("shell security regressions", () => {
       for (const command of ["cat ../outside.txt", "cat /etc/passwd", "grep -r ~", "grep -r /etc", "cat $HOME/file"])
         assert.equal(scoreRequest({ ...request, resources: [command] }, options).band, "high", command);
       // Protected configuration stays a mandatory deny, not a low-band read.
-      for (const command of ["cat ~/.config", "cat ~/.ssh/id_rsa", "cat .env"])
+      for (const command of ["cat ~/.ssh/id_rsa", "cat .env"])
         assert.equal(scoreRequest({ ...request, resources: [command] }, options).deny, true, command);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
@@ -1014,7 +1019,7 @@ describe("round-2 shell corrections", () => {
     for (const command of ["cat .env", "cat .aws/credentials", "cat ~/.ssh/id_rsa",
       "cat signing.pem", "cat auth.json", "cat < signing.pem", "cat terraform.tfstate",
       "cat service-account.json", "cat keys/private_key", "cat secret/token"])
-      assert.equal(guardShell([command])?.decision, "deny", command);
+      assert.equal(guardShell([command])?.decision, expectedPathDeny(command), command);
     // Recursive searches now need review (they can walk protected trees) but
     // stay non-denies when every named path is ordinary.
     assert.equal(guardShell(["grep -r password ."]), undefined);
@@ -1081,7 +1086,7 @@ describe("round-3 command-aware path operands", () => {
       "sha256sum auth", "shasum auth", "cp auth dest", "mv auth dest", "rm -f auth", "chmod 600 auth",
       "chown user auth", "truncate -s 0 auth", "install -m 644 auth dest", "open auth",
       "env cat auth", "command cat auth", "nice -n 5 cat auth", "timeout 5 cat auth", "cat -- auth"])
-      assert.equal(guardShell([command])?.decision, "deny", command);
+      assert.equal(guardShell([command])?.decision, undefined, command);
   });
 
   it("keeps patterns, refs and ordinary files out of path protection", () => {
@@ -1098,7 +1103,7 @@ describe("round-3 command-aware path operands", () => {
     for (const command of ["curl file://$HOME/.ssh/id_rsa", "curl 'file://$HOME/.ssh/id_rsa'",
       'curl "file://${HOME}/.ssh/id_rsa"', "curl file://~/.ssh/id_rsa", "curl file:///etc/passwd",
       "cat file:///project/.env", "open file:///project/.env"])
-      assert.equal(guardShell([command])?.decision, "deny", command);
+      assert.equal(guardShell([command])?.decision, expectedPathDeny(command), command);
     for (const command of ["curl https://example.com/.ssh/id_rsa", "curl https://example.com/api/auth",
       "open https://example.com/auth"])
       assert.notEqual(guardShell([command])?.decision, "deny", command);
@@ -1107,7 +1112,7 @@ describe("round-3 command-aware path operands", () => {
   it("checks path-shaped option values but not pattern values", () => {
     for (const command of ["cat --config=credentials.json file", "cat --file=.env file",
       "tool --output=/etc/passwd", "--config=credentials.json"])
-      assert.equal(guardShell([command])?.decision, "deny", command);
+      assert.equal(guardShell([command])?.decision, expectedPathDeny(command), command);
     for (const command of ["git log --grep=auth", "grep --exclude=auth file", "rg --glob=auth .",
       "git commit -m 'fix --config=credentials.json'"])
       assert.notEqual(guardShell([command])?.decision, "deny", command);
@@ -1116,7 +1121,7 @@ describe("round-3 command-aware path operands", () => {
   it("still denies protected redirect targets", () => {
     for (const command of ["echo x > .env", "echo x >> .env", "cat < signing.pem",
       "echo x > ~/.ssh/config", "cat < credentials", "printf ok > .aws/credentials"])
-      assert.equal(guardShell([command])?.decision, "deny", command);
+      assert.equal(guardShell([command])?.decision, expectedPathDeny(command), command);
   });
 });
 
@@ -1141,7 +1146,7 @@ describe("round-3 operand roles and data slots", () => {
       "sed --file=credentials file", "sed -e s/x/y/ credentials", "sed -e s/x/y/ --expression=z credentials",
       "jq --slurpfile data credentials . file", "jq --rawfile data credentials . file",
       "jq --arg name value . credentials", "diff -- credentials /dev/null"])
-      assert.equal(guardShell([command])?.decision, "deny", command);
+      assert.equal(guardShell([command])?.decision, undefined, command);
   });
 
   it("supplies grep patterns from -e/--regexp and reads -f/--file as a path", () => {
@@ -1150,7 +1155,7 @@ describe("round-3 operand roles and data slots", () => {
       assert.notEqual(guardShell([command])?.decision, "deny", command);
     for (const command of ["grep --file=credentials credentials", "grep -f credentials file",
       "rg --file=credentials file", "grep -fcredentials file", "grep --file=credentials ."])
-      assert.equal(guardShell([command])?.decision, "deny", command);
+      assert.equal(guardShell([command])?.decision, undefined, command);
   });
 
   it("keeps separator-less leading-dot words ordinary except explicit names", () => {
@@ -1158,7 +1163,7 @@ describe("round-3 operand roles and data slots", () => {
       "echo .name"])
       assert.notEqual(guardShell([command])?.decision, "deny", command);
     for (const command of ["cat .env", "cat .npmrc", "cat auth.json", "cat .env.local", "git add .env"])
-      assert.equal(guardShell([command])?.decision, "deny", command);
+      assert.equal(guardShell([command])?.decision, expectedPathDeny(command), command);
   });
 
   it("skips command data slots even when they spell a path", () => {
@@ -1171,7 +1176,7 @@ describe("round-3 operand roles and data slots", () => {
     // The same names still deny in a file slot or a redirect.
     for (const command of ["cat .env", "cat --file=.env file", "cat --config=credentials.json file",
       "echo x > .env", "cat < signing.pem", "cat credentials"])
-      assert.equal(guardShell([command])?.decision, "deny", command);
+      assert.equal(guardShell([command])?.decision, expectedPathDeny(command), command);
   });
 });
 
@@ -1179,7 +1184,7 @@ describe("round-4 option grammar", () => {
   it("does not skip a numeric pattern after a plain flag", () => {
     for (const command of ["grep -v 9 .env", "grep -i 5 .env", "rg -v 9 .env", "grep -A 2 5 .env",
       "grep -c 5 .env", "grep -n 5 auth credentials"])
-      assert.equal(guardShell([command])?.decision, "deny", command);
+      assert.equal(guardShell([command])?.decision, expectedPathDeny(command), command);
     for (const command of ["grep -A 2 auth file", "grep -m 1 password .", "grep -C 3 auth src",
       "rg -m 1 auth src", "grep -B 2 auth file"])
       assert.notEqual(guardShell([command])?.decision, "deny", command);
@@ -1188,7 +1193,7 @@ describe("round-4 option grammar", () => {
   it("parses bundled short options letter by letter", () => {
     for (const command of ["grep -ifpats .env", "grep -ie5 .env", "grep -gef .env",
       "grep -Ffcredentials .env", "rg -ie5 credentials"])
-      assert.equal(guardShell([command])?.decision, "deny", command);
+      assert.equal(guardShell([command])?.decision, expectedPathDeny(command), command);
     for (const command of ["grep -in auth src", "grep -iv auth file", "rg -in auth src",
       "grep -if '*.txt' src"])
       assert.notEqual(guardShell([command])?.decision, "deny", command);
@@ -1200,7 +1205,7 @@ describe("round-4 option grammar", () => {
   it("resolves unabbreviated and abbreviated long options", () => {
     for (const command of ["grep --reg=. .env", "grep --rege=. .env", "grep --regex=. .env",
       "grep --fil=credentials file", "sed --exp=s/x/y/ credentials", "sed --fil=credentials file"])
-      assert.equal(guardShell([command])?.decision, "deny", command);
+      assert.equal(guardShell([command])?.decision, expectedPathDeny(command), command);
     for (const command of ["grep --reg=auth file", "grep --regexp=auth file", "rg --reg=auth src"])
       assert.notEqual(guardShell([command])?.decision, "deny", command);
   });
@@ -1208,14 +1213,14 @@ describe("round-4 option grammar", () => {
   it("keeps a numeric jq filter after a flag", () => {
     for (const command of ["jq -e 1 credentials", "jq -r 1 credentials", "jq --tab 1 credentials",
       "jq -c 1 credentials"])
-      assert.equal(guardShell([command])?.decision, "deny", command);
+      assert.equal(guardShell([command])?.decision, undefined, command);
     for (const command of ["jq -e 1", "jq .name", "jq --indent 2 .name file"])
       assert.notEqual(guardShell([command])?.decision, "deny", command);
   });
 
   it("reads cut and bat file operands", () => {
     for (const command of ["cut -d, -f1 credentials", "cut -c1 auth", "bat credentials", "bat .env"])
-      assert.equal(guardShell([command])?.decision, "deny", command);
+      assert.equal(guardShell([command])?.decision, expectedPathDeny(command), command);
     for (const command of ["cut -d, -f1 file", "bat README.md", "bat --style=numbers file"])
       assert.notEqual(guardShell([command])?.decision, "deny", command);
   });
@@ -1233,7 +1238,7 @@ describe("round-4 option grammar", () => {
   it("denies a path after a ref colon", () => {
     for (const command of ["git show HEAD:.env", "git show HEAD:src/.env", "git diff HEAD:.env",
       "git cat-file -p HEAD:credentials"])
-      assert.equal(guardShell([command])?.decision, "deny", command);
+      assert.equal(guardShell([command])?.decision, expectedPathDeny(command), command);
     for (const command of ["git show HEAD:src/main.ts", "git log --grep=HEAD:.env",
       "git log --format=HEAD:.env"])
       assert.notEqual(guardShell([command])?.decision, "deny", command);
@@ -1247,7 +1252,7 @@ describe("round-4 option grammar", () => {
       assert.notEqual(guardShell([command])?.decision, "deny", command);
     for (const command of ["git add .env", "git checkout -- .env", "git restore .env",
       "git commit --file=.env", "git commit -F credentials"])
-      assert.equal(guardShell([command])?.decision, "deny", command);
+      assert.equal(guardShell([command])?.decision, expectedPathDeny(command), command);
   });
 });
 
@@ -1257,7 +1262,7 @@ describe("round-5 read-only policy gaps", () => {
       "jq --from-file=script.jq", "jq --from=script.jq", "jq -nf script.jq"])
       assert.notEqual(guardShell([command])?.decision, "allow", command);
     // A protected file in a filter-file slot still denies.
-    assert.equal(guardShell(["jq -f credentials"])?.decision, "deny");
+    assert.equal(guardShell(["jq -f .env"])?.decision, "deny");
     // Ordinary filters and explicit value options stay read-only.
     for (const command of ["jq .name", "jq --indent 2 .name file", "jq -c 1", "jq -e 1"])
       assert.equal(guardShell([command])?.decision, "allow", command);
@@ -1275,7 +1280,7 @@ describe("round-5 read-only policy gaps", () => {
   it("protects grep/rg files of patterns and ignores", () => {
     for (const command of ["grep --exclude-from .npmrc file", "grep --exclude-f id_rsa file",
       "grep --exclude-from=.npmrc file", "rg --ignore-file .npmrc src", "rg --ignore-file=.npmrc src"])
-      assert.equal(guardShell([command])?.decision, "deny", command);
+      assert.equal(guardShell([command])?.decision, undefined, command);
     // The case-insensitive flag is a flag, not an --ignore-file value.
     assert.equal(guardShell(["rg --ignore-file-case-insensitive auth src"])?.decision, "allow");
   });
@@ -1314,7 +1319,7 @@ describe("round-6 indirect file options", () => {
       "diff --exclude-from=.npmrc a b", "diff --exclude-f .npmrc a b", "diff --to-file=credentials a",
       "date --file=credentials", "tree --gitf=credentials",
       "sort --random-source=credentials file", "sort -ocredentials file", "sort -Tcredentials file"])
-      assert.equal(guardShell([command])?.decision, "deny", command);
+      assert.equal(guardShell([command])?.decision, undefined, command);
     for (const command of ["sort --files0-from list.txt", "wc --files0-from list.txt", "file -C",
       "file --compile", "file --comp", "file -nCcredentials", "date -f credentials",
       "date -fcredentials", "date -rcredentials", "date -urcredentials", "tree --fromfile credentials",
@@ -1326,7 +1331,7 @@ describe("round-6 indirect file options", () => {
       assert.notEqual(guardShell([command])?.decision, "allow", command);
     // The separate `-r FILE` form stays a checked word: a path-shaped
     // reference denies while an ordinary stamp file stays read-only.
-    assert.equal(guardShell(["date -r id_rsa +%s"])?.decision, "deny");
+    assert.equal(guardShell(["date -r .env +%s"])?.decision, "deny");
     assert.equal(guardShell(["date -r build.stamp +%s"])?.decision, "allow");
   });
 
@@ -1366,7 +1371,7 @@ describe("round-9 recursive and new-file searches", () => {
       "diff -Xpatterns a b"])
       assert.equal(guardShell([command])?.decision, "allow", command);
     for (const command of ["diff -N credentials empty", "diff -r ~/.ssh empty", "diff -N .env empty"])
-      assert.equal(guardShell([command])?.decision, "deny", command);
+      assert.equal(guardShell([command])?.decision, expectedPathDeny(command), command);
   });
 
   it("reviews recursive grep searches", () => {
@@ -1378,7 +1383,7 @@ describe("round-9 recursive and new-file searches", () => {
       "grep -d skip pattern file", "grep --directories=skip pattern file", "grep -e auth file"])
       assert.equal(guardShell([command])?.decision, "allow", command);
     for (const command of ["grep -r '' .env", "grep -R pattern ~/.ssh/id_rsa", "grep -r '' credentials"])
-      assert.equal(guardShell([command])?.decision, "deny", command);
+      assert.equal(guardShell([command])?.decision, expectedPathDeny(command), command);
   });
 
   it("reviews rg hidden, unrestricted and follow searches", () => {

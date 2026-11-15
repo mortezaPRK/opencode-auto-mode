@@ -484,7 +484,7 @@ describe("v2 permission orchestration", () => {
     const host = await setup({ classifiers: [{ type: "llm", model: configuredModel }] });
     try {
       const input = event("ask", "read", [join(host.directory, ".env")]);
-      await host.evaluate(input); assert.equal(input.effect, "ask"); assert.equal(host.calls.generate, 0); assert.equal(host.calls.context, 0);
+      await host.evaluate(input); assert.equal(input.effect, "deny"); assert.equal(host.calls.generate, 0); assert.equal(host.calls.context, 0);
     } finally { await host.cleanup(); }
   });
   it("RPC decision events never carry sensitive reviewer text or rule identifiers", async () => {
@@ -1057,12 +1057,12 @@ describe("v2 permission orchestration", () => {
       assert.deepEqual(host.calls, { storage: 0, context: 0, generate: 0, vcs: 0 });
     } finally { await host.cleanup(); }
   });
-  it("protected native allow reads still ask without model generation", async () => {
+  it("protected native allow reads deny without model generation", async () => {
     const host = await setup();
     try {
       const input = { ...event("allow", "read", [join(host.directory, ".env")]), message: "native allow" };
       await host.evaluate(input);
-      assert.equal(input.effect, "ask"); assert.match(input.message!, /Protected path/);
+      assert.equal(input.effect, "deny"); assert.match(input.message!, /Protected path/);
       assert.equal(host.calls.generate, 0); assert.equal(host.calls.context, 0);
     } finally { await host.cleanup(); }
   });
