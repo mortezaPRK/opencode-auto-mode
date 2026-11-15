@@ -149,6 +149,13 @@ Classifier stages:
 | `decision` | `{type:"decision", model, timeoutMs?, minConfidence?}` | Native `ctx.experimental.generate.decisions` only. Defaults: timeout 3000, confidence 0.9. |
 | `llm` | `{type:"llm", model, timeoutMs?}` | Native `ctx.experimental.generate.text` reviewer. `model` is explicit and required. |
 
+Both model stages receive complete bounded action evidence, selected static findings,
+and chronological user-message boundaries. The LLM replies with one nonempty
+`ALLOW:`, `DENY:`, or `HUMAN_REVIEW:` reason. Intentional human review abstains and
+continues configured stages; malformed output remains a separate failure. A trailing
+static abstention preserves the last model rationale. This contract does not guarantee
+that a model will reason correctly about authorization.
+
 Stages run in array order. The first decisive allow or deny stops the chain.
 Abstention, low confidence, invalid output, provider errors, and timeouts continue
 to the next stage. A chain that cannot decide asks the user. Per-stage timeouts

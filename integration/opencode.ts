@@ -340,6 +340,15 @@ try {
     profile.sameModelReviewer = true; profile.reviewer = "ALLOW: same-model fixture authorized"; calls.length = 0;
     await expectPermission(f, "allow"); assert.deepEqual(calls, ["reviewer"]);
   });
+  await run("intentional HUMAN_REVIEW preserves its rationale", async () => {
+    const f = await fixture({ classifiers: [{ type: "llm", model: `${FIXTURE_PROVIDER}/${FIXTURE_REVIEWER_MODEL}` }, { type: "static" }] });
+    profile.reviewer = "HUMAN_REVIEW: Which destination is authorized?"; calls.length = 0;
+    await expectPermission(f, "ask");
+    const record = await summary(f);
+    assert.equal(record.reason, "Which destination is authorized?");
+    assert.equal(record.errorKind, undefined);
+    assert.deepEqual(calls, ["reviewer"]);
+  });
   await run("reviewer timeout remains manual", async () => {
     const f = await fixture(); profile.timeout = true; calls.length = 0;
     await expectPermission(f, "ask"); assert.deepEqual(calls, ["reviewer"]);

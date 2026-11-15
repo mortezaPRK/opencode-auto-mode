@@ -130,3 +130,17 @@ describe("ordered classifier execution", () => {
     assert.doesNotMatch(final.reason, /PRIVATE_ERROR/);
   });
 });
+
+it("retains the last model rationale across a trailing static abstention", async () => {
+  const score = { band: "high" as const, reason: "Unknown scope", findings: ["resolution unknown"] };
+  const final = await runClassifiers([llm, staticStage], { ...request }, score, {
+    ...callbacks("abstain"), llm: async (_stage, req) => {
+      assert.deepEqual(req.staticAnalysis, score);
+      return { decision: "abstain", stage: "reviewer", reason: "Which destination did you authorize?" };
+    },
+  });
+  assert.equal(final.decision, "ask");
+  assert.equal(final.reason, "Which destination did you authorize?");
+  assert.equal(final.stage, "reviewer");
+  assert.equal(final.errorKind, undefined);
+});

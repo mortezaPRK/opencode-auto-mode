@@ -319,7 +319,7 @@ export default Plugin.define({
                   const users = messages.filter((message) => message.type === "user").map((message) => message.text);
                   if (users.length === 0 || users.some((text) => typeof text !== "string") || Buffer.byteLength(users.join("\n")) > 12_000)
                     throw new ReviewFailure("context", "User authorization context is unavailable or oversized");
-                  return users.join("\n");
+                   return (request.userMessages = users).join("\n");
                 })();
                 request.transcript = await transcript;
                 if (cancelledNow()) throw new Error(INTERRUPTED_REASON);

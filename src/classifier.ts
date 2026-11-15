@@ -21,6 +21,7 @@ export async function runClassifiers(stages: readonly ClassifierOptions[], reque
   // Defensive guard: no configured stage may override mandatory scoring effects.
   if (score.deny || score.ask)
     return { decision: score.deny ? "deny" : "ask", reason: score.reason, stage: "guard" };
+  request.staticAnalysis = { band: score.band, reason: score.reason, findings: score.findings };
   let last: StageResult | undefined;
   for (const [index, stage] of stages.entries()) {
     if (callbacks.signal?.aborted) return interrupted(stage.type);
@@ -44,7 +45,11 @@ export async function runClassifiers(stages: readonly ClassifierOptions[], reque
     if (callbacks.signal?.aborted) return interrupted(stage.type);
     if (result.errorKind === "cancelled" || result.errorKind === "deadline") return { ...result, decision: "ask" };
     if (result.decision === "allow" || result.decision === "deny") return result as ReviewResult;
-    last = result;
+    last = retainRationale(stage.type, result, last);
   }
   return { ...last, decision: "ask", reason: last?.reason ?? "No classifier resolved the request", stage: last?.stage ?? "classifiers" };
+}
+
+function retainRationale(type: string, result: StageResult, previous?: StageResult): StageResult {
+  return type === "static" && previous ? previous : result;
 }

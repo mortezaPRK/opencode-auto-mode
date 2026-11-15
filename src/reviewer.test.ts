@@ -101,6 +101,28 @@ describe("reviewer deny-gate", () => {
     for (const text of ["ALLOW", "ASK: unclear", "ALLOW: uncertain", "ALLOW: safe\nextra", "DENY:", "DENY: [only-a-rule]", "```ALLOW: safe```"])
       assert.equal(parseDecision(text).decision, "ask", text);
   });
+});
+
+it("preserves intentional abstention separately from malformed output", () => {
+  assert.deepEqual(parseDecision("HUMAN_REVIEW: Cannot determine the destination"), {
+    decision: "abstain", reason: "Cannot determine the destination",
+  });
+  for (const text of ["HUMAN_REVIEW:", "HUMAN_REVIEW: reason\nextra", "HUMAN_REVIEW: [legacy]"])
+    assert.equal(parseDecision(text).errorKind, "invalid-output");
+});
+it("carries bounded static findings and user message boundaries with the complete action", () => {
+  const userMessages = ["Use old-name. Never publish.", "Correction: use new-name."];
+  const prompt = buildReviewPrompt({ ...request, userMessages,
+    staticAnalysis: { band: "high", reason: "Unverified scope", findings: ["resolution unknown", "x".repeat(900)] },
+  });
+  const evidence = JSON.parse(prompt.split("\n")[2]);
+  assert.deepEqual(evidence.userMessages, userMessages);
+  assert.deepEqual(evidence.resources, request.resources);
+  assert.equal(evidence.staticAnalysis.findings[1].length, 500);
+  assert.match(prompt, /newer explicit naming correction supersedes the older related name/);
+  assert.match(prompt, /exact command spelling is not required/);
+});
+describe("reviewer transport", () => {
   it("makes one configured reasoning call", async () => {
     let calls = 0;
     const ctx = context(async (input, options) => {
@@ -134,6 +156,9 @@ describe("reviewer deny-gate", () => {
     assert.equal(result.errorKind, "cancelled");
     assert.equal(calls, 0);
   });
+});
+
+describe("reviewer deadlines", () => {
   it("local reviewer deadline advances to fallback despite a host cancelled exception", async () => {
     const controller = new AbortController();
     let calls = 0;
@@ -170,6 +195,9 @@ describe("reviewer deny-gate", () => {
     assert.equal(final.errorKind, "cancelled");
     assert.equal(calls, 1);
   });
+});
+
+describe("reviewer bounds", () => {
   it("rejects oversized evidence and unconfigured models without calling generation", async () => {
     const ctx = context(async () => { throw new Error("must not call"); });
     assert.equal((await reviewRequest(ctx, { ...request, resources: ["x".repeat(70_000)] }, model, new AbortController().signal, 100)).errorKind, "context");

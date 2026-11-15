@@ -4,6 +4,8 @@ export interface RequestScore {
   reason: string;
   deny?: boolean;
   ask?: boolean;
+  /** Selected policy/scope facts, not raw filesystem contents. */
+  findings?: readonly string[];
 }
 
 export const low = (reason: string): RequestScore => ({ band: "low", reason });
