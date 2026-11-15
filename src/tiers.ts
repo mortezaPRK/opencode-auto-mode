@@ -83,6 +83,12 @@ function projectRootSpellings(projectDir?: string): string[] {
   return roots;
 }
 
+function protectionSpelling(candidate: string, includeGit?: boolean): string {
+  // Metadata needs model review, not a credential deny. Do not normalize here:
+  // sensitive descendants and resolved symlink destinations must still count.
+  return includeGit === false ? candidate.replace(/(^|[/\\])\.git(?=[/\\]|$)/gi, "$1") : candidate;
+}
+
 /**
  * Sensitive spelling of one candidate.
  *
@@ -92,14 +98,14 @@ function projectRootSpellings(projectDir?: string): string[] {
  * still applied to the whole candidate and, in `isProtected`, to every resolved
  * component: a real `.ssh` or `.config` directory stays protected.
  */
-function sensitiveSpelling(candidate: string, roots: readonly string[]): boolean {
-  if (SENSITIVE_PATH.test(candidate)) return true;
+function sensitiveSpelling(candidate: string, roots: readonly string[], includeGit?: boolean): boolean {
+  if (SENSITIVE_PATH.test(protectionSpelling(candidate, includeGit))) return true;
   if (path.isAbsolute(candidate)) {
     for (const root of roots) {
-      if (isInProject(candidate, root)) return DOT_COMPONENT.test(path.relative(root, path.resolve(candidate)));
+      if (isInProject(candidate, root)) return DOT_COMPONENT.test(protectionSpelling(path.relative(root, path.resolve(candidate)), includeGit));
     }
   }
-  return DOT_COMPONENT.test(candidate);
+  return DOT_COMPONENT.test(protectionSpelling(candidate, includeGit));
 }
 
 /** Inspect components before normalization can erase an alias followed by `..`.
@@ -123,16 +129,17 @@ export function hasSymlinkTraversal(target: string, locationDir = process.cwd())
   return false;
 }
 
-/** Check lexical spelling and each resolved component, preserving symlink/.. traversal. */
-export function isProtected(target: string, projectDir?: string): boolean {
+/** Check lexical and resolved components. Excluding Git only removes the metadata
+ * marker; credentials inside it and symlink/.. traversal remain protected. */
+export function isProtected(target: string, projectDir?: string, includeGit?: boolean): boolean {
   const roots = projectRootSpellings(projectDir);
   const candidates = [target, ...target.split("="), ...target.split(":")];
-  if (candidates.some((candidate) => sensitiveSpelling(candidate, roots) ||
+  if (candidates.some((candidate) => sensitiveSpelling(candidate, roots, includeGit) ||
       /^\/proc\/(?:self|thread-self|\d+)\/(?:environ|mem)(?:$|\/)/.test(candidate))) return true;
   let current: string;
   try { current = path.isAbsolute(target) ? path.parse(target).root : realpathSync(projectDir ?? process.cwd()); }
   catch { return hasSymlinkTraversal(target, path.resolve(projectDir ?? process.cwd())); }
-  const protectedPath = (candidate: string) => SENSITIVE_PATH.test(candidate) ||
+  const protectedPath = (candidate: string) => SENSITIVE_PATH.test(protectionSpelling(candidate, includeGit)) ||
     /^\/proc\/(?:self|thread-self|\d+)\/(?:environ|mem)(?:$|\/)/.test(candidate);
   if (protectedPath(current)) return true;
   for (const part of target.split(path.sep).filter(Boolean)) {
@@ -205,13 +212,13 @@ function operandValue(word: string): string {
  * reason to deny `.name`, `.gitignore` or `.cache`. Paths with a separator keep
  * the full check, including resolved components, symlinks and `file:` URLs.
  */
-export function isProtectedPathOperand(target: string, projectDir?: string): boolean {
+export function isProtectedPathOperand(target: string, projectDir?: string, includeGit?: boolean): boolean {
   if (!target) return false;
   const word = operandValue(target);
   const local = fileUrlPath(word);
-  if (local !== undefined) return isProtected(local, projectDir);
+  if (local !== undefined) return isProtected(local, projectDir, includeGit);
   if (SCHEME_URL.test(word) || SCP_URL.test(word)) return false;
-  return /[/\\]/.test(word) ? isProtected(word, projectDir) : SENSITIVE_PATH.test(word);
+  return /[/\\]/.test(word) ? isProtected(word, projectDir, includeGit) : SENSITIVE_PATH.test(protectionSpelling(word, includeGit));
 }
 
 /**
@@ -227,33 +234,33 @@ export function isProtectedPathOperand(target: string, projectDir?: string): boo
  * (`signing.pem`) stay protected everywhere, and redirect targets are checked
  * with the full `isProtected` because a redirection always names a file.
  */
-export function isProtectedShellWord(target: string, projectDir?: string): boolean {
+export function isProtectedShellWord(target: string, projectDir?: string, includeGit?: boolean): boolean {
   if (!target) return false;
   const separator = target.startsWith("-") ? target.indexOf("=") : -1;
   // `--grep=config/auth`, `--format=src/.env` and `--exclude=.env` carry
   // pattern/format data even when the value is spelled like a path.
   if (separator !== -1 && isDataOption(target.slice(0, separator))) return false;
   const local = fileUrlPath(target);
-  if (local !== undefined) return isProtected(local, projectDir);
+  if (local !== undefined) return isProtected(local, projectDir, includeGit);
   if (SCHEME_URL.test(target) || SCP_URL.test(target)) return false;
   const candidates = [target, ...target.split("="), ...target.split(":")];
   // A `file:` value is a local path even when it arrives through an option.
   const files = candidates.map(fileUrlPath).filter((candidate): candidate is string => candidate !== undefined);
-  if (files.length) return files.some((file) => isProtected(file, projectDir));
+  if (files.length) return files.some((file) => isProtected(file, projectDir, includeGit));
   // Any other scheme or an SCP-style location is remote, never a local path.
   if (candidates.some((candidate) => SCHEME_URL.test(candidate) || SCP_URL.test(candidate))) return false;
   if (target.startsWith("-")) {
     if (separator === -1) return false;
     // `--config=credentials.json` and `--file=.env` name files.
-    return isProtectedPathOperand(target.slice(separator + 1), projectDir);
+    return isProtectedPathOperand(target.slice(separator + 1), projectDir, includeGit);
   }
   // `git show HEAD:.env` names a file after the colon; schemes and SCP
   // locations were already excluded above.
-  if (!target.includes("=") && target.split(":").slice(1).some((part) => isProtectedPathOperand(part, projectDir)))
+  if (!target.includes("=") && target.split(":").slice(1).some((part) => isProtectedPathOperand(part, projectDir, includeGit)))
     return true;
   // A separator-less word is only a file reference when it carries a
   // filename-shaped name; a bare keyword such as `auth` stays data here.
-  return /[/\\]/.test(target) ? isProtected(target, projectDir) : SENSITIVE_NAME.test(target);
+  return /[/\\]/.test(target) ? isProtected(target, projectDir, includeGit) : SENSITIVE_NAME.test(protectionSpelling(target, includeGit));
 }
 
 export function isInProject(target: string, projectDir: string): boolean {

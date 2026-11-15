@@ -9,12 +9,14 @@ export function isFileAction(action: string): boolean {
   return FILE_ACTIONS.has(action);
 }
 
-/** Protected paths and symlink traversal need human approval, never a hard deny. */
+/** Credentials/config and symlinks ask; Git metadata goes to model review. */
 function pathApproval(resources: readonly string[], projectDir?: string): RequestScore | undefined {
-  if (resources.some((target) => isProtected(target, projectDir)))
+  if (resources.some((target) => isProtected(target, projectDir, false)))
     return ask("Protected path access requires human approval");
   if (resources.some((target) => hasSymlinkTraversal(target, projectDir)))
     return ask("Symlink traversal requires human approval");
+  if (resources.some((target) => isProtected(target, projectDir)))
+    return high("Git metadata access requires further review");
   return undefined;
 }
 

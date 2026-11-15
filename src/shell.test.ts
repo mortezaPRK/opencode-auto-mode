@@ -1114,7 +1114,7 @@ describe("round-3 command-aware path operands", () => {
   });
 
   it("still denies protected redirect targets", () => {
-    for (const command of ["echo x > .env", "echo x >> .env", "cat < signing.pem", "echo x > .git/config",
+    for (const command of ["echo x > .env", "echo x >> .env", "cat < signing.pem",
       "echo x > ~/.ssh/config", "cat < credentials", "printf ok > .aws/credentials"])
       assert.equal(guardShell([command])?.decision, "deny", command);
   });

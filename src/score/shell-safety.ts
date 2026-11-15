@@ -5,15 +5,15 @@ import { historyChange, historyScore, isGitGlobalOption } from "./history.js";
 import { executableShapeScore, pathTargets, type ShellScan } from "./shell-argv.js";
 import { ask, deny, high, type RequestScore } from "./types.js";
 
-function commandTouchesProtected(command: ParsedShellCommands | undefined, projectDir?: string): boolean {
+function commandTouchesProtected(command: ParsedShellCommands | undefined, projectDir?: string, includeGit = true): boolean {
   if (!command) return false;
-  return command.segments.some((segment) => protectedSegment(segment, projectDir)) ||
-    command.leftovers.some((word) => isProtectedShellWord(word, projectDir));
+  return command.segments.some((segment) => protectedSegment(segment, projectDir, includeGit)) ||
+    command.leftovers.some((word) => isProtectedShellWord(word, projectDir, includeGit));
 }
 
 /** A redirection always names a file, so its target takes the full path-aware check. */
-function redirectsProtected(commands: readonly (ParsedShellCommands | undefined)[], projectDir?: string): boolean {
-  return commands.some((command) => command?.redirects.some((target) => isProtected(target, projectDir)));
+function redirectsProtected(commands: readonly (ParsedShellCommands | undefined)[], projectDir?: string, includeGit = true): boolean {
+  return commands.some((command) => command?.redirects.some((target) => isProtected(target, projectDir, includeGit)));
 }
 
 /** Denies and asks that depend only on the literal parsed command text. */
@@ -32,17 +32,20 @@ function literalShellScore(scan: ShellScan, request: PermissionRequest, worktree
   return undefined;
 }
 
-/** Protected paths deny; a path that traverses a symlink asks for human review. */
+/** Credential/config paths deny; Git metadata is left to configured reviewers. */
 function protectedPathScore(scan: ShellScan, projectDir?: string): RequestScore | undefined {
   // Wrappers do not erase destructive semantics (env rm / command git push).
   // Each simple command is judged by its own grammar, so a pattern/script/filter
   // is data even when spelled like a path, while tokens outside any command keep
   // the generic word check.
-  if (redirectsProtected(scan.commands, projectDir) ||
-      scan.commands.some((command) => commandTouchesProtected(command, projectDir)))
+  if (redirectsProtected(scan.commands, projectDir, false) ||
+      scan.commands.some((command) => commandTouchesProtected(command, projectDir, false)))
     return deny("Protected path access");
   if (pathTargets(scan).some((arg) => hasSymlinkTraversal(arg, projectDir)))
     return ask("Symlink traversal requires human approval");
+  if (redirectsProtected(scan.commands, projectDir) ||
+      scan.commands.some((command) => commandTouchesProtected(command, projectDir)))
+    return high("Git metadata access requires further review");
   return undefined;
 }
 

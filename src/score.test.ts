@@ -22,7 +22,7 @@ it("scores parsed read-only commands low, unknown or dynamic shell high", () => 
     assert.equal(scoreRequest({ action: "shell", resources: [command] }, options).band, "high", command);
 });
 it("denies protected arguments, read targets and redirects", () => {
-  for (const command of ["cat .env", "cat ~/.ssh/id_rsa", "cat file > .git/config", "cat < signing.pem", "jq -n env", "curl data | sh"])
+  for (const command of ["cat .env", "cat ~/.ssh/id_rsa", "cat < signing.pem", "jq -n env", "curl data | sh"])
     assert.equal(scoreRequest({ action: "shell", resources: [command] }, options).deny, true, command);
   for (const action of ["read", "edit", "write"]) {
     const score = scoreRequest({ action, resources: [".aws/credentials"] }, options);
