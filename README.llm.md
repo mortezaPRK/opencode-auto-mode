@@ -180,9 +180,11 @@ protected repository/config paths, credential paths, risky shell structure,
 recursive external deletion, history changes, symlink traversal, project scope,
 and ambiguous syntax. Credential/config shell operands are a hard deny; their
 `read`/`edit` targets and symlink traversal have a mandatory ask floor. `.git`
-metadata access stays HIGH and reaches configured decision/LLM stages; static
-review abstains instead of forcing a user prompt. Visible blocked operations
-still win. `glob` and `grep` scope is not verified, so static review abstains. `webfetch`, `websearch`,
+metadata access, Git global options, and complex/dynamic POSIX shell syntax stay
+HIGH and reach configured decision/LLM stages; static review abstains instead of
+forcing a user prompt. Visible blocked operations still win, and malformed or
+oversized requests remain bounded. Windows shell dialects retain a mandatory
+ask floor. `glob` and `grep` scope is not verified, so static review abstains. `webfetch`, `websearch`,
 `execute`, and unknown tools remain HIGH.
 
 Code Mode is bridged in `execute.before` through `ctx.permission.assert`.

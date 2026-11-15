@@ -360,6 +360,12 @@ try {
     await expectPermission(f, "allow", ["cat .git/HEAD"]);
     assert.deepEqual(calls, ["reviewer", "reviewer"]);
   });
+  await run("complex shell and Git global options reach the reviewer", async () => {
+    const f = await fixture(); profile.reviewer = "ALLOW: fixture authorized"; calls.length = 0;
+    await expectPermission(f, "allow", ["bash -c 'printf ok'"]);
+    await expectPermission(f, "allow", ["git -C . status"]);
+    assert.deepEqual(calls, ["reviewer", "reviewer"]);
+  });
   await run("real reply Always is re-reviewed and denial is enforced", async () => {
     const f = await fixture(); await command(f, "off"); calls.length = 0;
     const first = await permission(f, ["scp sample.txt destination:saved-fixture.txt"]);
@@ -529,8 +535,7 @@ try {
   });
   await run("actual scratch shell execution", async () => {
     const f = await fixture();
-    // Nested sh -c is intentionally a mandatory manual ask. Use a direct HIGH
-    // write instead so this test exercises a reviewer without bypassing the floor.
+    // A direct HIGH write exercises the reviewer on an actual tool invocation.
     profile.tool = { name: "shell", input: { command: "touch tool-result.txt", description: "Scratch marker" } }; calls.length = 0;
     await api(`/api/session/${f.sessionID}/prompt`, { text: "Run the one scratch shell marker command." });
     await api(`/api/experimental/session/${f.sessionID}/wait`, {});
@@ -543,7 +548,7 @@ try {
     assert.equal(captured?.source?.type, "tool"); assert.equal(typeof captured?.source?.messageID, "string");
     assert.equal(typeof captured?.source?.id, "string", "actual native tool source identifiers retained");
   });
-  await run("real shell scanner allows parsed multiline commands but interpreter header remains manual", async () => {
+  await run("real shell scanner allows parsed multiline commands and reviews interpreter scripts", async () => {
     const f = await fixture();
     profile.tool = { name: "shell", input: { command: "pwd\nls", description: "List the scratch directory" } }; calls.length = 0;
     await api(`/api/session/${f.sessionID}/prompt`, { text: "Run the one benign multiline scratch command." });
@@ -558,17 +563,14 @@ try {
     const resources = evaluated.flatMap(record => (record.payload as { resources: string[] }).resources);
     assert.ok(resources.some(resource => resource.includes("pwd")) && resources.some(resource => resource.includes("ls")), JSON.stringify(resources));
     assert.ok(records.some(record => record.reviewID && record.stage === "static" && record.decision === "allow"));
-    profile.tool = { name: "shell", input: { command: "sh <<'EOF'\npwd\nls\nEOF", description: "Benign interpreter fixture requiring consent" } };
+    profile.tool = { name: "shell", input: { command: "sh <<'EOF'\npwd\nls\nEOF", description: "Benign interpreter fixture for review" } };
     profile.issued = false; calls.length = 0;
     await api(`/api/session/${f.sessionID}/prompt`, { text: "Attempt the changed benign interpreter command once." });
-    const pending = await until(() => api(`/api/session/${f.sessionID}/permission`), value => value.data.some((request: { action: string }) => request.action === "shell"));
-    const request = pending.data.find((entry: { action: string }) => entry.action === "shell");
-    assert.deepEqual(calls, [], "mandatory interpreter guard never calls the reviewer");
-    await api(`/api/session/${f.sessionID}/permission/${request.id}/reply`, { decision: "reject" });
     await api(`/api/experimental/session/${f.sessionID}/wait`, {});
-    assert.equal((await toolResult(f, "shell")).state.status, "error");
+    assert.equal((await toolResult(f, "shell")).state.status, "completed");
+    assert.deepEqual(calls, ["reviewer"], "interpreter syntax reaches the configured reviewer");
     const guarded = await summary(f);
-    assert.equal(guarded.stage, "score"); assert.equal(guarded.decision, "ask");
+    assert.equal(guarded.stage, "reviewer"); assert.equal(guarded.decision, "allow");
   });
   await run("hostile project options cannot replace global safety options", async () => {
     const f = await fixture({ classifiers: [{ type: "static", allowInProjectEdits: false },

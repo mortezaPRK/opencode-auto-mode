@@ -36,7 +36,7 @@ it("keeps stateful, interpreter and arbitrary script compounds out of low risk",
     assert.equal(score.band, "high", command);
   }
   for (const command of ["set -e\npwd", "export X=ok\npwd", "sh <<'EOF'\npwd\nEOF"])
-    assert.equal(scoreRequest({ action: "shell", resources: [command] }, options).ask, true, command);
+    assert.equal(scoreRequest({ action: "shell", resources: [command] }, options).ask, undefined, command);
 });
 it("gates force operations and external recursive deletes", () => {
   const request = { action: "shell", resources: ["git push --force-with-lease"], projectDir: "/project" };

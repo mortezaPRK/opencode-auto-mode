@@ -122,10 +122,11 @@ Stage shapes:
    are re-reviewed but never deleted or rewritten.
 3. Built-in guards run first: protected paths and credentials, risky shell
    structure, recursive external deletion, history changes, and ambiguous syntax.
-   These guards are not user-extensible. Git metadata (`.git`) is left to the
-   configured decision/LLM stages, not automatically denied or forced to a user
-   prompt. Credential protections and visible blocked operations still take
-   precedence.
+   These guards are not user-extensible. Git metadata (`.git`), Git global
+   options, and complex POSIX shell syntax are left to the configured decision/LLM
+   stages, not automatically denied or forced to a user prompt. Credential
+   protections and visible blocked operations still take precedence. Unsupported
+   Windows shell dialects still require manual approval.
 4. Configured classifiers run in array order. A static stage may resolve low-risk
    work; a decision stage uses OpenCode's native decision API; an LLM stage uses
    its explicit reviewer. The first decisive allow or deny stops the chain.

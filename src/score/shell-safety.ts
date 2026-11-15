@@ -20,10 +20,10 @@ function redirectsProtected(commands: readonly (ParsedShellCommands | undefined)
 function literalShellScore(scan: ShellScan, request: PermissionRequest, worktreeRoot?: string): RequestScore | undefined {
   if (scan.scanned.some((argv) => recursiveExternalDelete(argv, request.projectDir, worktreeRoot)))
     return deny("Recursive/force deletion outside the project");
-  // Git global options alter cwd/config or helper execution. Do not guess the
-  // effective subcommand or let a reviewer lift this uncertainty.
+  // Global options can change cwd/config/helpers: not static clearance, but
+  // reviewers can evaluate the full invocation and its effective scope.
   if (scan.scanned.some(isGitGlobalOption))
-    return ask("Git global options require manual approval");
+    return high("Git global options require further review");
   // A history-rewriting invocation is gated once, against the request's VCS facts.
   if (scan.scanned.some(historyChange)) return historyScore(scan.scanned, request.gitState);
   // No regex fallback. Only the guard's literal, fully parsed representation

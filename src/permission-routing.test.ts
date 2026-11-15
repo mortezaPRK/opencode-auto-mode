@@ -26,7 +26,7 @@ it("sends Git metadata reads, writes and redirects to review, never static clear
       }
     }
     for (const command of ["cat .git/HEAD", "cat file > .git/config", "echo x >> .git/config",
-      "cat .git/hooks/pre-commit", "cat file://" + root + "/.git/HEAD"]) {
+      "git --git-dir=.git status", "cat .git/hooks/pre-commit", "cat file://" + root + "/.git/HEAD"]) {
       const score = scoreRequest({ action: "shell", resources: [command], projectDir: root }, options);
       assert.equal(score.band, "high", command);
       assert.equal(score.ask, undefined, command);

@@ -21,7 +21,7 @@ it("checks destructive segments before complex-syntax escalation", () => {
   assert.equal(forcePush.band, "high");
   assert.equal(forcePush.ask, true);
   assert.equal(forcePush.deny, undefined);
-  assert.equal(scoreRequest({ action: "shell", resources: ["git -C /project push --force"], projectDir: "/project" }, options).ask, true);
+  assert.equal(scoreRequest({ action: "shell", resources: ["git -C /project push --force"], projectDir: "/project" }, options).ask, undefined);
   assert.equal(scoreRequest({ action: "shell", resources: ["sudo id $'x'"] }, options).deny, true);
 });
 it("retains later-command deny precedence and executable qualification for compounds", () => {
@@ -31,7 +31,7 @@ it("retains later-command deny precedence and executable qualification for compo
   assert.equal(scoreRequest({ action: "shell", resources: ["pwd\ncommand git push --force"], projectDir: "/project" }, options).ask, true);
   for (const command of ["pwd\n/usr/bin/ls", "pwd; ./ls", "pwd\nenv ./ls"])
     assert.equal(scoreRequest({ action: "shell", resources: [command] }, options).band, "high", command);
-  assert.equal(scoreRequest({ action: "shell", resources: ["pwd\ngit -C /project status"] }, options).ask, true);
+  assert.equal(scoreRequest({ action: "shell", resources: ["pwd\ngit -C /project status"] }, options).ask, undefined);
 });
 it("never low-scores dash filename writes or expanded input redirects", () => {
   for (const command of ["printf ok > -", "printf ok >> -", "pwd\nprintf ok > -"])
@@ -39,7 +39,7 @@ it("never low-scores dash filename writes or expanded input redirects", () => {
   for (const command of ['cat < "${INPUT:-.env}"', "cat < $INPUT", "pwd; cat < $INPUT"]) {
     const score = scoreRequest({ action: "shell", resources: [command] }, options);
     assert.equal(score.band, "high", command);
-    assert.equal(score.ask, true, command);
+    assert.equal(score.ask, undefined, command);
   }
   // A bracket glob that can only expand to a protected dotfile stays a deny.
   assert.equal(scoreRequest({ action: "shell", resources: ["cat < .[e]nv"] }, options).deny, true);
