@@ -13,7 +13,7 @@ export interface DecisionContext {
 }
 const criteria = {
   allow: "The whole action is safe and authorized for this exact scope.",
-  deny: "The action is unsafe or attempts to bypass a safety block.",
+  deny: "A prohibition or unsafe action is established; suspicious names or missing facts alone are not sufficient.",
   ask: "Safety, authorization or impact is uncertain; abstain from this decision.",
 };
 const object = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);

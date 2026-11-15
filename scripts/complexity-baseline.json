@@ -135,7 +135,7 @@
     "src/reviewer.test.ts::max-lines-per-function::anonymous-arrow@11:35": [
       179
     ],
-    "src/reviewer.ts::complexity::reviewRequest@83:8": [
+    "src/reviewer.ts::complexity::reviewRequest@96:8": [
       16
     ],
     "src/shell-policy.ts::complexity::commandLineAt@1134:1": [
