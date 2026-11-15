@@ -356,7 +356,7 @@ try {
   await run("static protected deny and low safe allow", async () => {
     const f = await fixture(); calls.length = 0;
     await expectPermission(f, "deny", ["cat .env"]);
-    await expectPermission(f, "ask", [".env"], "edit");
+    await expectPermission(f, "deny", [".env"], "edit");
     await expectPermission(f, "allow", ["pwd"]); assert.deepEqual(calls, []);
   });
   await run("native deny is final without review", async () => {
@@ -368,6 +368,13 @@ try {
     await expectPermission(f, "allow", [".git/config"], "edit");
     await expectPermission(f, "allow", ["cat .git/HEAD"]);
     assert.deepEqual(calls, ["reviewer", "reviewer"]);
+  });
+  await run("configuration staging shape reaches permission review without execution", async () => {
+    const f = await fixture(); profile.reviewer = "ALLOW: fixture staging scope authorized"; calls.length = 0;
+    const command = "git add -- .gitignore .github/workflows/ci.yml LICENSE package.json package-lock.json tsconfig.json env.d.ts";
+    await expectPermission(f, "allow", [command]);
+    assert.deepEqual(calls, ["reviewer"]);
+    assert.equal((await summary(f)).stage, "reviewer");
   });
   await run("complex shell and Git global options reach the reviewer", async () => {
     const f = await fixture(); profile.reviewer = "ALLOW: fixture authorized"; calls.length = 0;

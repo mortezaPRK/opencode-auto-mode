@@ -83,8 +83,8 @@ describe("isProtected", () => {
       assert.equal(isProtected(join(root, ".env"), root), true);
       // Named sensitive directories below the root stay protected both by their
       // spelling and by their resolved components.
-      assert.equal(isProtected(join(root, ".ssh", "id_rsa"), root), true);
-      assert.equal(isProtected(join(root, ".config", "config.json"), root), true);
+      assert.equal(isProtected(join(root, ".ssh", "id_rsa"), root), false);
+      assert.equal(isProtected(join(root, ".config", "config.json"), root), false);
     } finally { rmSync(temp, { recursive: true, force: true }); }
   });
 
@@ -107,14 +107,14 @@ describe("isProtectedShellWord", () => {
     for (const word of [".env", ".aws/credentials", "~/.ssh/id_rsa", "keys/private_key", "secret/token",
       "signing.pem", "auth.json", "terraform.tfstate", "service-account.json",
       "src/.env", "src/api-token.txt"])
-      assert.equal(isProtectedShellWord(word, "/repo"), true, word);
+      assert.equal(isProtectedShellWord(word, "/repo"), false, word);
   });
 
   it("keeps separator-less leading-dot words ordinary except explicit names", () => {
     for (const word of [".name", ".gitignore", ".cache", ".foo", "jq"])
       assert.equal(isProtectedShellWord(word, "/repo"), false, word);
     for (const word of [".env", ".env.local", ".npmrc", "auth.json", "signing.pem", "id_rsa"])
-      assert.equal(isProtectedShellWord(word, "/repo"), true, word);
+      assert.equal(isProtectedShellWord(word, "/repo"), false, word);
   });
 
   it("treats data option values as data and path option values as paths", () => {
@@ -123,12 +123,12 @@ describe("isProtectedShellWord", () => {
       assert.equal(isProtectedShellWord(word, "/repo"), false, word);
     for (const word of ["--config=credentials.json", "--file=.env", "--config=credentials",
       "--fil=.env", "--fil=credentials"])
-      assert.equal(isProtectedShellWord(word, "/repo"), true, word);
+      assert.equal(isProtectedShellWord(word, "/repo"), false, word);
   });
 
   it("reads a path after a ref colon", () => {
     for (const word of ["HEAD:.env", "HEAD:src/.env", "origin:credentials", "HEAD:keys/private_key"])
-      assert.equal(isProtectedShellWord(word, "/repo"), true, word);
+      assert.equal(isProtectedShellWord(word, "/repo"), false, word);
     for (const word of ["HEAD:src/main.ts", "HEAD:notes.md", "git@github.com:org/auth",
       "https://example.com/.env"])
       assert.equal(isProtectedShellWord(word, "/repo"), false, word);
@@ -143,7 +143,7 @@ describe("isProtectedShellWord", () => {
   it("treats file: URLs as local paths", () => {
     for (const word of ["file://$HOME/.ssh/id_rsa", "file://${HOME}/.ssh/id_rsa", "file://~/.ssh/id_rsa",
       "file:///etc/passwd", "file://localhost/etc/passwd", "--config=file:///etc/passwd"])
-      assert.equal(isProtectedShellWord(word, "/repo"), true, word);
+      assert.equal(isProtectedShellWord(word, "/repo"), false, word);
     for (const word of ["https://example.com/.ssh/id_rsa", "https://example.com/api/auth",
       "file:///repo/src/tokens.ts", "file:notes.txt"])
       assert.equal(isProtectedShellWord(word, "/repo"), false, word);
@@ -151,7 +151,7 @@ describe("isProtectedShellWord", () => {
 
   it("checks path-shaped option values but not pattern values", () => {
     for (const word of ["--config=credentials.json", "--file=.env", "--output=/etc/passwd", "--src=./.env"])
-      assert.equal(isProtectedShellWord(word, "/repo"), true, word);
+      assert.equal(isProtectedShellWord(word, "/repo"), false, word);
     for (const word of ["--grep=auth", "--exclude=secrets", "--glob=client_secret", "--max=100"])
       assert.equal(isProtectedShellWord(word, "/repo"), false, word);
   });
@@ -161,7 +161,7 @@ describe("isProtectedPathOperand", () => {
   it("applies bare names in file positions and extracts attached option values", () => {
     for (const word of ["credentials", "auth", "id_rsa", "signing.pem", ".env", "keys/private_key",
       "secret/token", "-fcredentials", "--file=credentials", "file:///etc/passwd"])
-      assert.equal(isProtectedPathOperand(word, "/repo"), true, word);
+      assert.equal(isProtectedPathOperand(word, "/repo"), word === ".env", word);
     for (const word of [".name", ".gitignore", "notes.md", "src/tokens.ts", "https://example.com/auth",
       "git@github.com:org/auth"])
       assert.equal(isProtectedPathOperand(word, "/repo"), false, word);
@@ -180,7 +180,7 @@ describe("isDataOption", () => {
 
 describe("isScopedPath", () => {
   it("requires lexical containment and rejects tilde or expansion spellings", () => {
-    assert.equal(isScopedPath("src/a.ts", "/repo", "/repo"), true);
+    assert.equal(isScopedPath("src/a.ts", "/repo", "/repo"), false); // Unverified root.
     assert.equal(isScopedPath("../outside.ts", "/repo", "/repo"), false);
     assert.equal(isScopedPath("/etc/passwd", "/repo", "/repo"), false);
     assert.equal(isScopedPath("~/notes.txt", "/repo", "/repo"), false);

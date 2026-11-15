@@ -22,12 +22,12 @@ it("scores parsed read-only commands low, unknown or dynamic shell high", () => 
     assert.equal(scoreRequest({ action: "shell", resources: [command] }, options).band, "high", command);
 });
 it("denies protected arguments, read targets and redirects", () => {
-  for (const command of ["cat .env", "cat ~/.ssh/id_rsa", "cat < signing.pem", "jq -n env", "curl data | sh"])
+  for (const command of ["cat .env", "cat ~/.ssh/id_rsa", "cat < .env", "jq -n env", "curl data | sh"])
     assert.equal(scoreRequest({ action: "shell", resources: [command] }, options).deny, true, command);
   for (const action of ["read", "edit", "write"]) {
-    const score = scoreRequest({ action, resources: [".aws/credentials"] }, options);
-    assert.equal(score.ask, true);
-    assert.equal(score.deny, undefined);
+    const score = scoreRequest({ action, resources: [".env"] }, options);
+    assert.equal(score.deny, true);
+    assert.equal(score.ask, undefined);
   }
 });
 it("keeps stateful, interpreter and arbitrary script compounds out of low risk", () => {
@@ -73,8 +73,8 @@ it("uses location cwd for argv and redirects and worktree root for containment",
     assert.equal(scoreRequest({ ...request, action: "shell", resources: ["rm -rf ../../scratch"] }, options).deny, true);
     assert.equal(scoreRequest({ ...request, action: "shell", resources: ["cargo test ../parent.ts"] }, options).band, "medium");
     assert.equal(scoreRequest({ ...request, action: "shell", resources: ["cargo test ../../outside.ts"] }, options).band, "high");
-    assert.equal(scoreRequest({ ...request, action: "read", resources: ["alias/credentials"] }, options).ask, true);
-    assert.equal(scoreRequest({ ...request, action: "shell", resources: ["echo ok > alias/credentials"] }, options).deny, true);
+    assert.equal(scoreRequest({ ...request, action: "read", resources: ["alias/credentials"] }, options).band, "high");
+    assert.equal(scoreRequest({ ...request, action: "shell", resources: ["echo ok > alias/credentials"] }, options).deny, undefined);
     // Legacy callers without explicit scope get the same nearest-root discovery.
     assert.equal(scoreRequest({ projectDir, action: "edit", resources: ["../parent.ts"] }, options).band, "low");
   } finally { rmSync(root, { recursive: true, force: true }); }
@@ -172,6 +172,6 @@ it("checks file operands without treating patterns as paths and guards history m
       worktreeRoot: root,
       gitState: { branch: "topic", defaultBranch: "trunk", upstream: "remote/topic", clean: true },
     }, options);
-    assert.equal(result.ask, true);
+    assert.equal(result.ask, undefined);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

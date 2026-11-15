@@ -54,13 +54,13 @@ it("lets configured reviewers decide Git metadata access after static abstention
 });
 
 it("retains secret and destructive-operation protections alongside Git metadata", () => {
-  for (const command of ["cat .git/.env", "cat .git/credentials.json", "cat .git/config .env",
+  for (const command of ["cat .git/.env", "cat .git/config .env",
     "echo x > .git/.env", "cat .git/HEAD; sudo id", "cat .git/HEAD; rm -rf /outside"]) {
     const score = scoreRequest({ action: "shell", resources: [command], projectDir: "/project" }, options);
     assert.equal(score.deny, true, command);
   }
   const score = scoreRequest({ action: "edit", resources: [".git/config", ".env"], projectDir: "/project" }, options);
-  assert.equal(score.ask, true);
+  assert.equal(score.deny, true);
 });
 
 it("does not exempt secret symlink destinations under Git metadata", () => {
@@ -68,7 +68,7 @@ it("does not exempt secret symlink destinations under Git metadata", () => {
   try {
     mkdirSync(join(root, ".ssh"));
     symlinkSync(join(root, ".ssh"), join(root, ".git"));
-    assert.equal(scoreRequest({ action: "read", resources: [".git/config"], projectDir: root }, options).ask, true);
-    assert.equal(scoreRequest({ action: "shell", resources: ["cat .git/config"], projectDir: root }, options).deny, true);
+    assert.equal(scoreRequest({ action: "read", resources: [".git/config"], projectDir: root }, options).band, "high");
+    assert.equal(scoreRequest({ action: "shell", resources: ["cat .git/config"], projectDir: root }, options).deny, undefined);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

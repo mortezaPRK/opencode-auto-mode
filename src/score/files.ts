@@ -1,6 +1,6 @@
 import type { AutoModeOptions } from "../config.js";
-import { hasSymlinkTraversal, isProtected, isScopedPath, projectRoot, safeTarget } from "../tiers.js";
-import { ask, high, low, type RequestScore } from "./types.js";
+import { classifyPath, isScopedPath, projectRoot, safeTarget } from "../tiers.js";
+import { deny, high, low, type RequestScore } from "./types.js";
 
 /** Tools whose resources are filesystem paths this scorer can verify. */
 const FILE_ACTIONS = new Set(["read", "edit", "write", "glob", "grep"]);
@@ -9,14 +9,12 @@ export function isFileAction(action: string): boolean {
   return FILE_ACTIONS.has(action);
 }
 
-/** Credentials/config and symlinks ask; Git metadata goes to model review. */
+/** Only established stores deny. Configuration and resolution uncertainty review. */
 function pathApproval(resources: readonly string[], projectDir?: string): RequestScore | undefined {
-  if (resources.some((target) => isProtected(target, projectDir, false)))
-    return ask("Protected path access requires human approval");
-  if (resources.some((target) => hasSymlinkTraversal(target, projectDir)))
-    return ask("Symlink traversal requires human approval");
-  if (resources.some((target) => isProtected(target, projectDir)))
-    return high("Git metadata access requires further review");
+  const facts = resources.map((target) => classifyPath(target, projectDir));
+  const findings = facts.slice(0, 16).map((fact) => `${fact.kind}: ${fact.reason}`);
+  if (facts.some((fact) => fact.kind === "protected")) return { ...deny("Protected path access"), findings };
+  if (facts.some((fact) => fact.review)) return { ...high("Path role or resolution requires further review"), findings };
   return undefined;
 }
 
@@ -37,10 +35,10 @@ export function scoreFileAction(action: string, resources: readonly string[], op
   // in-project path; shell `file:` handling is separate and unchanged.
   if (resources.some((target) => target.includes("://")))
     return high("URL resource does not establish a filesystem path");
-  const approval = pathApproval(resources, projectDir);
-  if (approval) return approval;
   if (action === "grep" || action === "glob")
     return high("Search patterns do not establish the actual filesystem scope");
+  const approval = pathApproval(resources, projectDir);
+  if (approval) return approval;
   const write = action === "edit" || action === "write";
   const locationDir = projectDir ?? process.cwd();
   // Read targets follow the same scope rule as writes: an external, tilde or
