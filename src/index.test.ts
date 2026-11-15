@@ -1195,3 +1195,20 @@ it("uses reviewer deny and uncertainty results for complex scripts", async () =>
     assert.equal(host.calls.generate, 2);
   } finally { await host.cleanup(); }
 });
+
+it("does not ask a model to approve skill loading or override native skill denies", async () => {
+  const host = await setup();
+  try {
+    for (const effect of ["allow", "ask"] as const) {
+      const input = event(effect, "skill", ["opencode"]);
+      await host.evaluate(input);
+      assert.equal(input.effect, "allow");
+    }
+    const input = { ...event("deny", "skill", ["opencode"]), message: "native skill deny" };
+    await host.evaluate(input);
+    assert.equal(input.effect, "deny");
+    assert.equal(input.message, "native skill deny");
+    assert.equal(host.calls.generate, 0);
+    assert.equal(host.calls.context, 0);
+  } finally { await host.cleanup(); }
+});

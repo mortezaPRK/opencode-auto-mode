@@ -126,7 +126,9 @@ Stage shapes:
    options, and complex POSIX shell syntax are left to the configured decision/LLM
    stages, not automatically denied or forced to a user prompt. Credential
    protections and visible blocked operations still take precedence. Unsupported
-   Windows shell dialects still require manual approval.
+   Windows shell dialects still require manual approval. Loading a skill is
+   low-risk: it loads instructions, not executable code; later tool calls are
+   checked separately.
 4. Configured classifiers run in array order. A static stage may resolve low-risk
    work; a decision stage uses OpenCode's native decision API; an LLM stage uses
    its explicit reviewer. The first decisive allow or deny stops the chain.

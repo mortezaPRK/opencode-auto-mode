@@ -27,6 +27,7 @@ export function scoreRequest(request: PermissionRequest & { worktreeRoot?: strin
   // No host allowlist exists, so a URL/query name cannot bound what is fetched.
   if (NETWORK_ACTIONS.has(action)) return high("Network fetch/search has no verified host allowlist");
   if (INTERACTIVE_ACTIONS.has(action)) return low("User interaction without host side effects");
+  if (action === "skill") return low("Loading skill instructions without executing them");
   // JavaScript can hide egress behind aliases, templates and computed URLs.
   // Even literal allowlisted fetches do not prove the rest of the program safe.
   if (action === "execute")
