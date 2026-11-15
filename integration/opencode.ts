@@ -366,6 +366,11 @@ try {
     await expectPermission(f, "allow", ["git -C . status"]);
     assert.deepEqual(calls, ["reviewer", "reviewer"]);
   });
+  await run("skill loading stays static", async () => {
+    const f = await fixture(); calls.length = 0;
+    await expectPermission(f, "allow", ["opencode"], "skill");
+    assert.deepEqual(calls, []);
+  });
   await run("real reply Always is re-reviewed and denial is enforced", async () => {
     const f = await fixture(); await command(f, "off"); calls.length = 0;
     const first = await permission(f, ["scp sample.txt destination:saved-fixture.txt"]);

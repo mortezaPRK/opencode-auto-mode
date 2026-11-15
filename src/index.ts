@@ -22,7 +22,7 @@ const INTERRUPTED_REASON = "Auto-mode review was interrupted; please decide your
 const PAUSED_REASON = "Auto mode is paused; please decide yourself";
 const INVALID_CONFIG_ACTION = "Auto-mode review is disabled because its configuration is invalid";
 const NATIVE_DENY_REASON = "Native permission deny";
-const REVIEW_ACTIONS = /^(?:read|edit|write|glob|grep|shell|execute|webfetch|websearch|question|todowrite)$/;
+const REVIEW_ACTIONS = /^(?:read|edit|write|glob|grep|shell|execute|webfetch|websearch|question|todowrite|skill)$/;
 const SAFER_ALTERNATIVE = "Continue with a safer alternative.";
 function denialMessage(reason: string): string {
   const trimmed = reason.trim().replace(/[\s.]+$/, "");

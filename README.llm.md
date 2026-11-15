@@ -184,7 +184,9 @@ metadata access, Git global options, and complex/dynamic POSIX shell syntax stay
 HIGH and reach configured decision/LLM stages; static review abstains instead of
 forcing a user prompt. Visible blocked operations still win, and malformed or
 oversized requests remain bounded. Windows shell dialects retain a mandatory
-ask floor. `glob` and `grep` scope is not verified, so static review abstains. `webfetch`, `websearch`,
+ask floor. Loading a `skill` is LOW because it only loads instructions; subsequent
+tool calls are checked independently. `glob` and `grep` scope is not verified,
+so static review abstains. `webfetch`, `websearch`,
 `execute`, and unknown tools remain HIGH.
 
 Code Mode is bridged in `execute.before` through `ctx.permission.assert`.
