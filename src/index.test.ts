@@ -1153,3 +1153,18 @@ describe("v2 permission orchestration", () => {
     } finally { await host.cleanup(); }
   });
 });
+
+it("reviews Git metadata through the permission hook with complete evidence", async () => {
+  const host = await setup();
+  try {
+    for (const [action, resource] of [["shell", "cat .git/HEAD"],
+      ["read", ".git/HEAD"], ["edit", ".git/config"]]) {
+      const input = event("ask", action, [resource]);
+      const before = host.calls.generate;
+      await host.evaluate(input);
+      assert.equal(input.effect, "allow", resource);
+      assert.equal(host.calls.generate, before + 1, resource);
+      assert.ok(host.prompts.at(-1)!.includes(resource), resource);
+    }
+  } finally { await host.cleanup(); }
+});

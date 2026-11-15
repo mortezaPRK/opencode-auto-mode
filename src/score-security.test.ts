@@ -301,7 +301,7 @@ it("protects file: URL paths and path-shaped option values", () => {
     "git log --grep=auth", "grep --exclude=auth file", "open https://example.com/auth"])
     assert.notEqual(scoreRequest({ ...request, resources: [command] }, options).deny, true, command);
   // Protected redirect targets keep their mandatory deny.
-  for (const command of ["echo x > .env", "cat < credentials", "echo x >> .git/config", "cat < signing.pem"])
+  for (const command of ["echo x > .env", "cat < credentials", "cat < signing.pem"])
     assert.equal(scoreRequest({ ...request, resources: [command] }, options).deny, true, command);
 });
 

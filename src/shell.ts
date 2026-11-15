@@ -277,15 +277,21 @@ export function parseShellCommands(command: string, limits: { maxChars?: number 
  * path word is checked with `isProtectedPathOperand` and every other word keeps
  * the generic shell-word check.
  */
-export function protectedSegment(segment: { words: readonly string[] }, projectDir?: string): boolean {
+export function protectedSegment(segment: { words: readonly string[] }, projectDir?: string, includeGit = true): boolean {
   const roles = operandRoles(segment.words);
   const data = new Set(roles.data);
   const paths = new Set(roles.paths);
-  if (roles.pathValues.some((value) => isProtectedPathOperand(value, projectDir))) return true;
+  if (roles.pathValues.some((value) => isProtectedPathOperand(value, projectDir, includeGit))) return true;
   return segment.words.some((word, index) => {
     if (data.has(index)) return false;
-    return paths.has(index) ? isProtectedPathOperand(word, projectDir) : isProtectedShellWord(word, projectDir);
+    return paths.has(index) ? isProtectedPathOperand(word, projectDir, includeGit) : isProtectedShellWord(word, projectDir, includeGit);
   });
+}
+
+function protectedCommands(parsed: ParsedLine, projectDir?: string, includeGit = true): boolean {
+  return parsed.redirects.some((target) => isProtected(target, projectDir, includeGit)) ||
+    parsed.segments.some((segment) => protectedSegment(segment, projectDir, includeGit)) ||
+    parsed.leftovers.some((word) => isProtectedShellWord(word, projectDir, includeGit));
 }
 
 function analyzeLine(command: string, projectDir?: string): Verdict {
@@ -305,9 +311,7 @@ function analyzeLine(command: string, projectDir?: string): Verdict {
   // substitution) keep the generic shell-word check. None of this depends on the
   // line parsing completely: a deny visible in the literal text must win over the
   // manual-approval floor.
-  if (redirects.some((target) => isProtected(target, projectDir)) ||
-      segments.some((segment) => protectedSegment(segment, projectDir)) ||
-      leftovers.some((word) => isProtectedShellWord(word, projectDir)))
+  if (protectedCommands({ segments, redirects, leftovers, complete }, projectDir, false))
     return { decision: "deny", reason: "protected path access" };
   // Deny rules that are already visible must win even when later arguments are
   // dynamic (`sudo id $(...)`) and even when the line only parses partially.
@@ -326,7 +330,7 @@ function analyzeLine(command: string, projectDir?: string): Verdict {
   if (!complete || DYNAMIC_SYNTAX.test(command)) return { decision: "ask" };
 
   let ask = false;
-  let review = false;
+  let review = protectedCommands({ segments, redirects, leftovers, complete }, projectDir);
   for (const segment of segments) {
     const verdict = analyzeSegment(segment);
     if (verdict.decision === "deny") return verdict;
@@ -518,9 +522,7 @@ export function visibleShellDeny(resources: readonly string[], projectDir?: stri
       if (FORK_BOMB.test(visible)) return "dangerous shell operation";
       const parsed = parseShellCommands(visible, { maxChars: MAX_COMMAND_BYTES });
       if (parsed === undefined) continue;
-      if (parsed.redirects.some((target) => isProtected(target, projectDir)) ||
-          parsed.segments.some((segment) => protectedSegment(segment, projectDir)) ||
-          parsed.leftovers.some((word) => isProtectedShellWord(word, projectDir)))
+      if (protectedCommands(parsed, projectDir, false))
         return "protected path access";
       const commands = parsed.segments.map((segment) => effectiveInvocation(segment.words));
       for (const command of commands) {
@@ -612,4 +614,3 @@ export function guardShell(resources: readonly string[], projectDir?: string): R
   if (ask) return { decision: "ask", reason: "Shell syntax requires manual approval" };
   return review ? undefined : { decision: "allow", reason: "read-only command" };
 }
-

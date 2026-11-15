@@ -347,12 +347,18 @@ try {
   await run("static protected deny and low safe allow", async () => {
     const f = await fixture(); calls.length = 0;
     await expectPermission(f, "deny", ["cat .env"]);
-    await expectPermission(f, "ask", [".git/config"], "edit");
+    await expectPermission(f, "ask", [".env"], "edit");
     await expectPermission(f, "allow", ["pwd"]); assert.deepEqual(calls, []);
   });
   await run("native deny is final without review", async () => {
     const f = await fixture({}, [{ action: "*", resource: "*", effect: "deny" }]); calls.length = 0;
     await expectPermission(f, "deny", ["cat .env"]); assert.deepEqual(calls, []);
+  });
+  await run("Git metadata reaches the reviewer", async () => {
+    const f = await fixture(); profile.reviewer = "ALLOW: fixture authorized"; calls.length = 0;
+    await expectPermission(f, "allow", [".git/config"], "edit");
+    await expectPermission(f, "allow", ["cat .git/HEAD"]);
+    assert.deepEqual(calls, ["reviewer", "reviewer"]);
   });
   await run("real reply Always is re-reviewed and denial is enforced", async () => {
     const f = await fixture(); await command(f, "off"); calls.length = 0;
