@@ -8,6 +8,15 @@ export class ReviewFailure extends Error {
   }
 }
 
+/** Terminal request evidence loss, distinct from a stage-local provider failure. */
+export class EvidenceFailure extends ReviewFailure {
+  constructor(message: string, options?: { cause?: unknown }) { super("context", message, options); }
+}
+
+export function terminalEvidence(error: unknown): { terminal?: true } {
+  return error instanceof EvidenceFailure ? { terminal: true } : {};
+}
+
 /** Finds an explicit category even when a provider library wraps our failure. */
 function explicitKind(error: unknown): ReviewErrorKind | undefined {
   let current = error;

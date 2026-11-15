@@ -13,7 +13,7 @@ review expectations.
 | `src/config.ts` | Strict public option parsing and defaults. Unknown keys fail. |
 | `src/global-options.ts` | Loads safety options from exactly one user-owned global registration. Ignores project-merged `ctx.options`; rejects duplicate registrations and env/file substitution. |
 | `src/score.ts`, `src/score/` | `src/score.ts` is the public `scoreRequest` compatibility re-export. Implementation lives under `src/score/` (`index`, `types`, `limits`, `files`, `history`, `shell`, `shell-argv`, `shell-safety`, `shell-baseline`). Hand-written shell, path, credential, VCS, and tool routing guards live in this ownership area. |
-| `src/shell.ts` | Parsed shell guard: deny/ask classification, protected operands, recursive deletion, history changes, ambiguity floors. |
+| `src/shell.ts`, `src/shell-copy.ts` | Parsed shell guard, operand expansion/copy-mode provenance, protected accesses, deletion containment, and ambiguity routing. |
 | `src/shell-policy.ts` | Shell grammar and command policy vocabulary. Large on purpose; it models parser behavior rather than matching raw text. |
 | `src/path-policy.ts`, `src/tiers.ts` | Anchored credential-store roles and metadata resolution; shell operand adapters, containment, and safe edit targets. |
 | `src/worktree.ts` | Discovers the session's current worktree root and canonical location. |

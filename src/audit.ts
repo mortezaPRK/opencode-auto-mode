@@ -45,7 +45,8 @@ export function defaultAuditPath(): string {
 
 const REDACTED = "[REDACTED]";
 const HTTP_BODY_OPTION = /^--(?:(?:expand-)?(?:data(?:-[a-z]+)?|json|form(?:-string)?)|post-data|post-file|body-data|body-file|upload-file|execute|config)(?:=|$)/;
-const POSSIBLE_HTTP_BODY = /--(?:(?:expand-)?(?:data|json|form)|post-|body-|upload-file|execute|config)|-[^- \t\n]*[dFTKe]/;
+const POSSIBLE_HTTP_BODY = /--(?:(?:expand-)?(?:data|json|form)|post-|body-|upload-file|execute|config)/;
+const POSSIBLE_SHORT_BODY = /-[^- \t\n]*[dFTKe]/;
 const WGET_BODY_OPTIONS = ["--body-data", "--body-file", "--config", "--execute", "--post-data", "--post-file", "--upload-file"];
 
 function isWgetBodyOption(word: string): boolean {
@@ -58,7 +59,15 @@ function uncertainHttpBodyEvidence(value: string): boolean {
   const literal = normalizeContinuations(value).replace(/['"\\]/g, "");
   const abbreviatedWgetOption = /\bwget\b/.test(literal) &&
     (literal.match(/--[A-Za-z0-9-]+/g) ?? []).some(isWgetBodyOption);
-  return /(?:curl|wget)/.test(literal) && (POSSIBLE_HTTP_BODY.test(literal) || abbreviatedWgetOption);
+  return /(?:curl|wget)/.test(literal) && (possibleBodySyntax(literal) || abbreviatedWgetOption);
+}
+
+/** A hyphen inside a literal long option is not a short-option bundle.
+ * Dynamic word boundaries retain the conservative original short-form scan. */
+function possibleBodySyntax(literal: string): boolean {
+  const withoutLongWords = literal.replace(/--[^ \t\n;|&()]+/g, "");
+  return POSSIBLE_HTTP_BODY.test(literal) || POSSIBLE_SHORT_BODY.test(withoutLongWords) ||
+    (/[$`]/.test(literal) && POSSIBLE_SHORT_BODY.test(literal));
 }
 
 function isHttpBodyOption(word: string, client: string): boolean {

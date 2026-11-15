@@ -127,7 +127,9 @@ Stage shapes:
    options, and complex POSIX shell syntax are left to the configured decision/LLM
    stages, not automatically denied or forced to a user prompt. Established credential-store
    protections and visible blocked operations still take precedence. Unsupported
-   Windows shell dialects still require manual approval. Loading a skill is
+   shell dialects are reviewed from their complete raw text without POSIX-derived
+   denials. Missing scope/VCS facts also reach review; deliberate history gates
+   for a known default branch or dirty tree remain human decisions. Loading a skill is
    low-risk: it loads instructions, not executable code; later tool calls are
    checked separately.
 4. Configured classifiers run in array order. A static stage may resolve low-risk

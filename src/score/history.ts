@@ -128,14 +128,14 @@ function forceResetTarget(argv: readonly string[]): string | undefined {
   return forceCreate(argv.slice(1))?.branch;
 }
 
-/** Scores one verified history-changing invocation, or the missing precondition that asks for review. */
+/** Missing facts review; deliberate default-branch/dirty-tree policy still asks. */
 export function historyScore(scanned: readonly (readonly string[])[], gitState?: VcsState): RequestScore {
-  const gate = evaluateVcsGate(gitState);
-  if (!gate.allowed) return ask(gate.reason);
   const defaultBranch = gitState?.defaultBranch;
   if (defaultBranch && scanned.some((argv) => pushesToDefaultBranch(argv, defaultBranch)))
     return ask("Explicit push destination is the default branch");
   if (defaultBranch && scanned.some((argv) => forceResetTarget(argv) === defaultBranch))
     return ask("Force-reset target is the default branch");
+  const gate = evaluateVcsGate(gitState);
+  if (!gate.allowed) return gate.mandatory ? ask(gate.reason) : high(gate.reason);
   return high("History changes satisfy VCS preconditions but still require review");
 }

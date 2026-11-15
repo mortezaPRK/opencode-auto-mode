@@ -123,3 +123,20 @@ it("preserves runtime-file designations in bounded final symlink chains", () => 
     assert.equal(classifyPath("cycle", root, roots).kind, "unresolved");
   });
 });
+
+it("does not substitute the original home after shell binding effects", () => {
+  fixture((root, roots) => {
+    mkdirSync(join(roots.home, ".ssh")); writeFileSync(join(roots.home, ".ssh/id_rsa"), "fixture");
+    for (const command of ['HOME=/synthetic/project; cat "$HOME/.ssh/id_rsa"', 'HOME=/synthetic/project\ncat ~/.ssh/id_rsa',
+      'export HOME=/synthetic/project; cat "$HOME/.ssh/id_rsa"', "eval 'HOME=/synthetic/project'; cat ~/.ssh/id_rsa",
+      'source setup.sh; cat "$HOME/.ssh/id_rsa"', '. setup.sh; cat ~/.ssh/id_rsa', 'unknown-function; cat ~/.ssh/id_rsa',
+      'printf -v HOME replacement; cat ~/.ssh/id_rsa', 'HOME=/synthetic/project; cat < "$HOME/.ssh/id_rsa"',
+      'HOME=/synthetic/project\ncat "$HOME/.ssh/id_rsa" # $\'suffix\'']) {
+      const score = shell(root, command); assert.equal(score.deny, undefined, command); assert.equal(score.band, "high", command);
+    }
+    for (const command of ['cat "$HOME/.ssh/id_rsa"', 'pwd; cat ~/.ssh/id_rsa', 'pwd\ncat "$HOME/.ssh/id_rsa"',
+      'echo HOME=/synthetic/project; cat ~/.ssh/id_rsa', 'cat ~/.ssh/id_rsa; HOME=/synthetic/project', 'HOME=/synthetic/project; cat .env.local'])
+      assert.equal(shell(root, command).deny, true, command);
+    assert.equal(scoreRequest({ action: "shell", projectDir: root, resources: ['HOME=/synthetic/project', 'cat "$HOME/.ssh/id_rsa"'] }, options).deny, true);
+  });
+});

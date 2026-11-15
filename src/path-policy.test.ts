@@ -1,6 +1,6 @@
 import { it } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { classifyPath, type PolicyRoots } from "./path-policy.js";
@@ -84,9 +84,19 @@ it("aligns file access, shell content reads and staging while preserving final-l
     const options = parseOptions({ classifiers: [{ type: "static" }] });
     for (const action of ["read", "edit", "write"])
       assert.equal(scoreRequest({ action, projectDir: root, resources: ["alias"] }, options).deny, true, action);
-    for (const command of ["cat alias", "cp alias output", "git add .env", "grep pattern .env"])
+    for (const command of ["cat alias", "cp alias output", "git add .env", "grep pattern .env", `curl file://${root}/%2eenv`])
       assert.equal(scoreRequest({ action: "shell", projectDir: root, resources: [command] }, options).deny, true, command);
-    for (const command of ["git add alias", "unknown .env", "echo .env", "grep .env file", "cat <<.env\nfixture\n.env"])
+    for (const command of ["git add alias", "rm alias", "mv alias destination", "ls alias", "stat alias", "unknown .env", "echo .env", "grep .env file", "cat <<.env\nfixture\n.env"])
       assert.equal(scoreRequest({ action: "shell", projectDir: root, resources: [command] }, options).deny, undefined, command);
+  });
+});
+
+it("keeps inaccessible metadata unresolved rather than declaring a secret access", { skip: process.platform === "win32" || process.getuid?.() === 0 }, () => {
+  fixture((root, roots) => {
+    const directory = join(root, "inaccessible");
+    mkdirSync(directory);
+    chmodSync(directory, 0);
+    try { assert.equal(classifyPath(join(directory, ".env"), root, roots).kind, "unresolved"); }
+    finally { chmodSync(directory, 0o700); }
   });
 });

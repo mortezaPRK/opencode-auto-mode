@@ -1,6 +1,6 @@
 import { basename } from "node:path";
 import { operandRoles, resolveExecutable } from "../shell-policy.js";
-import { parseShellCommands, type ParsedShellCommands } from "../shell.js";
+import { parseShellCommands, staticSegmentWords, type ParsedShellCommands } from "../shell.js";
 import { high, type RequestScore } from "./types.js";
 
 /**
@@ -38,7 +38,7 @@ export function scanShell(resources: readonly string[]): ShellScan {
     commands,
     parsedWords,
     effective,
-    scanned: effective.map(scannedArgv),
+    scanned: commands.flatMap((command) => command?.segments.map((segment) => scannedArgv(effectiveArgv(staticSegmentWords(segment)))) ?? []),
     operands: commands.flatMap((command) => command?.operands ?? []),
   };
 }
