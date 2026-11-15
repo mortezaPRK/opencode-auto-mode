@@ -911,12 +911,12 @@ describe("v2 permission orchestration", () => {
       } finally { await host.cleanup(); }
     }
   });
-  it("hard shell asks do not escalate to a permissive reviewer", async () => {
+  it("Git global options reach the configured reviewer", async () => {
     const host = await setup();
     try {
       const input = event("ask", "shell", ["git -C /repo status"]);
       await host.evaluate(input);
-      assert.equal(input.effect, "ask"); assert.equal(host.calls.generate, 0);
+      assert.equal(input.effect, "allow"); assert.equal(host.calls.generate, 1);
     } finally { await host.cleanup(); }
   });
   it("missing upstream on gated git mutations asks without model inference", async () => {
@@ -1166,5 +1166,32 @@ it("reviews Git metadata through the permission hook with complete evidence", as
       assert.equal(host.calls.generate, before + 1, resource);
       assert.ok(host.prompts.at(-1)!.includes(resource), resource);
     }
+  } finally { await host.cleanup(); }
+});
+
+it("reviews complex scripts through the permission hook with complete evidence", async () => {
+  const host = await setup();
+  try {
+    const resource = "bash -c 'printf ok'";
+    const input = event("ask", "shell", [resource]);
+    await host.evaluate(input);
+    assert.equal(input.effect, "allow");
+    assert.equal(host.calls.generate, 1);
+    assert.ok(host.prompts.at(-1)!.includes(resource));
+  } finally { await host.cleanup(); }
+});
+
+it("uses reviewer deny and uncertainty results for complex scripts", async () => {
+  const host = await setup();
+  try {
+    host.answer("DENY: script exceeds the requested scope");
+    const denied = event("allow", "shell", ["bash -c 'printf ok'"]);
+    await host.evaluate(denied);
+    assert.equal(denied.effect, "deny");
+    host.answer("uncertain");
+    const uncertain = event("allow", "shell", ["bash -c 'printf ok'"]);
+    await host.evaluate(uncertain);
+    assert.equal(uncertain.effect, "ask");
+    assert.equal(host.calls.generate, 2);
   } finally { await host.cleanup(); }
 });

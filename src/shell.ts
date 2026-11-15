@@ -310,7 +310,7 @@ function analyzeLine(command: string, projectDir?: string): Verdict {
   // keeps the protected-path check. Tokens no command consumed (words inside a
   // substitution) keep the generic shell-word check. None of this depends on the
   // line parsing completely: a deny visible in the literal text must win over the
-  // manual-approval floor.
+  // parser uncertainty.
   if (protectedCommands({ segments, redirects, leftovers, complete }, projectDir, false))
     return { decision: "deny", reason: "protected path access" };
   // Deny rules that are already visible must win even when later arguments are
@@ -611,6 +611,6 @@ export function guardShell(resources: readonly string[], projectDir?: string): R
     if (verdict.decision === "ask") ask = true;
     else if (verdict.decision === "review") review = true;
   }
-  if (ask) return { decision: "ask", reason: "Shell syntax requires manual approval" };
+  if (ask) return { decision: "ask", reason: "Shell syntax requires further review" };
   return review ? undefined : { decision: "allow", reason: "read-only command" };
 }

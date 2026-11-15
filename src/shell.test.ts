@@ -957,9 +957,9 @@ describe("shell security regressions", () => {
     // Oversized commands keep the deny visible in their literal prefix.
     for (const command of [`sudo id ${"x".repeat(5000)}`, `cat .env ${"x".repeat(5000)}`, `rm -rf / ${"x".repeat(5000)}`])
       assert.equal(scoreRequest({ ...request, resources: [command] }, options).deny, true, command.slice(0, 24));
-    // Genuinely ambiguous syntax with no visible deny still reaches manual review.
+    // Genuinely ambiguous syntax with no visible deny reaches model review.
     for (const command of ["touch \"unclosed", "pwd $(touch marker)", "bash -c pwd", "echo $'a b'", "umask 000"])
-      assert.equal(scoreRequest({ ...request, resources: [command] }, options).ask, true, command);
+      assert.equal(scoreRequest({ ...request, resources: [command] }, options).ask, undefined, command);
   });
 
   it("treats tilde, $HOME, empty and abbreviated recursive deletes as external", () => {
