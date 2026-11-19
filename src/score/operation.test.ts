@@ -80,13 +80,13 @@ it("does not treat metadata or arbitrary identifiers as selected paths", () => {
 it("leaves ordinary operation paths and existing action scoring unchanged", () => {
   const shell = scoreRequest({
     action: "shell", resources: ["pwd"], projectDir: "/repo",
-    operation: { access: "execute", complete: true, arguments: { workdir: "src" } },
+    operation: { access: "execute", complete: true, arguments: { command: "pwd", workdir: "src" } },
   }, options);
   assert.equal(shell.deny, undefined);
   assert.equal(shell.band, "low");
   const protectedShell = scoreRequest({
     action: "shell", resources: ["pwd"], projectDir: "/repo",
-    operation: { access: "execute", complete: true, arguments: { workdir: ".env" } },
+    operation: { access: "execute", complete: true, arguments: { command: "pwd", workdir: ".env" } },
   }, options);
   assert.equal(protectedShell.deny, true);
 });
@@ -161,6 +161,66 @@ it("resolves a symlink-bearing working directory physically instead of collapsin
     assert.equal(result.deny, true);
     assert.match(result.reason, /protected path access/i);
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+it("resolves a captured working directory by its original spelling and rejects whitespace-only values", () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "auto-mode-workdir-spelling-")));
+  try {
+    mkdirSync(join(root, "checkout"));
+    symlinkSync("/etc", join(root, "checkout "));
+    const command = "cat shadow";
+    // The trailing-space spelling selects the symlink; trimming would score the
+    // project directory that shares its prefix and miss `/etc/shadow`.
+    const relocated = scoreRequest({
+      action: "shell", resources: [command], projectDir: join(root, "checkout"),
+      operation: { tool: "shell", access: "execute", complete: true,
+        arguments: { command, workdir: `${join(root, "checkout")} ` } },
+    }, options);
+    assert.equal(relocated.deny, true);
+    assert.match(relocated.reason, /protected path access/i);
+    const whitespace = scoreRequest({
+      action: "shell", resources: ["pwd"], projectDir: root,
+      operation: { tool: "shell", access: "execute", complete: true, arguments: { command: "pwd", workdir: "   " } },
+    }, options);
+    assert.equal(whitespace.band, "high");
+    assert.equal(whitespace.deny, undefined);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+it("requires review when captured command evidence is lost or conflicts with the scored resources", () => {
+  const request = { action: "shell" as const, resources: ["pwd"], projectDir: "/repo" };
+  for (const command of [undefined, "", "   ", "cat /etc/shadow", "pwd\ncat /etc/shadow"]) {
+    const result = scoreRequest({
+      ...request,
+      operation: { tool: "shell", access: "execute", complete: true,
+        arguments: command === undefined ? {} : { command } },
+    }, options);
+    assert.equal(result.band, "high", String(command));
+    assert.equal(result.deny, undefined, String(command));
+  }
+  const matching = scoreRequest({
+    ...request,
+    operation: { tool: "shell", access: "execute", complete: true, arguments: { command: "pwd" } },
+  }, options);
+  assert.equal(matching.band, "low");
+  // A direct permission event without captured arguments has no conflicting
+  // command claim, while explicitly incomplete captured evidence cannot clear.
+  const uncaptured = scoreRequest({ ...request, operation: { tool: "shell", access: "execute", complete: true } }, options);
+  assert.equal(uncaptured.band, "low");
+  const lost = scoreRequest({ ...request, operation: { tool: "shell", access: "execute", complete: false } }, options);
+  assert.equal(lost.band, "high");
+  const splitResources = scoreRequest({
+    action: "shell", resources: ["pwd", "ls"], projectDir: "/repo",
+    operation: { tool: "shell", access: "execute", complete: true, arguments: { command: "pwd\nls" } },
+  }, options);
+  assert.equal(splitResources.band, "low");
+  // A protected access visible in the scored resource keeps its deny even when
+  // the captured command conflicts.
+  const visibleDeny = scoreRequest({
+    action: "shell", resources: ["cat /etc/shadow"], projectDir: "/repo",
+    operation: { tool: "shell", access: "execute", complete: true, arguments: { command: "pwd" } },
+  }, options);
+  assert.equal(visibleDeny.deny, true);
 });
 
 it("does not clear a file action when the captured target leaves the permission scope", () => {

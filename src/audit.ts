@@ -162,6 +162,28 @@ export function redactHttpBodies(value: string, depth = 0): string {
   return hasHttpBodyEvidence(value) ? "[REDACTED HTTP BODY AND COMMAND EVIDENCE]" : value;
 }
 
+/** Literal credential syntax that must not reach model prompts as plain evidence. */
+const URL_USERINFO = /((?:[a-z][a-z0-9+.-]*:)?\/\/)[^\s/@]+@/gi;
+const CREDENTIAL_PARAM_NAME = /(?:^|[_.-])(?:token|tokens|secrets?|password|passwd|signature|credentials?|api[_-]?key|apikey|key|auth|sig)(?:$|[_.-])/i;
+const CREDENTIAL_HEADER = /(^|[^A-Za-z0-9_-])((?:authorization|proxy-authorization|cookie|set-cookie|x-api-key|api-key|x-auth-token|x-access-token|x-amz-security-token)["']?\s*:\s*["']?)[^"'\r\n]+/gi;
+const AUTH_SCHEME = /\b(Bearer\s+)[A-Za-z0-9._~+/=-]{6,}/gi;
+const WELL_KNOWN_TOKEN = /\b(?:gh[pousr]_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,}|xox[abposr]-[A-Za-z0-9-]{8,}|sk-[A-Za-z0-9_-]{8,}|sk_(?:live|test)_[A-Za-z0-9]{8,}|AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{20,}|ya29\.[0-9A-Za-z_-]{8,}|glpat-[A-Za-z0-9_-]{10,}|npm_[A-Za-z0-9]{20,}|pypi-[A-Za-z0-9_-]{20,}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,})\b/g;
+
+function redactQueryCredentials(value: string): string {
+  return value.replace(/([?&])([^=&\s#]+)=([^&#\s"']*)/g, (match, prefix: string, name: string) =>
+    CREDENTIAL_PARAM_NAME.test(name) ? `${prefix}${name}=${REDACTED}` : match);
+}
+
+/** Screens the literal credential shapes that can survive HTTP-body screening. */
+export function redactCredentialSyntax(value: string): string {
+  const redacted = value
+    .replace(URL_USERINFO, "$1[REDACTED]@")
+    .replace(CREDENTIAL_HEADER, "$1$2[REDACTED]")
+    .replace(AUTH_SCHEME, "$1[REDACTED]")
+    .replace(WELL_KNOWN_TOKEN, REDACTED);
+  return redactQueryCredentials(redacted);
+}
+
 /** OFF unless explicitly enabled. Records are neither redacted nor truncated. */
 export function createAuditLog(setting: DebugLogSetting): AuditLog | undefined {
   return createJsonlLog(setting);

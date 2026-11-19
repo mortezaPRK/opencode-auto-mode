@@ -138,6 +138,28 @@ describe("operation evidence privacy and bounds", () => {
     assert.equal(evidence.complete, false);
   });
 
+  it("redacts recognized credential syntax inside retained strings and marks evidence incomplete", () => {
+    const githubToken = `ghp_${"a".repeat(36)}`;
+    const leafToken = `sk-${"b".repeat(24)}`;
+    const credential = {
+      user: "password", query: "QUERY_TOKEN", bearer: "BEARER_VALUE",
+      cookie: "COOKIE_VALUE", apiKey: "API_KEY_VALUE", signature: "SIGNATURE_VALUE",
+    };
+    const evidence = buildOperationEvidence({
+      action: "mcp__fetch", resources: ["https://example.invalid"], metadata: { input: {
+        url: `https://user:${credential.user}@example.invalid/?token=${credential.query}&next=1`,
+        command: `curl -H 'Authorization: Bearer ${credential.bearer}' https://example.invalid/`,
+        note: `curl -H 'Cookie: session=${credential.cookie}' -H 'X-Api-Key: ${credential.apiKey}' https://example.invalid/`,
+        steps: [`echo ${githubToken}`, `echo ${leafToken}`],
+        path: `https://example.invalid/?signature=${credential.signature}`,
+      } },
+    });
+    const serialized = JSON.stringify(evidence);
+    assert.doesNotMatch(serialized, /password|QUERY_TOKEN|BEARER_VALUE|COOKIE_VALUE|API_KEY_VALUE|SIGNATURE_VALUE|ghp_|sk-/);
+    assert.match(serialized, /\[REDACTED\]/);
+    assert.equal(evidence.complete, false);
+  });
+
   it("bounds object keys before reading discarded values", () => {
     let discardedReads = 0;
     const input: Record<string, unknown> = {};

@@ -1,7 +1,7 @@
 import { isAbsolute } from "node:path";
 import { resolvePhysicalDirectory } from "../path-policy.js";
 import type { OperationEvidence, PermissionRequest, ReviewResult } from "../reviewer.js";
-import { guardShell, visibleShellDeny } from "../shell.js";
+import { guardShell, parseShellCommands, visibleShellDeny } from "../shell.js";
 import { scanShell, type ShellScan } from "./shell-argv.js";
 import { scoreShellBaseline } from "./shell-baseline.js";
 import { shellSafetyScore } from "./shell-safety.js";
@@ -24,19 +24,20 @@ function directoryValues(value: unknown): string[] {
 }
 
 function resolveDirectory(value: string, projectDir?: string): string | undefined {
-  const trimmed = value.trim();
-  if (!trimmed || INVALID_DIRECTORY.test(trimmed) || UNRESOLVABLE_DIRECTORY.test(trimmed)) return undefined;
-  if (!isAbsolute(trimmed) && (projectDir === undefined || !isAbsolute(projectDir))) return undefined;
+  const spelling = value.trim();
+  // Whitespace-only or expansion-bearing spellings cannot be verified; the
+  // original spelling still resolves because trimming can select another path.
+  if (!spelling || INVALID_DIRECTORY.test(spelling) || UNRESOLVABLE_DIRECTORY.test(spelling)) return undefined;
+  if (!isAbsolute(value) && (projectDir === undefined || !isAbsolute(projectDir))) return undefined;
   // Physical traversal keeps `..` after a symlink selecting the directory the
   // host would actually enter; lexical collapsing would silently change it.
-  return resolvePhysicalDirectory(trimmed, projectDir ?? process.cwd());
+  return resolvePhysicalDirectory(value, projectDir ?? process.cwd());
 }
 
 /** Exactly one captured execution directory may become the scoring base;
  * missing, conflicting or unresolvable evidence must not clear statically. */
 function shellLocation(operation: OperationEvidence | undefined, projectDir?: string): ShellLocation {
-  const values = EXECUTION_DIRECTORY_KEYS.flatMap((key) => directoryValues(operation?.arguments?.[key]))
-    .filter((value) => value.trim().length > 0);
+  const values = EXECUTION_DIRECTORY_KEYS.flatMap((key) => directoryValues(operation?.arguments?.[key]));
   if (values.length === 0) return { unverified: false };
   const resolved = new Set<string>();
   for (const value of values) {
@@ -50,6 +51,44 @@ function shellLocation(operation: OperationEvidence | undefined, projectDir?: st
 function locatedRequest(request: PermissionRequest, location: ShellLocation): PermissionRequest {
   if (location.directory === undefined || location.directory === request.projectDir) return request;
   return { ...request, projectDir: location.directory };
+}
+
+function commandValues(operation: OperationEvidence | undefined): string[] {
+  const value = operation?.arguments?.command;
+  if (typeof value === "string") return [value];
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+}
+
+function segmentKeys(value: string): Set<string> | undefined {
+  const parsed = parseShellCommands(value);
+  if (parsed === undefined || !parsed.complete || parsed.segments.length === 0) return undefined;
+  return new Set(parsed.segments.map((segment) => JSON.stringify(segment.words)));
+}
+
+function sameSegments(left: ReadonlySet<string>, right: ReadonlySet<string>): boolean {
+  return left.size === right.size && [...left].every((key) => right.has(key));
+}
+
+/** The captured command must name exactly the commands the permission resources
+ * describe; missing or conflicting command evidence cannot clear statically. */
+function commandEvidenceConflicts(operation: OperationEvidence | undefined, resources: readonly string[]): boolean {
+  if (operation === undefined) return false;
+  // No captured arguments at all means this request never carried a conflicting
+  // command claim; incompleteness still marks captured evidence as lost.
+  if (operation.arguments === undefined) return operation.complete === false;
+  const commands = commandValues(operation);
+  if (commands.length !== 1) return true;
+  const [command] = commands;
+  if (command === undefined || command.trim().length === 0) return true;
+  const captured = segmentKeys(command);
+  if (captured === undefined) return true;
+  const scored = new Set<string>();
+  for (const resource of resources) {
+    const keys = segmentKeys(resource);
+    if (keys === undefined) return true;
+    for (const key of keys) scored.add(key);
+  }
+  return !sameSegments(captured, scored);
 }
 
 /** Preserve visible denies; parser uncertainty must reach configured reviewers. */
@@ -74,6 +113,10 @@ export function scoreShellRequest(request: PermissionRequest, worktreeRoot?: str
   const guarded = guardShell(resources, located.projectDir);
   const rejected = guardScore(guarded, resources, located.projectDir, worktreeRoot);
   if (rejected) return rejected;
+  // The parsed resources are the scored command; captured command evidence that
+  // is missing or points at different commands cannot grant static clearance.
+  if (commandEvidenceConflicts(request.operation, resources))
+    return high("Shell command evidence is missing or conflicts with the permission resources");
   // A relocated base without the original containment root cannot prove scope.
   if (location.unverified || (located !== request && worktreeRoot === undefined))
     return high("Shell working directory evidence is unresolved; static scope cannot be verified");

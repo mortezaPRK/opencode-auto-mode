@@ -1,5 +1,5 @@
 import { dirname, isAbsolute, normalize, resolve } from "node:path";
-import { redactHttpBodies } from "./audit.js";
+import { redactCredentialSyntax, redactHttpBodies } from "./audit.js";
 import { isRecord } from "./guards.js";
 import { resolvePhysicalPath } from "./path-policy.js";
 import type { OperationAccess, OperationEvidence } from "./reviewer.js";
@@ -147,14 +147,20 @@ function takeCharacters(target: SanitizeState, length: number): boolean {
   return true;
 }
 
+/** Every retained string is screened for inline HTTP bodies and recognized
+ * credential syntax before it can reach a model prompt. */
+function redactRetained(value: string): string {
+  return redactCredentialSyntax(redactHttpBodies(value));
+}
+
 function boundedString(value: string, target: SanitizeState): string {
   const length = Math.min(value.length, MAX_STRING_CHARS);
   if (length < value.length) target.incomplete = true;
   if (!takeCharacters(target, length)) return TRUNCATED;
   const bounded = value.slice(0, length);
   // Every retained string is screened, not just a built-in shell `command`:
-  // unknown/MCP arguments can carry the same inline HTTP body.
-  const redacted = redactHttpBodies(bounded);
+  // unknown/MCP arguments can carry the same inline HTTP body or credentials.
+  const redacted = redactRetained(bounded);
   if (redacted !== bounded) target.incomplete = true;
   return redacted;
 }
@@ -318,7 +324,7 @@ function limitTargets(values: readonly string[], transform: (value: string) => R
     const resolved = transform(value);
     if (!resolved.complete) complete = false;
     if (resolved.target.length > MAX_TARGET_CHARS) complete = false;
-    const redacted = redactHttpBodies(resolved.target);
+    const redacted = redactRetained(resolved.target);
     if (redacted !== resolved.target) complete = false;
     const target = redacted.slice(0, MAX_TARGET_CHARS);
     if (!targets.includes(target)) targets.push(target);
