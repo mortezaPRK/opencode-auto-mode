@@ -27,6 +27,18 @@ function within(candidate: string, root: string): boolean {
   return candidate === root || candidate.startsWith(`${root}${path.sep}`);
 }
 
+/** Relative containment; `includeSelf` also accepts the root itself. */
+export function isInside(root: string, target: string, includeSelf = false): boolean {
+  const rel = path.relative(root, target);
+  if (rel === "") return includeSelf;
+  return rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel);
+}
+
+/** Protected basenames such as key material and credential files. */
+export const PROTECTED_NAME = /^(?:id_(?:rsa|dsa|ecdsa|ed25519)(?:\.[\w-]+)?|credentials(?:\.[\w-]+)?|\.npmrc|\.netrc|\.git-credentials)$/i;
+/** Private-key and store suffixes; `.key` and `.pem` are never read-only targets. */
+export const PROTECTED_SUFFIX = /\.(?:pem|key|p12|pfx|jks|keystore)$/i;
+
 /** Supported catalog locations, not arbitrary credential-shaped basenames.
  * OpenCode: https://opencode.ai/docs/cli/providers/#storage and
  * https://opencode.ai/docs/troubleshooting#service-files. Metadata only. */
@@ -68,16 +80,21 @@ function runtimeEnv(fact: Resolution): boolean {
   return fact.envDesignation === true || [fact.designation, fact.resolved].some((candidate) => envName(candidate));
 }
 
-function envName(candidate?: string): boolean {
+export function envName(candidate?: string): boolean {
   const name = path.basename(candidate ?? "");
   return /^\.env(?:\..+)?$/.test(name) && !/^\.env(?:\.[a-zA-Z0-9_-]+)?\.(?:example|sample|template)$/.test(name);
 }
 
+/** Spelling checks read both separator spellings: a native Windows path can
+ * arrive on any host, where `\` would otherwise hide a component boundary.
+ * Filesystem resolution keeps the original spelling; only these checks fold it. */
 function reviewSpelling(target: string): boolean {
-  if (/(?:^|\/)\.(?!\.?(?:\/|$))[^/]+/.test(target)) return true;
-  if (/\.(?:[cm]?[jt]sx?|py|go|rs|md)$/.test(target)) return false;
-  return /(?:^|\/)(?:auth|tokens?|secrets?|credentials?|kubeconfig|id_(?:rsa|dsa|ecdsa|ed25519))(?:[./_-]|$)/i.test(target) ||
-    /(?:private[_-]?key|secret|password|passwd|service[-_]?account|terraform\.tfstate|\.(?:pem|key|p12|pfx|jks|keystore)$)/i.test(target);
+  const spelling = target.replace(/\\/g, "/");
+  if (/(?:^|\/)\.(?!\.?(?:\/|$))[^/]+/.test(spelling)) return true;
+  if (/\.(?:[cm]?[jt]sx?|py|go|rs|md)$/.test(spelling)) return false;
+  return /(?:^|\/)(?:auth|tokens?|secrets?|credentials?|kubeconfig|id_(?:rsa|dsa|ecdsa|ed25519))(?:[./_-]|$)/i.test(spelling) ||
+    /(?:private[_-]?key|secret|password|passwd|service[-_]?account|terraform\.tfstate)/i.test(spelling) ||
+    PROTECTED_SUFFIX.test(spelling);
 }
 
 /** This is only used when shell lexical provenance establishes expansion. */
