@@ -65,18 +65,36 @@ function verifiedTarget(target: string, write: boolean, projectDir?: string, wor
   return isScopedPath(target, projectDir, worktreeRoot ?? projectRoot(projectDir));
 }
 
+/** Every captured target names a permission resource, compared canonically. The
+ * scope itself is the score's check; this only proves the capture describes the
+ * permission request the score evaluated. A fact-only allow cannot skip it when
+ * the score band never reached `operationScopeApproval`. */
+export function operationTargetsReconciled(operation: OperationEvidence | undefined, action: string,
+  resources: readonly string[], projectDir?: string): boolean {
+  return operationTargets(operation, action).every((target) =>
+    namesPermissionResource(resources, target, projectDir));
+}
+
 /** A low file score needs a correlated capture (when one was supplied) whose
  * every captured target names a permission resource that stays verified in
  * scope. An omitted payload adds no target and keeps correlation valid, while a
  * mismatched, duplicate or dropped capture cannot clear statically. */
 export function operationScopeApproval(operation: OperationEvidence | undefined, action: string,
   resources: readonly string[], projectDir?: string, worktreeRoot?: string): RequestScore | undefined {
+  // Correlation failures and target mismatches are blocking findings: a fact-only
+  // allow must not certify a capture that the file guards never verified.
   if (operation?.correlated === false)
-    return high("Captured operation evidence does not match the permission request");
+    return {
+      ...high("Captured operation evidence does not match the permission request"),
+      findings: ["Captured call does not correlate with the permission request; file guards did not verify it"],
+    };
   const targets = operationTargets(operation, action);
   if (targets.length === 0) return undefined;
   const write = WRITE_ACTIONS.has(action);
   const verified = targets.every((target) => namesPermissionResource(resources, target, projectDir) &&
     verifiedTarget(target, write, projectDir, worktreeRoot));
-  return verified ? undefined : high("Operation target differs from the verified permission scope");
+  return verified ? undefined : {
+    ...high("Operation target differs from the verified permission scope"),
+    findings: ["Captured operation target differs from the verified permission scope; file guards did not verify it"],
+  };
 }

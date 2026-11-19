@@ -4,7 +4,9 @@ export type ReviewerModelRef = { id: string; providerID: string; variant?: strin
 export type ClassifierOptions =
   | { type: "static"; allowInProjectEdits?: boolean }
   | { type: "decision"; model: string; timeoutMs?: number; minConfidence?: number }
-  | { type: "llm"; model: string; timeoutMs?: number };
+  | { type: "llm"; model: string; timeoutMs?: number }
+  /** Native fact review; confidence 0.8-1, defaults to 0.9. */
+  | { type: "fact-review"; model: string; timeoutMs?: number; minConfidence?: number };
 export interface BreakerOptions { consecutiveDenies: number; windowDenies: number; windowSize: number }
 export interface AuditOptions { enabled: boolean; maxBytes: number }
 export interface AutoModeOptions {
@@ -63,23 +65,26 @@ function parseStatic(stage: Record<string, unknown>): ClassifierOptions {
   return { type: "static", ...(stage.allowInProjectEdits === undefined ? {} : { allowInProjectEdits: stage.allowInProjectEdits }) };
 }
 
-type ModelStageType = "decision" | "llm";
+type ModelStageType = "decision" | "llm" | "fact-review";
 const MODEL_STAGE_KEYS: Record<ModelStageType, readonly string[]> = {
   decision: ["type", "model", "timeoutMs", "minConfidence"],
   llm: ["type", "model", "timeoutMs"],
+  "fact-review": ["type", "model", "timeoutMs", "minConfidence"],
 };
 
 function isModelStageType(value: unknown): value is ModelStageType {
-  return value === "decision" || value === "llm";
+  return value === "decision" || value === "llm" || value === "fact-review";
 }
 
 function probability(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1;
 }
 
-function parseConfidence(value: unknown): number | undefined {
+/** Fact review clamps at its native 0.8 minimum; decision accepts the full range. */
+function parseConfidence(type: "decision" | "fact-review", value: unknown): number | undefined {
   if (value === undefined) return undefined;
-  if (!probability(value)) invalid("decision minConfidence");
+  if (!probability(value)) invalid(`${type} minConfidence`);
+  if (type === "fact-review" && value < MIN_FACT_REVIEW_CONFIDENCE) invalid("fact-review minConfidence");
   return value;
 }
 
@@ -89,14 +94,12 @@ function parseModelStage(type: ModelStageType, stage: Record<string, unknown>): 
   if (stage.timeoutMs !== undefined && !integer(stage.timeoutMs, MAX_REVIEW_TIMEOUT_MS)) invalid("classifier timeoutMs");
   const timeout = stage.timeoutMs === undefined ? {} : { timeoutMs: stage.timeoutMs as number };
   if (type === "llm") return { type, model: stage.model, ...timeout };
-  const confidence = parseConfidence(stage.minConfidence);
+  const confidence = parseConfidence(type, stage.minConfidence);
   const threshold = confidence === undefined ? {} : { minConfidence: confidence };
   return { type, model: stage.model, ...timeout, ...threshold };
 }
 
-/** Required, non-empty, and at most one static stage. Exactly one static stage may
- * exist: a second is redundant at best and makes the effective project-edit policy
- * ambiguous. */
+/** At most one static stage: a second makes the effective project-edit policy ambiguous. */
 function parseClassifiers(value: unknown): ClassifierOptions[] {
   if (!Array.isArray(value) || value.length < 1 || value.length > 64) invalid("classifiers");
   const classifiers = value.map(parseClassifier);
@@ -130,16 +133,14 @@ function parseAudit(value: unknown): AuditOptions {
   };
 }
 
-/** Strict validation only; callers must obtain provenance via loadGlobalOptions,
- * never from the SDK's project-merged ctx.options. */
+/** Strict validation only; provenance must come from loadGlobalOptions, never the SDK's project-merged ctx.options. */
 export function parseOptions(value: unknown): AutoModeOptions {
   if (!object(value)) invalid("options");
   only(value, ["classifiers", "reviewTimeoutMs", "breaker", "tui", "audit"]);
   const classifiers = parseClassifiers(value.classifiers);
   const result: AutoModeOptions = {
     classifiers,
-    // In-project edit auto-allow remains the default (owner-approved); a static
-    // stage opts out by setting allowInProjectEdits: false.
+    // In-project edit auto-allow is the default; a static stage opts out with allowInProjectEdits: false.
     allowInProjectEdits: classifiers.some((stage) => stage.type === "static" && stage.allowInProjectEdits !== false),
     tui: true,
     reviewTimeoutMs: DEFAULT_REVIEW_TIMEOUT_MS,

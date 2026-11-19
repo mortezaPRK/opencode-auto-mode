@@ -144,3 +144,141 @@ it("retains the last model rationale across a trailing static abstention", async
   assert.equal(final.stage, "reviewer");
   assert.equal(final.errorKind, undefined);
 });
+
+describe("fact-review stage ordering", () => {
+  const factReview: ClassifierOptions = { type: "fact-review", model: "test-provider/fact-review" };
+  const unexpected = async (): Promise<StageResult> => { throw new Error("must not run"); };
+
+  it("returns the first decisive fact-review allow before later stages", async () => {
+    const calls: string[] = [];
+    const final = await runClassifiers([factReview, llm], request, { band: "high", reason: "review" }, {
+      decision: unexpected,
+      llm: async () => { calls.push("llm"); return result("allow"); },
+      factReview: async (stage) => {
+        calls.push(stage.type);
+        assert.equal(stage.model, "test-provider/fact-review");
+        assert.equal(stage.timeoutMs, undefined);
+        return { decision: "allow", stage: "fact-review", reason: "certified fact review" };
+      },
+    });
+    assert.equal(final.decision, "allow");
+    assert.equal(final.stage, "fact-review");
+    assert.deepEqual(calls, ["fact-review"]);
+  });
+});
+
+describe("fact-review fallback ordering", () => {
+  const factReview: ClassifierOptions = { type: "fact-review", model: "test-provider/fact-review" };
+  const unexpected = async (): Promise<StageResult> => { throw new Error("must not run"); };
+
+  it("keeps ordered fallback for low-confidence and provider abstains", async () => {
+    const abstains: StageResult[] = [
+      { decision: "abstain", stage: "fact-review", reason: "below threshold" },
+      { decision: "abstain", stage: "fact-review", reason: "Fact review unavailable", errorKind: "provider" },
+    ];
+    for (const abstain of abstains) {
+      const seen: string[] = [];
+      let llmCalls = 0;
+      const final = await runClassifiers([factReview, llm], request, { band: "high", reason: "review" }, {
+        decision: unexpected,
+        llm: async () => { llmCalls++; return result("allow"); },
+        factReview: async () => abstain,
+        onResult: (stage) => { seen.push(stage.type); },
+      });
+      assert.equal(final.decision, "allow");
+      assert.equal(llmCalls, 1);
+      assert.deepEqual(seen, ["fact-review", "llm"]);
+    }
+  });
+
+  it("abstains and falls through when the fact-review provider throws", async () => {
+    const final = await runClassifiers([factReview, llm], request, { band: "high", reason: "review" }, {
+      decision: unexpected,
+      llm: async () => result("allow"),
+      factReview: async () => { throw new ReviewFailure("provider", "Fact review down"); },
+    });
+    assert.equal(final.decision, "allow");
+  });
+
+  it("never inserts fact-review into a pipeline that omits it", async () => {
+    let factCalls = 0;
+    const final = await runClassifiers([llm], request, { band: "high", reason: "review" }, {
+      decision: unexpected,
+      llm: async () => result("allow"),
+      factReview: async () => { factCalls++; return result("deny"); },
+    });
+    assert.equal(final.decision, "allow");
+    assert.equal(factCalls, 0);
+  });
+});
+
+describe("fact-review stage guards and cancellation", () => {
+  const factReview: ClassifierOptions = { type: "fact-review", model: "test-provider/fact-review" };
+  const unexpected = async (): Promise<StageResult> => { throw new Error("must not run"); };
+
+  it("abstains through an omitted callback without a terminal failure", async () => {
+    let llmCalls = 0;
+    const final = await runClassifiers([factReview, llm], request, { band: "high", reason: "review" }, {
+      decision: unexpected,
+      llm: async () => { llmCalls++; return result("allow"); },
+    });
+    assert.equal(final.decision, "allow");
+    assert.equal(llmCalls, 1);
+    const alone = await runClassifiers([factReview], request, { band: "high", reason: "review" }, {
+      decision: unexpected,
+      llm: unexpected,
+    });
+    assert.equal(alone.decision, "ask");
+    assert.equal(alone.stage, "fact-review");
+    assert.equal(alone.errorKind, "provider");
+  });
+
+  it("keeps mandatory score guards ahead of fact-review", async () => {
+    let calls = 0;
+    for (const effect of [{ deny: true }, { ask: true }]) {
+      const final = await runClassifiers([factReview], request, { band: "low", reason: "mandatory", ...effect }, {
+        decision: unexpected,
+        llm: unexpected,
+        factReview: async () => { calls++; return result("allow"); },
+      });
+      assert.equal(final.decision, "deny" in effect ? "deny" : "ask");
+      assert.equal(final.stage, "guard");
+    }
+    assert.equal(calls, 0);
+  });
+});
+
+describe("fact-review stage cancellation", () => {
+  const factReview: ClassifierOptions = { type: "fact-review", model: "test-provider/fact-review" };
+  const unexpected = async (): Promise<StageResult> => { throw new Error("must not run"); };
+
+  it("treats cancellation as terminal and skips later stages", async () => {
+    const seen: string[] = [];
+    let llmCalls = 0;
+    const final = await runClassifiers([factReview, llm], request, { band: "high", reason: "review" }, {
+      decision: unexpected,
+      llm: async () => { llmCalls++; return result("allow"); },
+      factReview: async () => ({ decision: "abstain", stage: "fact-review", reason: "cancelled", errorKind: "cancelled" }),
+      onResult: (stage) => { seen.push(stage.type); },
+    });
+    assert.equal(final.decision, "ask");
+    assert.equal(final.errorKind, "cancelled");
+    assert.equal(llmCalls, 0);
+    assert.deepEqual(seen, ["fact-review"]);
+  });
+
+  it("honors an aborted pipeline signal before fact-review", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    let calls = 0;
+    const final = await runClassifiers([factReview], request, { band: "high", reason: "review" }, {
+      signal: controller.signal,
+      decision: unexpected,
+      llm: unexpected,
+      factReview: async () => { calls++; return result("allow"); },
+    });
+    assert.equal(final.decision, "ask");
+    assert.equal(final.errorKind, "cancelled");
+    assert.equal(calls, 0);
+  });
+});

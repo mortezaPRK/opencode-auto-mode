@@ -1590,3 +1590,170 @@ it("does not ask the model to approve an incomplete MCP wildcard scope", async (
     assert.equal(host.calls.generate, 0);
   } finally { await host.cleanup(); }
 });
+
+type NativeDecision = { questions: { name: string; type: string }[]; input: { text: string }[] };
+const inspectionFactAnswer = { answers: [{ type: "choice", name: "inspection", choice: true,
+  probabilities: [{ value: true, probability: 0.95 }, { value: false, probability: 0.05 }] }] };
+
+it("opt-in fact review allows a certified clean inspection through the real permission hook", async () => {
+  const host = await setup({ classifiers: [{ type: "fact-review", model: configuredModel }], audit: { enabled: true } });
+  try {
+    const calls: string[][] = [];
+    const inputs: NativeDecision[] = [];
+    host.ctx.experimental.generate.decisions = async (input) => {
+      const request = input as NativeDecision;
+      calls.push(request.questions.map((question) => question.name));
+      inputs.push(request);
+      return inspectionFactAnswer;
+    };
+    const input = event("ask", "read", [join(host.directory, "README.md")]);
+    await host.evaluate(input);
+    assert.equal(input.effect, "allow");
+    // A certified clean inspection is read-only, so the fact alone allows without review.
+    assert.deepEqual(calls, [["inspection"]]);
+    assert.equal(inputs.length, 1);
+    assert.equal(host.calls.generate, 0);
+    assert.doesNotMatch(inputs[0]!.input[0]!.text, /Perform the requested operation/);
+    assert.deepEqual(host.records().find((entry) => entry.type === "configuration").payload.options.classifiers,
+      [{ type: "fact-review", model: configuredModel }]);
+    assert.equal((host.published[0] as { stage: string }).stage, "fact-review");
+    assert.doesNotMatch(JSON.stringify(host.published), /certifiedOperationFact|sourceInputHash|reviewer-fixture/);
+    const generated = host.records().filter((entry) => entry.type === "generate.decisions.before");
+    assert.equal(generated.length, 1);
+    assert.ok(generated.every((entry) => entry.stageIndex === 0));
+    const starts = host.records().filter((entry) => entry.type === "classifier.start");
+    assert.equal(starts.length, 1); assert.equal(starts[0].stageIndex, 0);
+    assert.equal(starts[0].payload.type, "fact-review");
+    const ends = host.records().filter((entry) => entry.type === "classifier.end");
+    assert.equal(ends.length, 1); assert.equal(ends[0].stageIndex, 0);
+    assert.equal(ends[0].payload.stage, "fact-review");
+  } finally { await host.cleanup(); }
+});
+
+it("fact review below the native floor abstains to the next configured LLM stage", async () => {
+  const host = await setup({ classifiers: [
+    { type: "fact-review", model: configuredModel },
+    { type: "llm", model: configuredModel },
+  ] });
+  try {
+    const calls: string[][] = [];
+    host.ctx.experimental.generate.decisions = async (input) => {
+      const request = input as NativeDecision;
+      calls.push(request.questions.map((question) => question.name));
+      return { answers: [{ type: "choice", name: "inspection", choice: true,
+        probabilities: [{ value: true, probability: 0.89 }, { value: false, probability: 0.11 }] }] };
+    };
+    const input = event("ask", "read", [join(host.directory, "README.md")]);
+    await host.evaluate(input);
+    assert.equal(input.effect, "allow");
+    assert.deepEqual(calls, [["inspection"]]);
+    assert.equal(host.calls.generate, 1);
+    assert.match(host.prompts[0]!, /README\.md/);
+    assert.doesNotMatch(host.prompts[0]!, /certifiedOperationFact/);
+  } finally { await host.cleanup(); }
+});
+
+it("fact review rejects a threshold below its 0.8 floor as invalid configuration", async () => {
+  const host = await setup({ classifiers: [{ type: "fact-review", model: configuredModel, minConfidence: 0.79 }] });
+  try {
+    let decisions = 0;
+    host.ctx.experimental.generate.decisions = async () => { decisions++; return {}; };
+    const input = { ...event(), message: "native ask" };
+    await host.evaluate(input);
+    assert.equal(input.effect, "ask"); assert.equal(input.message, "native ask");
+    assert.equal(host.calls.generate, 0); assert.equal(decisions, 0);
+    const status = statusOf(await host.status());
+    assert.equal(status.mode, "invalid"); assert.match(status.configError!, /minConfidence/);
+  } finally { await host.cleanup(); }
+});
+
+it("mandatory deny guards run before the fact review callback", async () => {
+  const host = await setup({ classifiers: [{ type: "fact-review", model: configuredModel }] });
+  try {
+    let decisions = 0;
+    host.ctx.experimental.generate.decisions = async () => { decisions++; return {}; };
+    const input = event("ask", "read", [join(host.directory, ".env")]);
+    await host.evaluate(input);
+    assert.equal(input.effect, "deny"); assert.match(input.message!, /Protected path/);
+    assert.equal(decisions, 0); assert.equal(host.calls.context, 0); assert.equal(host.calls.generate, 0);
+  } finally { await host.cleanup(); }
+});
+
+it("execute script facts ask one tool question then abstain to the LLM on invalid output", async () => {
+  const host = await setup({ classifiers: [
+    { type: "fact-review", model: configuredModel },
+    { type: "llm", model: configuredModel },
+  ] });
+  try {
+    const calls: string[][] = [];
+    host.ctx.experimental.generate.decisions = async (input) => {
+      const request = input as NativeDecision;
+      calls.push(request.questions.map((question) => question.name));
+      return {};
+    };
+    const input = event("ask", "execute", ["return 42"]);
+    await host.evaluate(input);
+    assert.equal(input.effect, "allow");
+    assert.deepEqual(calls, [["tool_readonly"]]);
+    assert.equal(host.calls.generate, 1);
+    assert.match(host.prompts[0]!, /return 42/);
+  } finally { await host.cleanup(); }
+});
+
+it("allows an in-project edit from one metadata-only fact question", async () => {
+  const host = await setup({ classifiers: [{ type: "fact-review", model: configuredModel }] });
+  try {
+    const names: string[][] = [];
+    host.ctx.experimental.generate.decisions = async (input) => {
+      names.push((input as NativeDecision).questions.map((question) => question.name));
+      return {
+        answers: [{
+          type: "choice", name: "edit_in_project", choice: true,
+          probabilities: [{ value: true, probability: 0.95 }, { value: false, probability: 0.05 }],
+        }],
+      };
+    };
+    const path = join(host.directory, "src", "fixture.ts");
+    const input = { ...event("ask", "edit", [path]), metadata: { filePath: path } };
+    await host.evaluate(input);
+    assert.equal(input.effect, "allow");
+    assert.deepEqual(names, [["edit_in_project"]]);
+    assert.equal(host.calls.generate, 0);
+  } finally { await host.cleanup(); }
+});
+
+it("local edits without host body consent ask one metadata-only question then reach the LLM without event content", async () => {
+  const host = await setup({ classifiers: [
+    { type: "fact-review", model: configuredModel },
+    { type: "llm", model: configuredModel },
+  ] });
+  try {
+    const decisions: NativeDecision[] = [];
+    host.ctx.experimental.generate.decisions = async (input) => {
+      decisions.push(input as NativeDecision);
+      return {};
+    };
+    const path = join(host.directory, "src", "fixture.ts");
+    const input = { ...event("ask", "edit", [path]), metadata: { filePath: path, content: "SECRET_EDIT_BODY" } };
+    await host.evaluate(input);
+    assert.equal(input.effect, "allow");
+    assert.equal(decisions.length, 1);
+    assert.deepEqual(decisions[0]!.questions.map((question) => question.name), ["edit_in_project"]);
+    assert.doesNotMatch(decisions[0]!.input[0]!.text, /SECRET_EDIT_BODY/);
+    assert.equal(host.calls.generate, 1);
+    assert.match(host.prompts[0]!, /fixture\.ts/);
+    assert.doesNotMatch(host.prompts[0]!, /SECRET_EDIT_BODY/);
+  } finally { await host.cleanup(); }
+});
+
+it("fact review stays inactive unless explicitly configured", async () => {
+  const host = await setup();
+  try {
+    let decisions = 0;
+    host.ctx.experimental.generate.decisions = async () => { decisions++; return {}; };
+    const input = event();
+    await host.evaluate(input);
+    assert.equal(input.effect, "allow");
+    assert.equal(decisions, 0); assert.equal(host.calls.generate, 1);
+  } finally { await host.cleanup(); }
+});
