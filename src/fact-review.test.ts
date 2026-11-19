@@ -944,6 +944,25 @@ it("allows exact .9 facts with test-run questions", async () => {
   assert.deepEqual(fake.inputs[2]!.questions, freshReviewQuestions());
 });
 
+it("keeps a cmd.exe shell interpreter in the review evidence", async () => {
+  const fake = pipeline({
+    inspection: inspectionReply(false, 0.02),
+    kind: kindReply("test_run", 0.9),
+    review: reply(reviewAnswer(0.9, 0.9)),
+  });
+  const request: FactReviewRequest = {
+    ...shellRequest("bun test > /tmp/out"),
+    shell: { platform: "win32", interpreter: "cmd.exe" },
+  };
+  const result = await reviewWithOperationFact(fake.ctx, options, request);
+  assert.equal(result.decision, "allow");
+  const evidence = JSON.parse(textOf(fake.inputs.at(-1))) as {
+    platform: string; shell?: { platform?: string; interpreter?: string };
+  };
+  assert.equal(evidence.platform, process.platform);
+  assert.deepEqual(evidence.shell, { platform: "win32", interpreter: "cmd.exe" });
+});
+
 it("certifies shell_segments from one inspection per segment and reaches review", async () => {
   const fake = pipeline({
     inspection: inspectionReply(false, 0.02),

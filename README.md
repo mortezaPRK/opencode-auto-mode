@@ -329,9 +329,11 @@ to the next stage. When a host enables `includeEditPayload` and a consented,
 host-minted, bounded edit body certifies `local_edit` at or above the floor,
 that same body is included as
 `changeContent` in the `safety`/`authorization` review, and the edit is allowed
-only if the fact, `safety`, and `allow` gates all clear. Fact review never
-permits an edit whose body it did not review. Audit behavior is unchanged:
-opt-in, local, and unredacted as described in [Audit](#audit).
+only if the fact, `safety`, and `allow` gates all clear. That body-review
+guarantee is scoped to body-captured `local_edit` facts: a metadata-only
+`project_edit` can allow without capturing or reviewing the edit body. Audit
+behavior is unchanged: opt-in, local, and unredacted as described in
+[Audit](#audit).
 
 ## Safety limits
 
