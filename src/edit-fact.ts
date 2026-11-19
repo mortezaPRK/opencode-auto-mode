@@ -417,6 +417,18 @@ function targetWorktreeRoot(target: string): string | undefined {
 
 type ComponentState = "bad" | "missing" | "ok";
 
+/** Only a live regular file with a single link is an edit target; a missing
+ * path is a creation candidate that the caller's component walk must still
+ * prove, and symlinks, devices, FIFOs and hardlinks are never one-file edits. */
+function plainTarget(target: string): boolean {
+  try {
+    const fact = lstatSync(target);
+    return fact.isFile() && fact.nlink === 1;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT";
+  }
+}
+
 function componentState(target: string): ComponentState {
   try {
     const stat = lstatSync(target);
@@ -489,14 +501,17 @@ function projectPathAllowed(root: string, canonical: string, rel: string): boole
   return policy.kind === "ordinary" && !policy.review;
 }
 
+/** Both policy branches require an existing target to be a regular single-link
+ * file; only a missing suffix stays a creation candidate after the review
+ * branch's component walk. That branch discovers the target's own root, so
+ * `request.worktreeRoot` stays host context rather than proof. */
 function pathBlock(payload: EditPayload, request: EditFactRequest): string | undefined {
   const policy = classifyPath(payload.path, request.projectDir);
   if (policy.kind !== "ordinary") return PATH_POLICY_BLOCK;
-  if (!policy.review) return undefined;
-  // request.worktreeRoot is host context, not proof: the target's own root is
-  // discovered here, so a cross-worktree target uses its own checkout.
   const target = normalizeTarget(payload.path, request.projectDir);
-  return target !== undefined && scopedPath(target) ? undefined : PATH_POLICY_BLOCK;
+  if (target === undefined || !plainTarget(target)) return PATH_POLICY_BLOCK;
+  if (policy.review && !scopedPath(target)) return PATH_POLICY_BLOCK;
+  return undefined;
 }
 
 /** Pre-call gate for the edit fact. Only a factory-minted payload whose capture
@@ -557,23 +572,28 @@ function projectEditScope(request: EditFactRequest): ProjectEditScope | undefine
   return root === undefined ? undefined : { tool, projectDir, root };
 }
 
-function canonicalEditTarget(value: string, projectDir: string): string | undefined {
-  const resolved = normalizeTarget(value, projectDir);
-  return resolved === undefined ? undefined : canonicalTargetPath(resolved);
+/** The spelling prefix of `resolved` that resolves to the checkout root, so a
+ * symlinked root spelling still anchors the component walk. */
+function rootSpelling(root: string, resolved: string): string | undefined {
+  let current = resolved;
+  while (true) {
+    try {
+      if (realpathSync(current) === root) return current;
+    } catch { /* missing suffix: climb to the nearest existing prefix */ }
+    const parent = dirname(current);
+    if (parent === current) return undefined;
+    current = parent;
+  }
 }
 
 interface ProjectTarget { readonly canonical: string; readonly rel: string }
 
 /** Existing components must stay non-symlink and a final file must have one link;
- * a missing suffix is a new file only while every existing ancestor is safe. */
-function safeProjectTarget(projectDir: string, resolved: string, canonical: string): boolean {
-  if (!clearComponents(projectDir, resolved)) return false;
-  try {
-    const fact = lstatSync(canonical);
-    return fact.isFile() && fact.nlink === 1;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "ENOENT";
-  }
+ * a missing suffix is a new file only while every existing ancestor below the
+ * containment root is safe. */
+function safeProjectTarget(root: string, resolved: string, canonical: string): boolean {
+  const base = rootSpelling(root, resolved);
+  return base !== undefined && clearComponents(base, resolved) && plainTarget(canonical);
 }
 
 function projectTarget(value: unknown, scope: ProjectEditScope): ProjectTarget | undefined {
@@ -581,32 +601,34 @@ function projectTarget(value: unknown, scope: ProjectEditScope): ProjectTarget |
   const resolved = normalizeTarget(value, scope.projectDir);
   const canonical = resolved === undefined ? undefined : canonicalTargetPath(resolved);
   if (resolved === undefined || canonical === undefined) return undefined;
-  if (!isInside(scope.root, canonical) || !safeProjectTarget(scope.projectDir, resolved, canonical))
+  if (!isInside(scope.root, canonical) || !safeProjectTarget(scope.root, resolved, canonical))
     return undefined;
   const rel = relative(scope.root, canonical);
   if (!projectPathAllowed(scope.root, canonical, rel)) return undefined;
   return { canonical, rel };
 }
 
-/** Every supplied alias must agree on one canonical captured target. */
-function argumentTarget(operation: OperationEvidence | undefined, projectDir: string): string | undefined {
+/** Original argument aliases get the full target policy, not only
+ * canonicalization: a protected or symlink designation must not ride an
+ * ordinary resource path onto the same canonical file. */
+function argumentTarget(operation: OperationEvidence | undefined,
+  scope: ProjectEditScope): string | undefined {
   const args = operation?.arguments;
   if (!isRecord(args)) return undefined;
   const targets = new Set<string>();
   for (const key of ["path", "filePath"]) {
     const value = args[key];
     if (value === undefined) continue;
-    if (typeof value !== "string") return undefined;
-    const canonical = canonicalEditTarget(value, projectDir);
-    if (canonical === undefined) return undefined;
-    targets.add(canonical);
+    const target = projectTarget(value, scope);
+    if (target === undefined) return undefined;
+    targets.add(target.canonical);
   }
   return targets.size === 1 ? [...targets][0] : undefined;
 }
 
 function projectEditTargets(request: EditFactRequest, scope: ProjectEditScope): string[] | undefined {
   const values = projectScopeValues(request);
-  const captured = argumentTarget(request.operation, scope.projectDir);
+  const captured = argumentTarget(request.operation, scope);
   if (values === undefined || values.length > MAX_TARGETS || captured === undefined) return undefined;
   const canonical = new Set<string>();
   const relatives = new Set<string>();
