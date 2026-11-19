@@ -472,8 +472,8 @@ describe("v2 permission orchestration", () => {
       const requests: unknown[] = [];
       host.ctx.experimental.generate.decisions = async (input) => {
         requests.push(input);
-        return { answers: [{ name: "permission", type: "choice", choice: "allow", confidence: 0.99,
-          probabilities: [{ value: "allow", probability: 0.99 }, { value: "deny", probability: 0.005 }, { value: "ask", probability: 0.005 }] }] };
+        return { answers: [{ type: "predicate", name: "safety", probability: 0.99 },
+          { type: "predicate", name: "authorization", probability: 0.99 }] };
       };
       const input = event(); await host.evaluate(input); assert.equal(input.effect, "allow");
       assert.equal(requests.length, 1); assert.equal(host.calls.generate, 0);

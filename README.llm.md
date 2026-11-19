@@ -32,9 +32,12 @@ Sources of truth checked for this guide:
   project-merged `ctx.options` and rejects duplicate registrations or ambiguous
   global files.
 - **Data egress:** a configured `decision` or `llm` stage sends the action and
-  resources (including full Code Mode source), agent, project/worktree, git
-  state, and up to 12 KB of user messages to that stage's model provider, even
-  when audit is disabled. The `static` stage makes no model call.
+  resources (including full Code Mode source), project/worktree, and up to 12 KB
+  of user text to that stage's model provider, even when audit is disabled. The
+  decision stage sends compact evidence plus selected operation details. The llm
+  stage also receives the agent and broader bounded review evidence. The llm
+  stage always includes Git state; the decision stage includes it only for
+  git-related actions. The `static` stage makes no model call.
 - Registration strings and option values do **not** support OpenCode
   `{env:...}` or `{file:...}` substitution. Write concrete values after the user
   chooses them.
@@ -146,15 +149,27 @@ Classifier stages:
 | Stage | Shape | Behavior |
 | --- | --- | --- |
 | `static` | `{type:"static", allowInProjectEdits?: boolean}` | Allows low-risk reads and verified in-project edits. `allowInProjectEdits: false` keeps edit/write actions out of static allows. |
-| `decision` | `{type:"decision", model, timeoutMs?, minConfidence?}` | Native `ctx.experimental.generate.decisions` only. Defaults: timeout 3000, confidence 0.9. |
+| `decision` | `{type:"decision", model, timeoutMs?, minConfidence?}` | Native `ctx.experimental.generate.decisions` only. Asks `safety` and `authorization` predicates; allows only when **both** probabilities meet `minConfidence`. Defaults: timeout 3000, per-predicate floor 0.9. Never denies; ordinary abstentions continue; terminal loss is incomplete wildcard-only evidence or external directory with no verified target. |
 | `llm` | `{type:"llm", model, timeoutMs?}` | Native `ctx.experimental.generate.text` reviewer. `model` is explicit and required. |
 
-Both model stages receive complete bounded action evidence, selected static findings,
-and chronological user-message boundaries. The LLM replies with one nonempty
-`ALLOW:`, `DENY:`, or `HUMAN_REVIEW:` reason. Intentional human review abstains and
-continues configured stages; malformed output remains a separate failure. A trailing
-static abstention preserves the last model rationale. This contract does not guarantee
-that a model will reason correctly about authorization.
+The decision stage receives compact evidence: action and resources, an optional
+selected operation (tool, access, targets and selected arguments) from host
+metadata and the captured tool call when available, one chronological
+user-message source, concrete static-analysis findings, and git state only for
+git-related actions. Raw metadata/source blobs and agent prose are not sent.
+Operation evidence is marked incomplete when selection, privacy bounds, or
+correlation are lost; shared call identities or skipped outer execute snapshots
+can leave the capture unavailable or ambiguous, and it is not guessed. Network
+and query values remain literal arguments/resources, not filesystem targets.
+Arbitrary payload keys are redacted; common search/query fields remain literal
+evidence.
+
+The LLM stage receives bounded review evidence, selected static findings, and
+chronological user-message boundaries. It replies with one nonempty `ALLOW:`,
+`DENY:`, or `HUMAN_REVIEW:` reason. Intentional human review abstains and
+continues configured stages; malformed output remains a separate failure. A
+trailing static abstention preserves the last model rationale. This contract does
+not guarantee that a model will reason correctly about authorization.
 
 Stages run in array order. The first decisive allow or deny stops the chain.
 Abstention, low confidence, invalid output, provider errors, and stage-local timeouts
@@ -181,6 +196,41 @@ Per-stage timeouts are bounded by `reviewTimeoutMs`.
   ask keeps its prompt. Paused mode never automatically allows.
 - `/auto-mode on` resumes and resets the breaker.
 - Session state is stored through `ctx.storage` and survives plugin reloads.
+
+## Decision predicate contract
+
+The decision stage is allow-or-abstain. It asks two separate predicate questions
+with the exact names `safety` and `authorization`; they are not claimed to be
+statistically independent. It allows only when **both** probabilities meet
+`minConfidence`; otherwise it abstains. Malformed output, refusals, missing or
+duplicated answers, out-of-range probabilities, provider errors, and timeouts
+abstain. It never denies.
+
+`minConfidence` is a probability floor applied separately to each predicate, not
+a confidence in a selected label and not a calibrated certainty guarantee. The
+default is `0.9`; lowering it is more permissive because both predicates must
+still clear it. The plugin does not auto-tune thresholds, rewrite config, or
+treat replay agreement as calibration.
+
+Pre-generation abstention is distinct from model abstention. Ordinary incomplete
+operation evidence, an oversized request, or a Code Mode identity mismatch
+abstains before a model call. Terminal evidence loss is limited to resource-body
+redaction, an external directory without a verified target, or an explicitly
+incomplete operation whose only resources are `*`; these resolve to **ask**.
+Final terminal checks also use the normalized decision evidence, so normalization
+loss cannot be bypassed. A complete unknown MCP operation with sanitized
+arguments is not terminal: it remains model-reviewed. Unknown capability is not
+structurally safe; safety probability must account for it. The LLM may infer
+semantics from the exact tool and arguments, but there is no declared
+verification. Test runners are not assumed safe by label; assess their actual
+effects. Invalid configuration is passthrough, not abstention. An ordinary
+abstain continues; a malformed model answer is an `invalid-output` fallback, not
+a deny.
+
+Fallback limits: the LLM is a separate reviewer, not ground truth. Its allow does
+not prove the decision stage's uncertainty was resolved, and its deny is not a
+calibrated label. Recorded audits are evidence of what happened, not correctness
+labels. Evaluate disagreements and malformed/error/fallback rates.
 
 ## Guardrails and Code Mode
 
@@ -319,7 +369,7 @@ read-only before changing it.
 | `XDG_CONFIG_HOME must be absolute` or a `Policy file`/`Policy path` rejection | Use an absolute `XDG_CONFIG_HOME`; put config outside the repository; remove symlinks; make it user-owned, not group/other-writable, single-hardlinked, and not inside the current project. Non-writable system-owned parents are allowed. |
 | `Unknown auto-mode option '<name>'` | Remove removed/unknown keys. Runtime errors do not suggest replacements. |
 | Review never uses a model | A static-only chain asks when static abstains. Add a valid `decision` or `llm` stage. |
-| Decision stage always abstains | Provider must support native decisions; lower confidence or check provider support. Otherwise remove the stage. |
+| Decision stage always abstains | Check whether `safety`, `authorization`, or both fall below `minConfidence`; inspect probability distributions and malformed/error counts. Provider must support native predicate decisions. Lowering the floor is more permissive but not calibrated; otherwise remove the stage. |
 | No prompts appear | Check client Auto/YOLO and native permissions. Plugin asks can be auto-approved by the client. |
 | Desktop pill `Review unavailable` or `status unavailable`; command appends a status/storage error without `Review disabled` | This is not necessarily a config error. Retry, then check session storage and the status RPC. A storage failure during review resolves to `ask`. |
 | Review latency too high | Prefer a `static` stage; tune `reviewTimeoutMs` and per-stage timeouts; remove unused model stages. |

@@ -1,8 +1,16 @@
 import { Model } from "@opencode/schema/model";
 import type { Generate } from "@opencode/schema/generate";
 import { errorKindOf, EvidenceFailure, terminalEvidence, ReviewFailure } from "./errors.js";
-import { AUTHORITY_RULES, reviewEvidence, terminalEvidenceReason, type PermissionRequest, type ReviewErrorObserver, type StageResult } from "./reviewer.js";
+import { formatProbability, isProbability, isRecord, MAX_REQUEST_BYTES } from "./guards.js";
+import { isOpaqueOperationLoss, type ReviewErrorObserver, type StageResult } from "./reviewer.js";
 import { withTimeout } from "./timeout.js";
+import {
+  buildDecisionEvidence,
+  DECISION_AUTHORIZATION_INSTRUCTIONS,
+  DECISION_SAFETY_INSTRUCTIONS,
+  type DecisionEvidence,
+  type DecisionEvidenceRequest,
+} from "./decision-evidence.js";
 
 export interface DecisionOptions { model: string; timeoutMs?: number; minConfidence?: number }
 export type DecisionInput = Omit<Generate.DecisionRequest, "input"> & { input: readonly { type: "text"; text: string }[] };
@@ -11,72 +19,96 @@ export interface DecisionContext {
     decisions(input: DecisionInput, options: { signal: AbortSignal }): Promise<unknown>;
   } };
 }
-const MAX_REQUEST_BYTES = 65_536;
+
+export { buildDecisionEvidence, DECISION_AUTHORIZATION_INSTRUCTIONS, DECISION_SAFETY_INSTRUCTIONS };
+export type { DecisionEvidence, DecisionEvidenceRequest, OperationEvidence } from "./decision-evidence.js";
+
+const PREDICATES = ["safety", "authorization"] as const;
+type Predicate = (typeof PREDICATES)[number];
 const DEFAULT_TIMEOUT_MS = 3_000;
 const DEFAULT_MIN_CONFIDENCE = 0.9;
-const criteria = {
-  allow: "The whole action is safe and authorized for this exact scope.",
-  deny: "A prohibition or unsafe action is established; suspicious names or missing facts alone are not sufficient.",
-  ask: "Safety, authorization or impact is uncertain; abstain from this decision.",
-};
-const object = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
-const probability = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1;
-const isChoice = (value: unknown): value is keyof typeof criteria => typeof value === "string" && Object.hasOwn(criteria, value);
+const isPredicate = (value: string): value is Predicate => (PREDICATES as readonly string[]).includes(value);
 
-type DecisionAnswer = { choice: keyof typeof criteria; confidence: number; probabilities: readonly unknown[] };
+type PredicateAnswer = { type: "predicate"; name: Predicate; probability: number };
 
-function answerOf(parsed: unknown): DecisionAnswer {
-  const answers = object(parsed) ? parsed.answers : undefined;
-  const answer = Array.isArray(answers) && answers.length === 1 ? answers[0] : undefined;
-  if (!object(answer) || answer.name !== "permission" || answer.type !== "choice" || !isChoice(answer.choice) ||
-      !probability(answer.confidence) || !Array.isArray(answer.probabilities))
-    throw new ReviewFailure("invalid-output", "Invalid decision answer");
-  return { choice: answer.choice, confidence: answer.confidence, probabilities: answer.probabilities };
+function predicateAnswer(value: unknown): value is PredicateAnswer {
+  return isRecord(value) && value.type === "predicate" && typeof value.name === "string" &&
+    isPredicate(value.name) && isProbability(value.probability);
 }
 
-function distributionOf(probabilities: readonly unknown[]): Map<keyof typeof criteria, number> {
-  const distribution = new Map<keyof typeof criteria, number>();
-  for (const entry of probabilities) {
-    if (!object(entry) || !isChoice(entry.value) || !probability(entry.probability) || distribution.has(entry.value))
-      throw new ReviewFailure("invalid-output", "Invalid decision probabilities");
-    distribution.set(entry.value, entry.probability);
+function predicateProbabilities(parsed: unknown): Record<Predicate, number> {
+  const answers = isRecord(parsed) ? parsed.answers : undefined;
+  if (!Array.isArray(answers) || answers.length !== PREDICATES.length)
+    throw new ReviewFailure("invalid-output", "Invalid decision answers");
+  const found = new Map<Predicate, number>();
+  for (const answer of answers) {
+    if (!predicateAnswer(answer) || found.has(answer.name))
+      throw new ReviewFailure("invalid-output", "Invalid decision predicate answer");
+    found.set(answer.name, answer.probability);
   }
-  return distribution;
+  const safety = found.get("safety");
+  const authorization = found.get("authorization");
+  if (safety === undefined || authorization === undefined)
+    throw new ReviewFailure("invalid-output", "Missing decision predicate answer");
+  return { safety, authorization };
 }
 
-function assertConsistent(distribution: Map<keyof typeof criteria, number>, choice: keyof typeof criteria): void {
-  const selected = distribution.get(choice);
-  const values = [...distribution.values()];
-  if (distribution.size !== 3 || selected === undefined || Math.abs(values.reduce((a, b) => a + b, 0) - 1) > 0.01 || selected < Math.max(...values))
-    throw new ReviewFailure("invalid-output", "Inconsistent decision probabilities");
-}
-
+/** Allow only when both separate predicates clear the configured threshold.
+ * Low confidence abstains; the initial decision stage never issues a deny. */
 function verdict(parsed: unknown, threshold: number): StageResult {
-  const answer = answerOf(parsed);
-  const distribution = distributionOf(answer.probabilities);
-  assertConsistent(distribution, answer.choice);
-  const selected = distribution.get(answer.choice) ?? 0;
-  if (answer.choice === "ask" || answer.confidence < threshold || selected < threshold)
-    return { decision: "abstain", stage: "decision", reason: "Decision stage abstained below the confidence threshold" };
-  return { decision: answer.choice as "allow" | "deny", stage: "decision", reason: `Decision stage verdict (confidence ${answer.confidence})` };
+  const { safety, authorization } = predicateProbabilities(parsed);
+  const summary = `safety=${formatProbability(safety)}, authorization=${formatProbability(authorization)}`;
+  const below: Predicate[] = [];
+  if (safety < threshold) below.push("safety");
+  if (authorization < threshold) below.push("authorization");
+  if (below.length === 0)
+    return { decision: "allow", stage: "decision", reason: `Decision predicates met threshold ${formatProbability(threshold)} (${summary})` };
+  return {
+    decision: "abstain", stage: "decision",
+    reason: `Decision predicates below threshold ${formatProbability(threshold)} for ${below.join(" and ")} (${summary})`,
+  };
 }
 
 function decisionQuestions(): Generate.DecisionQuestion[] {
-  return [{ name: "permission", type: "choice",
-    instructions: `Evaluate the whole pending action and its blast radius, including command chains, scripts, deletes, egress and history changes. ${AUTHORITY_RULES} Choose ask when safety, authorization or temporal scope is uncertain.`,
-    choices: Object.entries(criteria).map(([value, description]) => ({ value, description })),
-  }];
+  return [
+    { type: "predicate", name: "safety", instructions: DECISION_SAFETY_INSTRUCTIONS },
+    { type: "predicate", name: "authorization", instructions: DECISION_AUTHORIZATION_INSTRUCTIONS },
+  ];
+}
+
+function opaqueOperation(evidence: DecisionEvidence, request: DecisionEvidenceRequest): boolean {
+  const normalized = { ...request, operation: evidence.operation };
+  return isOpaqueOperationLoss(request) || isOpaqueOperationLoss(normalized) ||
+    (request.action === "external_directory" && (evidence.operation?.targets?.length ?? 0) === 0);
+}
+
+/** Only opaque scope loss and resource-level HTTP-body loss are terminal. Ordinary
+ * operation or delegation incompleteness abstains non-terminally so a configured
+ * fallback classifier can still review the retained evidence. */
+function incomplete(evidence: DecisionEvidence, request: DecisionEvidenceRequest): StageResult | undefined {
+  if (evidence.incompleteEvidenceKind === "resources") throw new EvidenceFailure("Incomplete decision evidence");
+  if (opaqueOperation(evidence, request)) throw new EvidenceFailure("Opaque operation evidence");
+  if (evidence.incompleteEvidenceKind === "delegations")
+    return {
+      decision: "abstain", stage: "decision", errorKind: "context",
+      reason: "Decision delegation evidence incomplete; abstained before generation",
+    };
+  if (evidence.incompleteEvidenceKind !== "operation" && evidence.operation?.complete !== false) return undefined;
+  return {
+    decision: "abstain", stage: "decision", errorKind: "context",
+    reason: "Decision operation evidence incomplete; abstained before generation",
+  };
 }
 
 function limits(options: DecisionOptions): { timeoutMs: number; minConfidence: number } {
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const minConfidence = options.minConfidence ?? DEFAULT_MIN_CONFIDENCE;
-  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0 || !probability(minConfidence))
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0 || !isProbability(minConfidence))
     throw new ReviewFailure("context", "Invalid decision options");
   return { timeoutMs, minConfidence };
 }
 
-function decisionInput(options: DecisionOptions, evidence: ReturnType<typeof reviewEvidence>): DecisionInput {
+function decisionInput(options: DecisionOptions, evidence: DecisionEvidence): DecisionInput {
   const input: DecisionInput = {
     model: Model.Ref.parse(options.model),
     input: [{ type: "text", text: JSON.stringify(evidence) }],
@@ -101,18 +133,14 @@ function failureResult(error: unknown, signal: AbortSignal | undefined, bounded:
 }
 
 /** Native stateless generation only. Unsupported providers and uncertain answers abstain. */
-export async function decisionStage(ctx: DecisionContext, options: DecisionOptions, request: PermissionRequest, signal?: AbortSignal, onError?: ReviewErrorObserver): Promise<StageResult> {
+export async function decisionStage(ctx: DecisionContext, options: DecisionOptions, request: DecisionEvidenceRequest, signal?: AbortSignal, onError?: ReviewErrorObserver): Promise<StageResult> {
   let bounded: AbortSignal | undefined;
   try {
     if (signal?.aborted) throw new ReviewFailure("cancelled", "Decision cancelled");
     const { timeoutMs, minConfidence } = limits(options);
-    // Opaque scope and HTTP-body loss stay terminal for every stage. Ordinary
-    // operation incompleteness (for example an omitted edit payload) does not:
-    // this stage abstains non-terminally so a configured fallback still reviews.
-    if (terminalEvidenceReason(request) !== undefined) throw new EvidenceFailure("Incomplete decision evidence");
-    const evidence = reviewEvidence(request);
-    if (evidence.incompleteEvidence !== undefined)
-      return { decision: "abstain", stage: "decision", reason: "Operation evidence is incomplete; deferring to later classifiers" };
+    const evidence = buildDecisionEvidence(request);
+    const early = incomplete(evidence, request);
+    if (early) return early;
     const input = decisionInput(options, evidence);
     bounded = boundedSignal(signal, timeoutMs);
     const response = await withTimeout(ctx.experimental.generate.decisions(input, { signal: bounded }), timeoutMs, signal);
