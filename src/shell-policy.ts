@@ -2250,7 +2250,7 @@ function hasPrintfVariableOption(args: readonly string[]): boolean {
   return false;
 }
 
-/** True when `find` uses an output or files-from option that writes or reads files. */
+/** True only when `find` has no output (`-fprint`, `-fprint0`, `-fprintf`, `-fls`) or files-from option. */
 function isReadOnlyFind(args: readonly string[]): boolean {
   return !args.some((arg) => /^--?(?:fprint|fprint0|fprintf|fls)$/.test(arg) || /^--?files0/.test(arg));
 }
