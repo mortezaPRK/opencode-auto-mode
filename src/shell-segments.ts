@@ -1,8 +1,9 @@
 /**
  * Conservative top-level shell segmentation. Pure and structural: never decides
  * whether a command is safe or authorized, and anything it cannot represent
- * exactly returns `undefined`. At most one leading literal `cd <path>` joined by
- * `&&`, `;` or a newline folds into a caller-resolved cwd.
+ * exactly returns `undefined`. At most one leading literal `cd <path>` in an
+ * unbroken `&&` chain folds into a caller-resolved cwd: only there does a failed
+ * `cd` abort every later segment, so the suffix always runs in that directory.
  */
 
 import { DYNAMIC, STATEFUL } from "./shell-policy.js";
@@ -26,12 +27,13 @@ const STATEFUL_COMMANDS = new Set([
   "cd", "pushd", "popd", "builtin", "command", "env", "sh", "bash", "zsh", "sudo",
   // Mutate state a later segment reads: command lookup (`hash`, `enable`, PATH
   // assignment), variables (`read`, `mapfile`, `readarray`, `getopts`,
-  // `printf -v`, `let`, `shift`), limits and shell/readline configuration
+  // `printf -v`, `let`, `shift`, and `test`/`[` whose `-v` array subscript is
+  // evaluated as an assignment), limits and shell/readline configuration
   // (`ulimit`, `bind`, `complete`, `compopt`), and history replay (`fc`).
   // Rejected by name, whatever the arguments, because an option can carry the
   // mutation.
   "hash", "read", "mapfile", "readarray", "getopts", "printf", "let", "shift",
-  "ulimit", "enable", "bind", "complete", "compopt", "fc",
+  "ulimit", "enable", "bind", "complete", "compopt", "fc", "test", "[",
 ]);
 
 /** Words that open or continue a compound command, so the rest is not top-level. */
@@ -241,8 +243,9 @@ function cdTarget(segment: string): string | undefined {
   return unrepresentable ? undefined : target;
 }
 
-function foldableSeparator(separator: string | undefined): boolean {
-  return separator === "&&" || separator === ";" || separator === "\n";
+/** A failed `cd` aborts every later segment only across an unbroken `&&` chain. */
+function abortingChain(separators: readonly string[]): boolean {
+  return separators.every((separator) => separator === "&&");
 }
 
 /** Syntax this scanner refuses before scanning: expansions, comments and
@@ -260,11 +263,11 @@ export function splitShellSegmentsWithLeadingCd(command: string): ShellSegmentSp
   if (scanned === undefined) return undefined;
   const segments = cleanSegments(scanned);
   if (segments === undefined) return undefined;
-  const folded = segments.length > 1 && foldableSeparator(scanned.separators[0])
-    ? cdTarget(segments[0]!)
-    : undefined;
-  const remaining = folded === undefined ? segments : segments.slice(1);
-  if (remaining.some(unreadableSegment)) return undefined;
-  if (folded === undefined) return { segments };
-  return { segments: remaining, leadingCd: folded };
+  const target = segments.length > 1 ? cdTarget(segments[0]!) : undefined;
+  if (target === undefined) {
+    return segments.some(unreadableSegment) ? undefined : { segments };
+  }
+  const remaining = segments.slice(1);
+  if (!abortingChain(scanned.separators) || remaining.some(unreadableSegment)) return undefined;
+  return { segments: remaining, leadingCd: target };
 }

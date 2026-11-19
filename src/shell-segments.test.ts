@@ -138,19 +138,29 @@ it("rejects empty segments and more than eight segments", () => {
     Array.from({ length: 8 }, () => "grep a f"));
 });
 
-it("folds one leading literal cd joined by &&, ; or a newline", () => {
+it("folds one leading literal cd joined by an unbroken && chain", () => {
   assert.deepEqual(splitShellSegmentsWithLeadingCd("cd /repo/sub && git status && git log -3"),
     { segments: ["git status", "git log -3"], leadingCd: "/repo/sub" });
-  assert.deepEqual(splitShellSegmentsWithLeadingCd("cd /repo/sub; ls"),
-    { segments: ["ls"], leadingCd: "/repo/sub" });
-  assert.deepEqual(splitShellSegmentsWithLeadingCd("cd /repo/sub\nls"),
-    { segments: ["ls"], leadingCd: "/repo/sub" });
   assert.deepEqual(splitShellSegmentsWithLeadingCd(`cd '/repo/my dir' && ls`),
     { segments: ["ls"], leadingCd: "/repo/my dir" });
   assert.deepEqual(splitShellSegmentsWithLeadingCd(`cd "/repo/my dir" && ls`),
     { segments: ["ls"], leadingCd: "/repo/my dir" });
   assert.deepEqual(splitShellSegmentsWithLeadingCd("cd .. && git status"),
     { segments: ["git status"], leadingCd: ".." });
+});
+
+it("never folds a leading cd a failed cd would not abort", () => {
+  // A failed `cd` leaves the shell where it was, so any suffix that can still
+  // run (`;`, newline, `||`, `|`) makes the folded directory a guess.
+  for (const command of [
+    "cd ./missing; pwd",
+    "cd ./missing\npwd",
+    "cd ./missing && echo ok || pwd",
+    "cd ./x && a | b",
+    "cd ./x && a; b",
+  ]) unresolved(command);
+  assert.deepEqual(splitShellSegmentsWithLeadingCd("cd ./x && a && b"),
+    { segments: ["a", "b"], leadingCd: "./x" });
 });
 
 it("never folds a non-literal, option, option-like, repeated or unjoined cd", () => {
@@ -180,7 +190,7 @@ it("never folds a non-literal, option, option-like, repeated or unjoined cd", ()
 it("folds a leading cd instead of returning it as a plain segment", () => {
   assert.deepEqual(splitShellSegmentsWithLeadingCd("cd /repo/sub && git status"),
     { segments: ["git status"], leadingCd: "/repo/sub" });
-  assert.deepEqual(splitShellSegmentsWithLeadingCd("cd /repo/sub; ls"),
+  assert.deepEqual(splitShellSegmentsWithLeadingCd("cd /repo/sub && ls"),
     { segments: ["ls"], leadingCd: "/repo/sub" });
   assert.deepEqual(splitShellSegmentsWithLeadingCd("grep a f"),
     { segments: ["grep a f"] });
@@ -238,6 +248,11 @@ it("rejects stateful builtins whatever their arguments", () => {
     "complete -W x y; git status",
     "compopt -o nospace; git status",
     "fc -s; git status",
+    // `test`/`[` `-v` evaluates an array subscript, so `ARR[PATH=0]` assigns.
+    "test -v 'BASH_VERSINFO[PATH=0]'; git status",
+    "test -v ARR[PATH=0]; git status",
+    "[ -v 'ARR[PATH=0]' ]; git status",
+    "test -f x && git status",
   ]) unresolved(command);
 });
 
