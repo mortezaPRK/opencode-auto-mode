@@ -46,6 +46,14 @@ it("does not infer credentials from general configuration, generic names or publ
   });
 });
 
+it("normalises native separators before the spelling checks", () => {
+  fixture((root, roots) => {
+    for (const name of ["auth\\settings.json", "src\\.config\\settings.json"])
+      assert.equal(classifyPath(name, root, roots).review, true, name);
+    assert.equal(classifyPath("src\\parser.ts", root, roots).review, false);
+  });
+});
+
 it("resolves bare aliases and alias/.. without classifying an abandoned directory as an access", () => {
   fixture((root, roots) => {
     mkdirSync(join(roots.home, ".ssh"));

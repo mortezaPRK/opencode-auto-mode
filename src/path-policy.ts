@@ -85,12 +85,16 @@ export function envName(candidate?: string): boolean {
   return /^\.env(?:\..+)?$/.test(name) && !/^\.env(?:\.[a-zA-Z0-9_-]+)?\.(?:example|sample|template)$/.test(name);
 }
 
+/** Spelling checks read both separator spellings: a native Windows path can
+ * arrive on any host, where `\` would otherwise hide a component boundary.
+ * Filesystem resolution keeps the original spelling; only these checks fold it. */
 function reviewSpelling(target: string): boolean {
-  if (/(?:^|\/)\.(?!\.?(?:\/|$))[^/]+/.test(target)) return true;
-  if (/\.(?:[cm]?[jt]sx?|py|go|rs|md)$/.test(target)) return false;
-  return /(?:^|\/)(?:auth|tokens?|secrets?|credentials?|kubeconfig|id_(?:rsa|dsa|ecdsa|ed25519))(?:[./_-]|$)/i.test(target) ||
-    /(?:private[_-]?key|secret|password|passwd|service[-_]?account|terraform\.tfstate)/i.test(target) ||
-    PROTECTED_SUFFIX.test(target);
+  const spelling = target.replace(/\\/g, "/");
+  if (/(?:^|\/)\.(?!\.?(?:\/|$))[^/]+/.test(spelling)) return true;
+  if (/\.(?:[cm]?[jt]sx?|py|go|rs|md)$/.test(spelling)) return false;
+  return /(?:^|\/)(?:auth|tokens?|secrets?|credentials?|kubeconfig|id_(?:rsa|dsa|ecdsa|ed25519))(?:[./_-]|$)/i.test(spelling) ||
+    /(?:private[_-]?key|secret|password|passwd|service[-_]?account|terraform\.tfstate)/i.test(spelling) ||
+    PROTECTED_SUFFIX.test(spelling);
 }
 
 /** This is only used when shell lexical provenance establishes expansion. */

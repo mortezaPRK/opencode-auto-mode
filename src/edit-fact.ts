@@ -470,6 +470,16 @@ function scopedPath(target: string): boolean {
   return policy.kind === "ordinary" && !policy.review;
 }
 
+/** The payload's own spelling is evidence too: `classifyPath` realpaths the
+ * project directory, so a link component in that spelling would otherwise stay
+ * invisible on the review-free branch. The outermost spelling that resolves to
+ * the target's own checkout root stays permitted, so root aliases keep working. */
+function originalSpellingAllowed(target: string, projectDir: string | undefined): boolean {
+  const root = targetWorktreeRoot(target) ?? canonicalPath(projectDir ?? process.cwd());
+  const base = rootSpelling(root, target);
+  return base !== undefined && clearComponents(base, target);
+}
+
 /** A relative root is never widened into the process directory, and the
  * compatibility-only `worktreeRoot` declaration is never containment proof:
  * only a Git root discovered from the project directory may widen it, with the
@@ -537,7 +547,8 @@ function pathBlock(payload: EditPayload, request: EditFactRequest): string | und
   if (policy.kind !== "ordinary") return PATH_POLICY_BLOCK;
   const target = normalizeTarget(payload.path, request.projectDir);
   if (target === undefined || !plainTarget(target)) return PATH_POLICY_BLOCK;
-  if (policy.review && !scopedPath(target)) return PATH_POLICY_BLOCK;
+  if (policy.review ? !scopedPath(target) : !originalSpellingAllowed(target, request.projectDir))
+    return PATH_POLICY_BLOCK;
   return undefined;
 }
 

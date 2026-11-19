@@ -12,6 +12,7 @@ const OUTSIDE = realpathSync(mkdtempSync(join(tmpdir(), "edit-fact-outside-")));
 const DECLARED = realpathSync(mkdtempSync(join(tmpdir(), "edit-fact-declared-")));
 const ALIAS = join(dirname(ROOT), `edit-fact-alias-${process.pid}`);
 const PROJECT = join(ROOT, "packages", "a");
+const PROJECT_ALIAS = join(ROOT, "project-alias");
 const SIBLING = join(ROOT, "packages", "b");
 const IDENTITY = { sessionID: "session-1", messageID: "message-1", callID: "call-1" } as const;
 
@@ -34,6 +35,7 @@ symlinkSync(join(SIBLING, "real"), join(SIBLING, "inner"));
 symlinkSync(join(OUTSIDE, "child"), join(ROOT, "escape"));
 symlinkSync(ROOT, join(ROOT, "loop"));
 symlinkSync(ROOT, ALIAS);
+symlinkSync(PROJECT, PROJECT_ALIAS);
 after(() => {
   unlinkSync(ALIAS);
   rmSync(ROOT, { recursive: true, force: true });
@@ -51,11 +53,15 @@ function mint(tool: "edit" | "write", path: string): EditPayload {
 }
 
 function fullRequest(tool: "edit" | "write", path: string): EditFactRequest {
+  return relativeRequest(tool, path, PROJECT);
+}
+
+function relativeRequest(tool: "edit" | "write", path: string, projectDir: string): EditFactRequest {
   const payload = mint(tool, path);
   return {
     action: tool,
     resources: [path],
-    projectDir: PROJECT,
+    projectDir,
     operation: { tool, access: "write", targets: [path], arguments: { path }, complete: true },
     editPayload: payload,
     expectedEditCapture: payload.capture,
@@ -97,6 +103,13 @@ it("keeps regular single-link and missing targets eligible for the full payload"
     const result = prepareEditCandidate(fullRequest("edit", target), true);
     if (!result.ok) assert.fail(`${target}: ${result.reason}`);
   }
+});
+
+it("validates the original relative spelling below a symlinked project directory", () => {
+  const blocked = prepareEditCandidate(relativeRequest("edit", "parser.ts", PROJECT_ALIAS), true);
+  assert.equal(blocked.ok, false, "relative payload through a symlinked project directory");
+  const aliased = prepareEditCandidate(relativeRequest("edit", "parser.ts", join(ALIAS, "packages", "a")), true);
+  if (!aliased.ok) assert.fail(aliased.reason);
 });
 
 it("rejects a protected argument alias that canonicalizes onto the same file", () => {
