@@ -1,3 +1,4 @@
+import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import type { ReviewResult } from "../reviewer.js";
 import type { ParsedShellCommands } from "../shell.js";
@@ -17,12 +18,16 @@ const FORGE_READS = new Set(["view", "list", "diff", "checks"]);
 const UNSCOPED_INSTALL_FLAGS = /^(?:-g|--global|--prefix|--cwd|--directory)/;
 const GIT_GLOBAL_OVERRIDE = /^(?:-c|--git-dir|--work-tree|--exec-path)/;
 
+/** Real location when it exists, so a symlinked temporary root compares equal. */
+function canonical(directory: string): string {
+  try { return realpathSync(directory); } catch { return directory; }
+}
+
 function operandEscapes(candidate: string, locationDir: string, worktreeRoot: string): boolean {
   if (SAFE_DEVICES.has(candidate)) return false;
-  const pathLike = candidate.startsWith("/") || candidate.startsWith("~") ||
-    /(?:^|[/\\])\.\.(?:[/\\]|$)/.test(candidate);
-  if (!pathLike) return false;
   if (candidate.startsWith("~") || /[$`\0]/.test(candidate)) return true;
+  // Every grammar-established operand is resolved against the verified
+  // execution directory, so a relocated working directory cannot hide reads.
   return !isInProject(resolve(locationDir, candidate), worktreeRoot);
 }
 
@@ -96,10 +101,15 @@ function isReadOnlyEligible(guarded: ReviewResult | undefined, scan: ShellScan):
 function readOnlyScore(scan: ShellScan, projectDir?: string, worktreeRoot?: string): RequestScore {
   // A read-only command still reads whatever its operands or attached option
   // values name. Low risk requires every one to stay inside the evaluated project.
-  const locationDir = projectDir ?? process.cwd();
-  const scopeRoot = worktreeRoot ?? projectRoot(locationDir);
+  const locationDir = canonical(projectDir ?? process.cwd());
+  const scopeRoot = canonical(worktreeRoot ?? projectRoot(projectDir ?? process.cwd()));
   if (pathTargets(scan).some((operand) => escapesProject(operand, locationDir, scopeRoot)))
     return high("Shell path operand resolves outside the project");
+  // `du`, operand-free `ls`, `find`, recursive `grep` and similar commands read
+  // their working directory implicitly, so a relocated base outside the
+  // worktree can never be a low read-only score.
+  if (!isInProject(locationDir, scopeRoot))
+    return high("Shell execution directory resolves outside the project");
   return low("Parsed read-only command with protected-path checks");
 }
 

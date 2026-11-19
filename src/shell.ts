@@ -57,6 +57,9 @@ export interface ParsedShellCommands {
   redirects: string[];
   /** String tokens no simple command consumed, such as words inside a substitution. */
   leftovers: string[];
+  /** Control operators between segments, in source order: `;`, `&&`, `||`, `|`,
+   * `|&`, `&`, or a newline between logical lines. */
+  operators: string[];
   /** False for syntax whose execution cannot be bounded by this parser. */
   complete: boolean;
   compound: boolean;
@@ -267,6 +270,8 @@ function parsedLine(command: string, binding: HomeBinding = { trusted: true }): 
     ...parsed,
     operands: tokens.flatMap((token) => typeof token === "string" ? [token] :
       "op" in token && token.op === "glob" && token.pattern !== undefined ? [token.pattern] : []),
+    operators: tokens.flatMap((token) =>
+      typeof token !== "string" && "op" in token && CONTROL_OPERATORS.has(token.op) ? [token.op] : []),
     complete: parsed.complete && !hasAmbiguousDescriptorClose(command) && !DYNAMIC_SYNTAX.test(command),
     compound: tokens.some((token) => typeof token !== "string" && "op" in token && CONTROL_OPERATORS.has(token.op)),
   };
@@ -295,11 +300,12 @@ function boundedCommand(command: string, maxChars: number): string | undefined {
 }
 
 function parseLines(lines: readonly string[], binding: HomeBinding): ParsedShellCommands | undefined {
-  const result: ParsedShellCommands = { segments: [], operands: [], redirects: [], leftovers: [], complete: true, compound: false };
+  const result: ParsedShellCommands = { segments: [], operands: [], redirects: [], leftovers: [], operators: [], complete: true, compound: false };
   try {
     for (const line of lines) {
       if (!line.trim() || line.trim().startsWith("#")) continue;
       if (!BALANCED_QUOTES.test(line)) return undefined;
+      if (result.segments.length > 0) result.operators.push("\n");
       mergeParsed(result, parsedLine(line, binding));
     }
   } catch { return undefined; }
@@ -312,6 +318,7 @@ function mergeParsed(result: ParsedShellCommands, parsed: ParsedShellCommands): 
   result.operands.push(...parsed.operands);
   result.redirects.push(...parsed.redirects);
   result.leftovers.push(...parsed.leftovers);
+  result.operators.push(...parsed.operators);
   result.complete &&= parsed.complete;
   result.compound ||= parsed.compound;
 }

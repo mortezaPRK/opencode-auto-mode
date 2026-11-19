@@ -1,9 +1,9 @@
 import { it } from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, mkdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { classifyPath, type PolicyRoots } from "./path-policy.js";
+import { classifyPath, resolvePhysicalDirectory, resolvePhysicalPath, type PolicyRoots } from "./path-policy.js";
 import { scoreRequest } from "./score.js";
 import { parseOptions } from "./config.js";
 import { runClassifiers } from "./classifier.js";
@@ -58,6 +58,20 @@ it("resolves bare aliases and alias/.. without classifying an abandoned director
     symlinkSync("missing", join(root, "dangling"));
     symlinkSync("loop", join(root, "loop"));
     for (const name of ["dangling", "loop"]) assert.equal(classifyPath(name, root, roots).kind, "unresolved");
+  });
+});
+
+it("resolves evidence spellings physically so dot-dot after a symlink keeps its meaning", () => {
+  fixture((root) => {
+    mkdirSync(join(root, "outside", "child"), { recursive: true });
+    symlinkSync(join(root, "outside", "child"), join(root, "alias"));
+    const outer = realpathSync(join(root, "outside"));
+    assert.equal(resolvePhysicalDirectory("alias/..", root), outer);
+    assert.equal(resolvePhysicalPath("alias/../notes", root), join(outer, "notes"));
+    // Traversal through an absent component or a non-directory is unverifiable.
+    assert.equal(resolvePhysicalDirectory("missing/..", root), undefined);
+    writeFileSync(join(root, "file.txt"), "fixture");
+    assert.equal(resolvePhysicalDirectory("file.txt", root), undefined);
   });
 });
 

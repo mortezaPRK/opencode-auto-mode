@@ -3,6 +3,22 @@ import { errorKindOf, EvidenceFailure, terminalEvidence, ReviewFailure, type Rev
 import { withTimeout } from "./timeout.js";
 import { redactHttpBodies } from "./audit.js";
 
+export type OperationAccess = "read" | "write" | "execute" | "unknown";
+
+/** Bounded, selected tool-call evidence. `complete` means this exact evidence
+ * was not lost to redaction or truncation; capability may still be unknown. */
+export interface OperationEvidence {
+  tool?: string;
+  access?: OperationAccess;
+  targets?: readonly string[];
+  arguments?: Record<string, unknown>;
+  complete: boolean;
+  /** Capture correlation, separate from payload completeness: `false` when a
+   * supplied call capture could not be matched to this action or lost its
+   * target arguments. An intentionally omitted payload keeps it `true`. */
+  correlated?: boolean;
+}
+
 export interface PermissionRequest {
   action: string;
   resources: string[];
@@ -17,9 +33,20 @@ export interface PermissionRequest {
   staticAnalysis?: { band: string; reason: string; findings?: readonly string[] };
   scopeResolution?: "unknown";
   shell?: { platform?: string; interpreter?: string };
+  /** Selected, bounded operation evidence from the permission event; never raw metadata/source. */
+  operation?: OperationEvidence;
   metadata?: Record<string, unknown>;
   source?: unknown;
   gitState?: { branch?: string; defaultBranch?: string; upstream?: string; clean?: boolean };
+}
+
+/** Shared terminal guard: external boundaries without a concrete target are always
+ * opaque. Other actions are terminal only when operation evidence was lost and left
+ * no usable scope (all resources '*'); a complete unknown MCP operation stays reviewed. */
+export function isOpaqueOperationLoss(request: Pick<PermissionRequest, "action" | "resources" | "operation">): boolean {
+  if (request.action === "external_directory" && (request.operation?.targets?.length ?? 0) === 0) return true;
+  if (request.operation?.complete !== false) return false;
+  return request.resources.length > 0 && request.resources.every((resource) => resource === "*");
 }
 
 export type Decision = "allow" | "deny" | "ask";
@@ -37,11 +64,20 @@ export interface ReviewResult extends Omit<StageResult, "decision"> { decision: 
 /** Excludes metadata/source blobs. Resources can still contain programs or file content;
  * omit recognizable inline HTTP bodies, but never obscure executable scripts as safe evidence. */
 export function reviewEvidence(req: PermissionRequest) {
+  const opaqueLoss = isOpaqueOperationLoss(req);
   const resourceIncomplete = req.resources.some((resource) => redactHttpBodies(resource) !== resource);
+  const operationIncomplete = req.operation !== undefined && !req.operation.complete;
   return {
     action: req.action,
     resources: req.resources.map((resource) => redactHttpBodies(resource)),
-    ...(resourceIncomplete ? { incompleteEvidence: "Inline HTTP body or remaining arguments omitted; do not approve from partial evidence" } : {}),
+    ...(opaqueLoss
+      ? { incompleteEvidence: "Operation scope is opaque or lacks a verified target; do not approve from partial evidence" }
+      : resourceIncomplete
+        ? { incompleteEvidence: "Inline HTTP body or remaining arguments omitted; do not approve from partial evidence" }
+        : operationIncomplete
+          ? { incompleteEvidence: "Operation evidence is incomplete; do not approve from partial operation evidence" }
+          : {}),
+    ...(req.operation === undefined ? {} : { operation: req.operation }),
     agent: req.agent,
     projectDir: req.projectDir,
     worktreeRoot: req.worktreeRoot,
@@ -99,10 +135,14 @@ export interface ReviewerContext {
 /** Opt-in local debugging only: receives the original exception, never a serialized result field. */
 export type ReviewErrorObserver = (error: unknown) => void;
 
-/** Shared terminal evidence check used by the LLM fallback. */
-function terminalEvidenceReason(request: PermissionRequest): string | undefined {
+/** Shared terminal evidence classification for both model paths. Ordinary
+ * operation incompleteness is intentionally absent: each model stage may still
+ * review retained evidence or abstain non-terminally. */
+export function terminalEvidenceReason(request: PermissionRequest): string | undefined {
   if (request.resources.some((resource) => redactHttpBodies(resource) !== resource))
     return "Inline HTTP body or ambiguous serialized evidence requires human review";
+  if (isOpaqueOperationLoss(request))
+    return "Operation scope is opaque or lacks a verified target; please decide yourself";
   return undefined;
 }
 

@@ -18,7 +18,9 @@ import { createStatusTracker, type StatusTracker } from "./status.js";
 import { withTimeout } from "./timeout.js";
 import { errorKindOf, EvidenceFailure, ReviewFailure } from "./errors.js";
 import { codeModePermission, codeModeReviewResources } from "./code-mode.js";
+import { isRecord } from "./guards.js";
 import { scanResultContent, withInjectionWarning } from "./probe.js";
+import { buildOperationEvidence, createToolInputStore, type ToolInputStore } from "./operation-evidence.js";
 
 export type { AutoModeOptions } from "./config.js";
 const INTERRUPTED_REASON = "Auto-mode review was interrupted; please decide yourself";
@@ -64,6 +66,7 @@ interface Infrastructure {
 
 interface SessionSurface {
   status: StatusTracker;
+  toolInputs: ToolInputStore;
   running: Map<string, Set<AbortController>>;
   suspended: Set<string>;
   subscriptions: AbortController;
@@ -156,6 +159,7 @@ function createObservability(events: EventLog | undefined, instanceID: string, s
 
 async function createSessionSurface(ctx: SetupContext, infra: Infrastructure): Promise<SessionSurface> {
   const status = createStatusTracker();
+  const toolInputs = createToolInputStore();
   const running = new Map<string, Set<AbortController>>();
   // A failed off write must not restore automation in this plugin instance.
   const suspended = new Set<string>();
@@ -178,7 +182,7 @@ async function createSessionSurface(ctx: SetupContext, infra: Infrastructure): P
   // Cancellation remains local to every loaded instance, independent of audit ownership.
   startInterruptSubscription(ctx, { subscriptions, abortSession, debug: infra.debug });
   return {
-    status, running, suspended, subscriptions, lifecycle, abortSession, publish, snapshot, setSessionMode, rpc,
+    status, toolInputs, running, suspended, subscriptions, lifecycle, abortSession, publish, snapshot, setSessionMode, rpc,
     nextReviewID: () => reviewCounter++,
   };
 }
@@ -360,6 +364,7 @@ async function captureLoop(ctx: SetupContext, infra: Infrastructure, signal: Abo
 function abandonRuntime(runtime: Runtime): void {
   runtime.lifecycle.stopping = true;
   runtime.subscriptions.abort();
+  runtime.toolInputs.clear();
   runtime.releaseCapture?.();
   for (const sessionID of runtime.running.keys()) runtime.abortSession(sessionID);
 }
@@ -367,10 +372,14 @@ function abandonRuntime(runtime: Runtime): void {
 async function registerHooks(runtime: Runtime, registrations: { dispose(): unknown }[]): Promise<void> {
   registrations.push(await runtime.ctx.permission.hook("evaluate", createPermissionEvaluate(runtime)));
   registrations.push(await runtime.ctx.tool.hook("execute.before", (event) => executeBeforeHook(event, {
-    valid: runtime.valid, stopped: () => runtime.lifecycle.stopping, debug: runtime.debug,
+    valid: runtime.valid, stopped: () => runtime.lifecycle.stopping, toolInputs: runtime.toolInputs, debug: runtime.debug,
     assert: (input) => runtime.ctx.permission.assert(input),
   })));
-  registrations.push(await runtime.ctx.tool.hook("execute.after", (event) => afterToolCall(event, runtime.debug)));
+  registrations.push(await runtime.ctx.tool.hook("execute.after", (event) => {
+    // Preserve the complete host output/error before adding any UX injection hint.
+    runtime.debug("tool.execute.after", event);
+    afterToolCall(event, () => runtime.toolInputs.release(event));
+  }));
   registrations.push(await runtime.ctx.command.transform((editor) => editor.add({
     name: "auto-mode", description: "Toggle auto mode or show its status", execute: createAutoModeCommand(runtime),
   })));
@@ -573,14 +582,6 @@ function reviewResourcesFor(event: PermissionEvent): string[] {
   catch (error) { throw new ReviewFailure("context", "Code Mode evidence does not match its permission identity", { cause: error }); }
 }
 
-function permissionRequestFor(
-  event: { action: string; resources: readonly string[]; agent?: string },
-  resources: string[],
-  facts: Pick<PermissionRequest, "projectDir" | "worktreeRoot" | "scopeResolution" | "gitState">,
-): PermissionRequest {
-  return { action: event.action, resources, agent: event.agent, ...facts };
-}
-
 async function prepareRequest(deps: Runtime, event: PermissionEvent, handle: ReviewHandle, meta: ReviewMeta): Promise<PreparedRequest> {
   const info = await deps.sdk("session.get", { sessionID: event.sessionID }, () => deps.ctx.session.get({ sessionID: event.sessionID }, { signal: handle.signal }), handle.signal, meta.correlation);
   if (handle.signal.aborted) return { kind: "cancelled" };
@@ -592,7 +593,7 @@ async function prepareRequest(deps: Runtime, event: PermissionEvent, handle: Rev
     status: async (directory) => (await deps.sdk("vcs.status", { location: { directory } }, () => deps.ctx.vcs.status({ location: { directory } }, { signal: handle.signal }), handle.signal, meta.correlation)).data,
   }, handle.signal);
   if (handle.signal.aborted) return { kind: "cancelled" };
-  const request = permissionRequestFor(event, reviewResourcesFor(event), facts);
+  const request = reviewRequestFor(event, reviewResourcesFor(event), facts, deps.toolInputs);
   if (handle.signal.aborted) return { kind: "cancelled" };
   return { kind: "ready", request };
 }
@@ -722,7 +723,7 @@ function applyHostEffect(
   tripped: boolean, hostEffect: PermissionEvent["effect"], original: HostOriginal, result: ReviewResult,
 ): void {
   // Recheck after storage settles, immediately before touching the host.
-  const applied = applyHostDecision(final, cancelled, explicitOff, hostEffect, original, result);
+  const applied = applyHostDecision(deps, event, final, cancelled, explicitOff, hostEffect, original, result);
   event.effect = applied.effect;
   if (applied.message === undefined) delete event.message;
   else event.message = applied.message;
@@ -730,12 +731,12 @@ function applyHostEffect(
 }
 
 function applyHostDecision(
-  final: FinishOutcome, cancelled: boolean, explicitOff: boolean,
+  deps: Runtime, event: PermissionEvent, final: FinishOutcome, cancelled: boolean, explicitOff: boolean,
   hostEffect: PermissionEvent["effect"], original: HostOriginal, result: ReviewResult,
 ): { effect: PermissionEvent["effect"]; message: string | undefined } {
   if (explicitOff) return { effect: hostEffect, message: original.message };
   if (cancelled || final.disposition === "cancelled") return { effect: "ask", message: INTERRUPTED_REASON };
-  if (final.decision === "deny") return { effect: final.decision, message: denialMessage(result.reason) };
+  if (final.decision === "deny") return hostDeny(deps.toolInputs, event, result.reason);
   if (final.disposition === "paused") return hostEffect === "allow"
     ? { effect: final.decision, message: PAUSED_REASON }
     : { effect: final.decision, message: original.message };
@@ -847,6 +848,39 @@ function unavailableAuthorization(error: unknown): never {
   throw new EvidenceFailure("User authorization evidence is unavailable", { cause: error });
 }
 
+/** A tool-sourced permission must carry that exact call's capture. The bounded
+ * store can evict it, and without the captured arguments a shell workdir or a
+ * file target silently disappears, making the request look like a direct
+ * permission event. Lost evidence must never clear a low static score. Outer
+ * Code Mode `execute` is intentionally never captured. */
+function lostToolCapture(event: { action: string; source?: unknown }, capture: unknown): boolean {
+  return capture === undefined && event.action !== "execute" &&
+    isRecord(event.source) && event.source.type === "tool";
+}
+
+function reviewRequestFor(
+  event: { action: string; resources: readonly string[]; agent?: string; metadata?: Record<string, unknown>; source?: unknown; sessionID: string },
+  resources: string[],
+  facts: Pick<PermissionRequest, "projectDir" | "worktreeRoot" | "scopeResolution" | "gitState">,
+  toolInputs: ReturnType<typeof createToolInputStore>,
+): PermissionRequest {
+  const capture = toolInputs.get(event.source, event.sessionID);
+  const operation = buildOperationEvidence(event, { projectDir: facts.projectDir, capture });
+  return {
+    action: event.action, resources, agent: event.agent, ...facts,
+    operation: lostToolCapture(event, capture) ? { ...operation, complete: false, correlated: false } : operation,
+  };
+}
+
+function hostDeny(
+  toolInputs: ReturnType<typeof createToolInputStore>,
+  event: { source?: unknown; sessionID: string },
+  reason: string,
+): { effect: "deny"; message: string } {
+  toolInputs.releaseSource(event.source, event.sessionID);
+  return { effect: "deny", message: denialMessage(reason) };
+}
+
 interface ToolHookEvent {
   tool: string;
   sessionID: Session.ID;
@@ -869,21 +903,26 @@ type ToolAssert = (input: {
 interface ToolHookDeps {
   valid: boolean;
   stopped: () => boolean;
+  toolInputs: ReturnType<typeof createToolInputStore>;
   debug: (type: string, data: unknown) => void;
   assert: ToolAssert;
 }
 
 function executeBeforeHook(event: ToolHookEvent, deps: ToolHookDeps): Promise<void> {
   deps.debug("tool.execute.before", event);
-  return executeToolCall(event, deps);
+  const capture = () => {
+    if (deps.valid && !deps.stopped()) deps.toolInputs.capture(event);
+  };
+  return executeToolCall(event, deps, capture);
 }
 
-async function executeToolCall(event: ToolHookEvent, deps: ToolHookDeps): Promise<void> {
+async function executeToolCall(event: ToolHookEvent, deps: ToolHookDeps, capture: () => void): Promise<void> {
   try {
-    if (event.tool !== "execute") return;
+    if (event.tool !== "execute") return capture();
     // Invalid configuration leaves native execute behavior byte-for-byte untouched.
     if (!deps.valid) return;
     if (deps.stopped()) throw new Error(INTERRUPTED_REASON);
+    // Outer Code Mode input is not stored; permission resources carry its verified source.
     // Hash identities prevent JavaScript '*'/'?' from widening new saved grants.
     // Actual source remains bound to the identity in metadata for review/display.
     // Existing saved rules are untouched; legacy source-specific grants may re-ask.
@@ -891,14 +930,14 @@ async function executeToolCall(event: ToolHookEvent, deps: ToolHookDeps): Promis
       source: { type: "tool", messageID: event.messageID, id: event.id } });
     if (deps.stopped()) throw new Error(INTERRUPTED_REASON);
   } catch (error) {
+    deps.toolInputs.release(event);
     deps.debug("tool.execute.before.error", { event, error });
     throw error;
   }
 }
 
-function afterToolCall(event: { status: string; result?: unknown }, debug: Debug): void {
-  // Preserve the complete host output/error before adding any UX injection hint.
-  debug("tool.execute.after", event);
+function afterToolCall(event: { status: string; result?: unknown }, release: () => void): void {
+  release();
   try {
     if (event.status !== "completed") return;
     const result = event.result as { content?: unknown };
