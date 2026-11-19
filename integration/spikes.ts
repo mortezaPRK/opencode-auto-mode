@@ -1,7 +1,7 @@
 // Isolated P2 probes. Never discovers, reloads, or restarts the shared service.
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { createServer } from "node:http";
+import { createServer, type IncomingMessage } from "node:http";
 import { once } from "node:events";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, symlinkSync, existsSync } from "node:fs";
 import { join, resolve } from "node:path";
@@ -17,19 +17,37 @@ const globalFile = join(root, "config/opencode/opencode.json");
 const project = join(root, "project");
 let currentTool: { name: string; arguments: unknown } | undefined;
 const wire: unknown[] = [];
-const provider = createServer(async (req, res) => {
+interface FixtureRequestBody {
+  stream?: boolean;
+  tools?: { function: { name: string } }[];
+  messages: { role: string }[];
+}
+
+async function readRequest(req: IncomingMessage): Promise<FixtureRequestBody> {
   const chunks: Buffer[] = [];
   for await (const chunk of req) chunks.push(Buffer.from(chunk));
-  const body = JSON.parse(Buffer.concat(chunks).toString());
+  return JSON.parse(Buffer.concat(chunks).toString()) as FixtureRequestBody;
+}
+
+/** Offer the fixture tool only before the model has seen a tool result. */
+function fixtureTool(body: FixtureRequestBody) {
+  if (!currentTool) return undefined;
+  if (!body.tools?.some((t) => t.function.name === currentTool!.name)) return undefined;
+  return body.messages.some((m) => m.role === "tool") ? undefined : currentTool;
+}
+
+const provider = createServer(async (req, res) => {
+  const body = await readRequest(req);
   wire.push({ path: req.url, body });
   if (req.url?.endsWith("systemone")) {
     res.setHeader("content-type", "application/json");
     res.end(JSON.stringify({ model: "predicate", answers: { safe: { type: "predicate", probability: 0.97 } } }));
     return;
   }
-  const tool = currentTool && body.tools?.some((t: { function: { name: string } }) => t.function.name === currentTool!.name)
-    && !body.messages.some((m: { role: string }) => m.role === "tool") ? currentTool : undefined;
-  const delta = tool ? { tool_calls: [{ index: 0, id: "fixture_call", type: "function", function: { name: tool.name, arguments: JSON.stringify(tool.arguments) } }] } : { role: "assistant", content: "Done" };
+  const tool = fixtureTool(body);
+  const delta = tool
+    ? { tool_calls: [{ index: 0, id: "fixture_call", type: "function", function: { name: tool.name, arguments: JSON.stringify(tool.arguments) } }] }
+    : { role: "assistant", content: "Done" };
   const base = { id: "fixture", model: "worker", created: 1 };
   if (!body.stream) {
     res.setHeader("content-type", "application/json");

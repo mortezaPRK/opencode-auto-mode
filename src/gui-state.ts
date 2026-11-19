@@ -173,12 +173,15 @@ export function pillAction(status: AutoModeStatus | undefined): AutoModeAction |
   }
 }
 
+function invalidPillLabel(status: AutoModeStatus): string {
+  if (status.errorKind === "status" || (status.errorKind === undefined && status.configError === "status unavailable")) return "status unavailable";
+  return status.errorKind === "config" ? "Invalid config — review disabled" : "Review unavailable";
+}
+
 export function pillLabel(status: AutoModeStatus | undefined): string | undefined {
   if (status === undefined) return undefined;
   switch (status.mode) {
-    case "invalid":
-      if (status.errorKind === "status" || (status.errorKind === undefined && status.configError === "status unavailable")) return "status unavailable";
-      return status.errorKind === "config" ? "Invalid config — review disabled" : "Review unavailable";
+    case "invalid": return invalidPillLabel(status);
     case "paused": return "paused (breaker)";
     case "off": return "off";
     case "on": return status.enabled ? "auto" : "off";
@@ -207,6 +210,24 @@ export interface ModeNotice {
   kind: "deny" | "breaker";
 }
 
+/** Location and session identity that a decision notice must match. */
+function decisionAllowed(current: StatusTarget, event: DecisionEvent): boolean {
+  if (!current.ownServer || event.location.directory !== current.location.directory
+    || event.location.workspaceID !== current.location.workspaceID) return false;
+  if (event.data === null || typeof event.data !== "object") return false;
+  const data = event.data as Record<string, unknown>;
+  return data.sessionID === current.sessionID && typeof data.reviewID === "string" && data.reviewID.length <= 256;
+}
+
+function noticeKind(data: Record<string, unknown>): ModeNotice["kind"] | undefined {
+  if (data.stage === "breaker") return "breaker";
+  return data.decision === "deny" ? "deny" : undefined;
+}
+
+function noticeMessage(kind: ModeNotice["kind"]): string {
+  return kind === "breaker" ? "Auto mode paused (breaker)" : "Auto mode denied";
+}
+
 /** No replay/history, raw reasons, saved-approval nags, or unbounded dedup state. */
 export function createDecisionNotifier(
   target: () => StatusTarget | undefined,
@@ -218,12 +239,9 @@ export function createDecisionNotifier(
   let shown = 0;
   return (event) => {
     const current = target();
-    if (current === undefined || !current.ownServer || event.location.directory !== current.location.directory
-      || event.location.workspaceID !== current.location.workspaceID) return;
-    if (event.data === null || typeof event.data !== "object") return;
+    if (current === undefined || !decisionAllowed(current, event)) return;
     const data = event.data as Record<string, unknown>;
-    if (data.sessionID !== current.sessionID || typeof data.reviewID !== "string" || data.reviewID.length > 256) return;
-    const kind = data.stage === "breaker" ? "breaker" : data.decision === "deny" ? "deny" : undefined;
+    const kind = noticeKind(data);
     if (kind === undefined) return;
     const key = JSON.stringify([current.key, data.reviewID, kind]);
     if (seen.has(key)) return;
@@ -234,7 +252,7 @@ export function createDecisionNotifier(
     // Cap bursts of deny toasts, but never suppress a new breaker trip.
     if (kind === "deny" && shown >= 4) return;
     shown++;
-    show({ kind, message: kind === "breaker" ? "Auto mode paused (breaker)" : "Auto mode denied" });
+    show({ kind, message: noticeMessage(kind) });
   };
 }
 

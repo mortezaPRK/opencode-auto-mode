@@ -43,13 +43,24 @@ export function codeModePermission(input: unknown) {
  * Undefined means an ordinary non-identity execute request; malformed identity
  * requests throw rather than allowing review of an opaque digest or mismatched code.
  */
-export function codeModeReviewResources(event: { action: string; resources: readonly string[]; metadata?: Record<string, unknown> }): string[] | undefined {
-  if (event.action !== "execute" || !event.resources.some(resource => resource.startsWith(IDENTITY_PREFIX))) return undefined;
+type CodeModeEvent = { action: string; resources: readonly string[]; metadata?: Record<string, unknown> };
+type CodeModeEvidence = { version?: unknown; identity?: unknown; code?: unknown };
+
+function codeModeEvidence(event: CodeModeEvent): CodeModeEvidence {
   const evidence = event.metadata?.[METADATA_KEY];
   if (!evidence || typeof evidence !== "object" || Array.isArray(evidence))
     throw new Error("Code Mode program evidence is unavailable");
-  const { version, identity, code } = evidence as { version?: unknown; identity?: unknown; code?: unknown };
-  if (version !== 1 || !validCode(code) || event.resources.length !== 1 || identity !== event.resources[0] || identity !== codeModeIdentity(code))
+  return evidence as CodeModeEvidence;
+}
+
+function matchingCode(event: CodeModeEvent, evidence: CodeModeEvidence): string {
+  if (evidence.version !== 1 || !validCode(evidence.code) || event.resources.length !== 1 ||
+      evidence.identity !== event.resources[0] || evidence.identity !== codeModeIdentity(evidence.code))
     throw new Error("Code Mode program evidence does not match its permission identity");
-  return [code];
+  return evidence.code;
+}
+
+export function codeModeReviewResources(event: CodeModeEvent): string[] | undefined {
+  if (event.action !== "execute" || !event.resources.some(resource => resource.startsWith(IDENTITY_PREFIX))) return undefined;
+  return [matchingCode(event, codeModeEvidence(event))];
 }
