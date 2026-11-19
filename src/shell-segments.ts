@@ -25,6 +25,9 @@ const UNSPLITTABLE = ["$(", "${", "$[", "$'", '$"', "`", "<<", "<(", ">("] as co
 const STATEFUL_COMMANDS = new Set([
   ...STATEFUL, ...DYNAMIC,
   "cd", "pushd", "popd", "builtin", "command", "env", "sh", "bash", "zsh", "sudo",
+  // Precommand modifiers and the short `repeat` loop hide the effective command,
+  // so `noglob cd /tmp; pwd` must not look like two independent segments.
+  "nohup", "noglob", "nocorrect", "repeat", "-",
   // Mutate state a later segment reads: command lookup (`hash`, `enable`, PATH
   // assignment), variables (`read`, `mapfile`, `readarray`, `getopts`,
   // `printf -v`, `let`, `shift`, and `test`/`[` whose `-v` array subscript is
@@ -33,7 +36,7 @@ const STATEFUL_COMMANDS = new Set([
   // Rejected by name, whatever the arguments, because an option can carry the
   // mutation.
   "hash", "read", "mapfile", "readarray", "getopts", "printf", "let", "shift",
-  "ulimit", "enable", "bind", "complete", "compopt", "fc", "test", "[",
+  "ulimit", "enable", "bind", "complete", "compgen", "compopt", "fc", "test", "[",
 ]);
 
 /** Words that open or continue a compound command, so the rest is not top-level. */

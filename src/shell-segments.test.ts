@@ -53,6 +53,18 @@ it("rejects stateful first segment words", () => {
   ]) unresolved(command);
 });
 
+it("rejects zsh precommand modifiers, short loops and compgen", () => {
+  for (const command of [
+    "noglob cd /tmp; pwd",
+    "nocorrect cd /tmp; pwd",
+    "repeat 1 cd /tmp; pwd",
+    "nohup git status; pwd",
+    "- cd /tmp; pwd",
+  ]) unresolved(command);
+  // An escaped expansion marker avoids UNSPLITTABLE, but `-W` still evaluates it.
+  unresolved("compgen -W \\$\\{X:=y\\}; echo $X");
+});
+
 it("rejects assignment prefixes and quoted stateful words", () => {
   unresolved("FOO=bar bun test");
   unresolved("IFS=, read -r a b");
