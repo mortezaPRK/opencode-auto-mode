@@ -275,8 +275,10 @@ cannot be split gets one `operation_kind` choice, where `test_run` or
 command as `fullCommand` context, and an unsplittable command whose
 `operation_kind` does not certify gets one `command_local` choice, whose `true`
 certifies `command_local` and still requires the full review. A model-derived
-fact is certified only when its reported probability clears the threshold and its exact
-source-input hash and provider-reported model label are present. A certified read-only `inspection`
+fact is certified only when its reported probability clears the threshold, its exact
+source-input hash is present, and it carries a model label: the provider-reported
+served model when the response includes one, otherwise the configured model reference.
+A certified read-only `inspection`
 with zero static analysis findings is allowed on that fact alone: no review call
 is made. A certified `shell_segments` fact with zero static analysis findings is
 likewise allowed on that fact alone as project-local, and keeps that full review
@@ -294,8 +296,10 @@ selected choice is `allow` and the raw `allow` probability meets
 analysis, also keeps that full review. The stage never denies. Mandatory score
 deny/ask guards run first and are never overridden by this stage. Unknown facts,
 missing source-input hash or model label, malformed output, low probabilities,
-provider errors, timeouts, cancellation, and later LLM-stage fallback continue
-to the next stage; the pipeline still asks when no stage decides. Terminal
+provider errors, and stage-local timeouts abstain and continue to the next
+stage; a pipeline that no stage decides still asks. Cancellation and the
+whole-review deadline are terminal instead: they stop the stage chain and
+resolve to **ask** without running a later classifier. Terminal
 preflight loss (a protected path, redacted resources or delegations, or missing
 root authority) also resolves to **ask**.
 

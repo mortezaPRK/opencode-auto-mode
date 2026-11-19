@@ -293,8 +293,9 @@ cannot be split gets one `operation_kind` choice, where `test_run` or
 whole command as `fullCommand` context, and an unsplittable command whose
 `operation_kind` does not certify gets one `command_local` choice, whose `true`
 certifies `command_local` for the full review. A model-derived fact must meet the threshold
-and carry its exact source-input hash and a nonempty provider-reported model
-label; unknown, malformed, or unproven facts abstain. User messages, delegations, transcripts,
+and carry its exact source-input hash and a nonempty model label: the
+provider-reported served model when the response includes one, otherwise the
+configured model reference; unknown, malformed, or unproven facts abstain. User messages, delegations, transcripts,
 and static findings are excluded from this classification call.
 
 A certified read-only `inspection` with zero static findings is allowed on the
@@ -314,8 +315,10 @@ reviewed separately. An inspection with any
 static finding, or without static analysis, keeps that full review. The stage
 never denies.
 Mandatory score deny/ask guards run first and cannot be overridden; uncertain
-facts, malformed output, provider errors, timeouts, cancellation, and exhaustion
-continue to later stages and end in `ask` when nothing decides. Terminal preflight loss (a protected path, redacted
+facts, malformed output, provider errors, and stage-local timeouts abstain and
+continue to later stages, and a pipeline that nothing decides ends in `ask`.
+Cancellation and the whole-review deadline are terminal instead: they stop the
+stage chain and resolve to `ask` without running a later classifier. Terminal preflight loss (a protected path, redacted
 resources or delegations, or missing root authority) also resolves to `ask`.
 The LLM stage is fallback evidence, not ground truth.
 
