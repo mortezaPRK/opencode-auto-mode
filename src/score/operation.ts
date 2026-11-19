@@ -65,6 +65,16 @@ function verifiedTarget(target: string, write: boolean, projectDir?: string, wor
   return isScopedPath(target, projectDir, worktreeRoot ?? projectRoot(projectDir));
 }
 
+/** Every captured target names a permission resource, compared canonically. The
+ * scope itself is the score's check; this only proves the capture describes the
+ * permission request the score evaluated. A fact-only allow cannot skip it when
+ * the score band never reached `operationScopeApproval`. */
+export function operationTargetsReconciled(operation: OperationEvidence | undefined, action: string,
+  resources: readonly string[], projectDir?: string): boolean {
+  return operationTargets(operation, action).every((target) =>
+    namesPermissionResource(resources, target, projectDir));
+}
+
 /** A low file score needs a correlated capture (when one was supplied) whose
  * every captured target names a permission resource that stays verified in
  * scope. An omitted payload adds no target and keeps correlation valid, while a

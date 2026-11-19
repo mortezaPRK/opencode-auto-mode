@@ -15,8 +15,10 @@
  * still apply the mandatory score guards first: a captured command or file target
  * that conflicts with the evaluated resources, an unresolved shell scope, or an
  * uncorrelated capture is carried by the score or the snapshot, so no fact-only
- * path allows on it. `bash` shares shell fact classification, but the score's
- * shell guards evaluate only `shell`, so a `bash` fact always gets the review.
+ * path allows on it. A file band outside `low` skips the score's scope approval,
+ * so the fact-only allow reconciles every captured target itself. The score's
+ * shell guards evaluate only the exact `shell` action, so a `bash` action or any
+ * shell-backed capture under another action always gets the review.
  */
 import { createHash } from "node:crypto";
 import { Model } from "@opencode/schema/model";
@@ -57,7 +59,7 @@ import { classifyPath } from "./path-policy.js";
 import type { PermissionRequest, StageResult } from "./reviewer.js";
 import { isFileAction } from "./score/files.js";
 import { checkRequestLimits } from "./score/limits.js";
-import { operationPathApproval } from "./score/operation.js";
+import { operationPathApproval, operationTargetsReconciled } from "./score/operation.js";
 import { MAX_SEGMENTS } from "./shell-segments.js";
 import { withTimeout } from "./timeout.js";
 
@@ -319,21 +321,30 @@ function factCallFlowMatches(kind: CertifiedOperationKind, calls: readonly FactC
 /** Zero static findings is enough only because the certified provenance already
  * proves every fact-stage call was read-only. Conflict or scope findings from
  * the score remain blocking, so a command that the shell guards never evaluated
- * cannot ride this shortcut. `bash` shares shell classification, but the score's
- * shell guards evaluate only the exact `shell` action, so an alias fact never
- * skips the review. */
-const SHELL_ACTIONS: ReadonlySet<string> = new Set(["shell", "bash"]);
-const shellGuardsEvaluated = (action: string): boolean => action === "shell" || !SHELL_ACTIONS.has(action);
+ * cannot ride this shortcut. The score's shell guards evaluate only the exact
+ * `shell` action, so a `bash` action or any shell-backed capture under another
+ * action never skips the review. */
+const SHELL_NAMES: ReadonlySet<string> = new Set(["shell", "bash"]);
+
+function shellCapture(operation: FactReviewSnapshot["operation"]): boolean {
+  return operation !== undefined &&
+    (SHELL_NAMES.has(operation.tool ?? "") || operation.arguments?.command !== undefined);
+}
+
+function shellGuardsEvaluated(snapshot: FactReviewSnapshot): boolean {
+  if (snapshot.action === "shell") return true;
+  return !SHELL_NAMES.has(snapshot.action) && !shellCapture(snapshot.operation);
+}
 
 function readOnlyInspection(fact: CertifiedOperationFact, snapshot: FactReviewSnapshot): boolean {
-  return fact.kind === "inspection" && shellGuardsEvaluated(snapshot.action) &&
+  return fact.kind === "inspection" && shellGuardsEvaluated(snapshot) &&
     snapshot.staticAnalysis !== undefined && (snapshot.staticAnalysis.findings?.length ?? 0) === 0;
 }
 
 /** Every segment stayed inside the working directory. The `command_local`
  * fallback may write to tempDir outside the project and is never allowed here. */
 function projectLocalShellSegments(fact: CertifiedOperationFact, snapshot: FactReviewSnapshot): boolean {
-  return fact.kind === "shell_segments" && shellGuardsEvaluated(snapshot.action) &&
+  return fact.kind === "shell_segments" && shellGuardsEvaluated(snapshot) &&
     snapshot.staticAnalysis !== undefined && (snapshot.staticAnalysis.findings?.length ?? 0) === 0;
 }
 
@@ -375,11 +386,20 @@ export function isFactOnlyKind(kind: string): boolean {
 }
 
 /** An uncorrelated capture cannot prove which operation the score evaluated, so
- * no fact-only path may allow; the abstain keeps configured later stages. */
+ * no fact-only path may allow; the abstain keeps configured later stages.
+ * A file score outside the low band skips `operationScopeApproval`, so the
+ * fact-only allow still reconciles every captured target with the permission
+ * resources; a mismatch falls through to the full review. */
+function fileTargetsReconciled(snapshot: FactReviewSnapshot): boolean {
+  return !isFileAction(snapshot.action) ||
+    operationTargetsReconciled(snapshot.operation, snapshot.action, snapshot.resources, snapshot.projectDir);
+}
+
 function factOnlyAllow(fact: CertifiedOperationFact, snapshot: FactReviewSnapshot): StageResult | undefined {
   if (!isFactOnlyKind(fact.kind)) return undefined;
   if (snapshot.operation?.correlated === false)
     return abstain("Captured operation evidence does not match the permission request", "context");
+  if (!fileTargetsReconciled(snapshot)) return undefined;
   if (readOnlyInspection(fact, snapshot)) return inspectionAllow(fact);
   if (projectLocalShellSegments(fact, snapshot)) return shellSegmentsAllow(fact);
   return fact.kind === "project_edit" ? projectEditAllow(fact) : undefined;

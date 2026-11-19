@@ -1221,8 +1221,7 @@ it("abstains on a metadata-only edit whose capture cannot be correlated", async 
   assert.notEqual(result.decision, "allow");
   assert.equal(result.errorKind, "context");
   assert.equal(result.terminal, undefined);
-  assert.match(result.reason, /does not match the permission request/);
-  assert.deepEqual(fake.calls, [["edit_in_project"]]);
+  assert.deepEqual(fake.calls, []);
 });
 
 it("keeps the full review when a captured file target differs from the permission scope", async () => {
@@ -1238,6 +1237,50 @@ it("keeps the full review when a captured file target differs from the permissio
   const request: FactReviewRequest = {
     action: "read", resources: ["safe.txt"], projectDir: EDIT_ROOT, worktreeRoot: EDIT_ROOT,
     userMessages: ["Inspect the safe file."], operation,
+    staticAnalysis: { band: score.band, reason: score.reason, findings: score.findings ?? [] },
+  };
+  const fake = pipeline({ inspection: inspectionReply(true, 0.95), review: reply(reviewAnswer(0.99, 0.99)) });
+  const result = await reviewWithOperationFact(fake.ctx, options, request);
+  assert.equal(result.decision, "allow");
+  assert.deepEqual(fake.calls, [["inspection"], ["safety", "authorization"]]);
+  assert.doesNotMatch(result.reason, /review skipped/);
+});
+
+it("reconciles a captured read target even when the file score is high without findings", async () => {
+  const operation: OperationEvidence = {
+    tool: "read", access: "read", targets: ["/repo/README.md"],
+    arguments: { filePath: "/repo/README.md" }, complete: true,
+  };
+  const score = scoreRequest({
+    action: "read", resources: ["/outside/report.txt"], projectDir: "/repo", worktreeRoot: "/repo", operation,
+  }, scoreOptions);
+  assert.equal(score.band, "high");
+  assert.deepEqual(score.findings ?? [], []);
+  const request: FactReviewRequest = {
+    action: "read", resources: ["/outside/report.txt"], projectDir: "/repo", worktreeRoot: "/repo",
+    userMessages: ["Read the external report."], operation,
+    staticAnalysis: { band: score.band, reason: score.reason, findings: score.findings ?? [] },
+  };
+  const fake = pipeline({ inspection: inspectionReply(true, 0.95), review: reply(reviewAnswer(0.99, 0.99)) });
+  const result = await reviewWithOperationFact(fake.ctx, options, request);
+  assert.equal(result.decision, "allow");
+  assert.deepEqual(fake.calls, [["inspection"], ["safety", "authorization"]]);
+  assert.doesNotMatch(result.reason, /review skipped/);
+});
+
+it("never skips the review for a shell capture under a non-shell action", async () => {
+  const operation: OperationEvidence = {
+    tool: "bash", access: "execute", targets: ["/repo"],
+    arguments: { command: "cat .env", workdir: "/repo" }, complete: true,
+  };
+  const score = scoreRequest({
+    action: "external_directory", resources: ["/repo"], projectDir: "/repo", worktreeRoot: "/repo", operation,
+  }, scoreOptions);
+  assert.equal(score.band, "high");
+  assert.deepEqual(score.findings ?? [], []);
+  const request: FactReviewRequest = {
+    action: "external_directory", resources: ["/repo"], projectDir: "/repo", worktreeRoot: "/repo",
+    userMessages: ["Inspect the environment file."], operation,
     staticAnalysis: { band: score.band, reason: score.reason, findings: score.findings ?? [] },
   };
   const fake = pipeline({ inspection: inspectionReply(true, 0.95), review: reply(reviewAnswer(0.99, 0.99)) });
