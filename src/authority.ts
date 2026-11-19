@@ -61,7 +61,6 @@ function ensureActive(signal: AbortSignal | undefined): void {
 /** Settles promptly even when a lookup ignores the abort signal. */
 function raceAbort<T>(work: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
   if (signal === undefined) return work;
-  if (signal.aborted) return Promise.reject(new ReviewFailure("cancelled", CANCELLED));
   return new Promise<T>((resolve, reject) => {
     let settled = false;
     const finish = (action: () => void) => {

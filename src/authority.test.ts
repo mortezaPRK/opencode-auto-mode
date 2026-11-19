@@ -326,6 +326,28 @@ it("settles promptly when cancelled during a lookup", async () => {
     error instanceof ReviewFailure && error.kind === "cancelled");
 });
 
+it("handles a lookup that aborts and rejects synchronously", async () => {
+  const controller = new AbortController();
+  const rejections: unknown[] = [];
+  const onUnhandled = (reason: unknown) => { rejections.push(reason); };
+  process.on("unhandledRejection", onUnhandled);
+  try {
+    const lookups: AuthorityLookups = {
+      get() {
+        controller.abort();
+        return Promise.reject(new Error("lookup failed after abort"));
+      },
+      async context() { return []; },
+    };
+    await assert.rejects(collectAuthority("root", lookups, { signal: controller.signal }), (error) =>
+      error instanceof ReviewFailure && error.kind === "cancelled");
+    await new Promise((resolve) => { setImmediate(resolve); });
+    assert.deepEqual(rejections, []);
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+  }
+});
+
 it("preserves cancellation before cutoff validation or lookups", async () => {
   const controller = new AbortController();
   controller.abort();
