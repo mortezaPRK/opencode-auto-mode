@@ -157,72 +157,106 @@ function leftoverWords(tokens: readonly Token[], consumed: ReadonlySet<number>):
   });
 }
 
+/** Mutable state of one left-to-right token scan over a parsed line. */
+interface LineScan {
+  segments: Segment[];
+  redirects: string[];
+  consumed: Set<number>;
+  current: Segment;
+  redirect?: { write: boolean; op: string };
+  uncertainRedirect: boolean;
+  wordIndex: number;
+  binding: HomeBinding;
+}
+
+function newSegment(): Segment {
+  return { words: [], globs: [], homes: [], write: false };
+}
+
 /** Splits parsed tokens into simple commands, tracking whether the whole line parsed. */
 function lineSegments(tokens: readonly Token[], expansions: readonly WordFact[], binding: HomeBinding): ParsedLine {
-  const segments: Segment[] = [{ words: [], globs: [], homes: [], write: false }];
-  const redirects: string[] = [];
-  const consumed = new Set<number>();
-  let current = segments[0];
-  let redirect: { write: boolean; op: string } | undefined;
-  let uncertainRedirect = false;
-  let wordIndex = 0;
+  const scan: LineScan = {
+    segments: [], redirects: [], consumed: new Set(), current: newSegment(),
+    uncertainRedirect: false, wordIndex: 0, binding,
+  };
+  scan.segments.push(scan.current);
   let position = 0;
-  const nextExpansion = () => bindHomeWord(expansions[wordIndex++] ?? { dynamic: false, home: false }, current.words, binding);
-  const failed = (): ParsedLine => { binding.trusted = false; return { segments, redirects, leftovers: leftoverWords(tokens, consumed), complete: false }; };
   for (const token of tokens) {
-    const index = position++;
-    if (typeof token === "string") {
-      if (redirect) {
-        const { target, expanded } = redirectWord(token, nextExpansion());
-        // Heredoc delimiters are quote-removed, not expanded. Their bodies and
-        // boundaries remain governed by the dedicated heredoc analyzer.
-        uncertainRedirect ||= expanded && !["<<", "<<-"].includes(redirect.op);
-        const descriptorClose = target === "-" && [">&", "<&"].includes(redirect.op);
-        if (redirect.write && target !== "/dev/null" && !descriptorClose)
-          current.write = true;
-        addPathRedirect(redirects, target, redirect.op, expanded);
-        consumed.add(index);
-        redirect = undefined;
-      } else {
-        current.words.push(token);
-        addWordFact(current, nextExpansion());
-        consumed.add(index);
-      }
-      continue;
-    }
-    if ("comment" in token) continue;
-    if (token.op === "glob" && token.pattern !== undefined) {
-      if (redirect) {
-        // A glob is still a redirection target, so it never becomes a command word.
-        nextExpansion();
-        uncertainRedirect = true;
-        redirects.push(token.pattern);
-        consumed.add(index);
-        if (redirect.write) current.write = true;
-        redirect = undefined;
-      } else {
-        addGlobWord(current, token.pattern, nextExpansion());
-        consumed.add(index);
-      }
-      continue;
-    }
-    if (CONTROL_OPERATORS.has(token.op)) {
-      // A control operator before the redirection target is invalid syntax.
-      if (redirect) return failed();
-      finishHomeSegment(current, binding);
-      current = { words: [], globs: [], homes: [], write: false };
-      segments.push(current);
-      continue;
-    }
-    if (REDIRECT_OPERATORS.has(token.op)) {
-      // Descriptor prefixes (`2>` in `2>/dev/null`) are stripped from the source
-      // before parsing, so a numeric word here is an operand and must survive.
-      redirect = { write: WRITE_OPERATORS.has(token.op), op: token.op };
-      continue;
-    }
-    return failed();
+    if (!consumeToken(scan, token, position++, expansions)) return failedLine(scan, tokens);
   }
-  return finishParsedLine({ segments, redirects, leftovers: leftoverWords(tokens, consumed), complete: redirect === undefined && !uncertainRedirect }, binding);
+  return finishParsedLine({
+    segments: scan.segments,
+    redirects: scan.redirects,
+    leftovers: leftoverWords(tokens, scan.consumed),
+    complete: scan.redirect === undefined && !scan.uncertainRedirect,
+  }, binding);
+}
+
+/** Feeds one token to the scan; false means the token is invalid in this position. */
+function consumeToken(scan: LineScan, token: Token, index: number, expansions: readonly WordFact[]): boolean {
+  if (typeof token === "string") { consumeStringToken(scan, token, index, expansions); return true; }
+  if ("comment" in token) return true;
+  if (token.op === "glob" && token.pattern !== undefined) { consumeGlobToken(scan, token.pattern, index, expansions); return true; }
+  if (CONTROL_OPERATORS.has(token.op)) return consumeControlToken(scan);
+  if (REDIRECT_OPERATORS.has(token.op)) {
+    // Descriptor prefixes (`2>` in `2>/dev/null`) are stripped from the source
+    // before parsing, so a numeric word here is an operand and must survive.
+    scan.redirect = { write: WRITE_OPERATORS.has(token.op), op: token.op };
+    return true;
+  }
+  return false;
+}
+
+function failedLine(scan: LineScan, tokens: readonly Token[]): ParsedLine {
+  scan.binding.trusted = false;
+  return { segments: scan.segments, redirects: scan.redirects, leftovers: leftoverWords(tokens, scan.consumed), complete: false };
+}
+
+function nextExpansion(scan: LineScan, expansions: readonly WordFact[]): WordFact {
+  return bindHomeWord(expansions[scan.wordIndex++] ?? { dynamic: false, home: false }, scan.current.words, scan.binding);
+}
+
+function consumeStringToken(scan: LineScan, token: string, index: number, expansions: readonly WordFact[]): void {
+  if (scan.redirect) consumeRedirectTarget(scan, token, expansions);
+  else addCommandWord(scan, token, expansions);
+  scan.consumed.add(index);
+}
+
+function addCommandWord(scan: LineScan, word: string, expansions: readonly WordFact[]): void {
+  scan.current.words.push(word);
+  addWordFact(scan.current, nextExpansion(scan, expansions));
+}
+
+function consumeRedirectTarget(scan: LineScan, word: string, expansions: readonly WordFact[]): void {
+  const redirect = scan.redirect!;
+  const { target, expanded } = redirectWord(word, nextExpansion(scan, expansions));
+  // Heredoc delimiters are quote-removed, not expanded. Their bodies and
+  // boundaries remain governed by the dedicated heredoc analyzer.
+  scan.uncertainRedirect ||= expanded && !["<<", "<<-"].includes(redirect.op);
+  const descriptorClose = target === "-" && [">&", "<&"].includes(redirect.op);
+  if (redirect.write && target !== "/dev/null" && !descriptorClose) scan.current.write = true;
+  addPathRedirect(scan.redirects, target, redirect.op, expanded);
+  scan.redirect = undefined;
+}
+
+function consumeGlobToken(scan: LineScan, pattern: string, index: number, expansions: readonly WordFact[]): void {
+  if (!scan.redirect) { addGlobWord(scan.current, pattern, nextExpansion(scan, expansions)); scan.consumed.add(index); return; }
+  // A glob is still a redirection target, so it never becomes a command word.
+  nextExpansion(scan, expansions);
+  scan.uncertainRedirect = true;
+  scan.redirects.push(pattern);
+  scan.consumed.add(index);
+  if (scan.redirect.write) scan.current.write = true;
+  scan.redirect = undefined;
+}
+
+function consumeControlToken(scan: LineScan): boolean {
+  // A control operator before the redirection target is invalid syntax.
+  if (scan.redirect) return false;
+  finishHomeSegment(scan.current, scan.binding);
+  scan.current = newSegment();
+  scan.segments.push(scan.current);
+  return true;
 }
 
 /** The same token-to-command representation used by the guard and residual scoring. */
@@ -245,29 +279,41 @@ function parsedLine(command: string, binding: HomeBinding = { trusted: true }): 
  * without changing the guard's own manual-approval limit.
  */
 export function parseShellCommands(command: string, limits: { maxChars?: number; homeBinding?: HomeBinding } = {}): ParsedShellCommands | undefined {
-  const maxChars = limits.maxChars ?? MAX_COMMAND_CHARS;
-  const binding = requestHomeBinding(limits);
+  const normalized = boundedCommand(command, limits.maxChars ?? MAX_COMMAND_CHARS);
+  if (normalized === undefined) return undefined;
+  const { lines, certain } = logicalLines(normalized);
+  if (certain < lines.length) return undefined;
+  return parseLines(lines, requestHomeBinding(limits));
+}
+
+/** The continuation-normalized source, or undefined when it cannot be decoded. */
+function boundedCommand(command: string, maxChars: number): string | undefined {
   if (!command || command.length > maxChars || hasUndecodedSyntax(command)) return undefined;
   const normalized = normalizeContinuations(command);
   if (hasUndecodedSyntax(normalized) || hasHeredoc(normalized)) return undefined;
-  const { lines, certain } = logicalLines(normalized);
-  if (certain < lines.length) return undefined;
+  return normalized;
+}
+
+function parseLines(lines: readonly string[], binding: HomeBinding): ParsedShellCommands | undefined {
   const result: ParsedShellCommands = { segments: [], operands: [], redirects: [], leftovers: [], complete: true, compound: false };
   try {
     for (const line of lines) {
       if (!line.trim() || line.trim().startsWith("#")) continue;
       if (!BALANCED_QUOTES.test(line)) return undefined;
-      const parsed = parsedLine(line, binding);
-      result.segments.push(...parsed.segments);
-      result.operands.push(...parsed.operands);
-      result.redirects.push(...parsed.redirects);
-      result.leftovers.push(...parsed.leftovers);
-      result.complete &&= parsed.complete;
-      result.compound ||= parsed.compound;
+      mergeParsed(result, parsedLine(line, binding));
     }
   } catch { return undefined; }
   result.compound ||= result.segments.filter((segment) => segment.words.length).length > 1;
   return result;
+}
+
+function mergeParsed(result: ParsedShellCommands, parsed: ParsedShellCommands): void {
+  result.segments.push(...parsed.segments);
+  result.operands.push(...parsed.operands);
+  result.redirects.push(...parsed.redirects);
+  result.leftovers.push(...parsed.leftovers);
+  result.complete &&= parsed.complete;
+  result.compound ||= parsed.compound;
 }
 
 /**
@@ -308,11 +354,10 @@ function analyzeLine(command: string, projectDir: string | undefined, binding: H
   if (!BALANCED_QUOTES.test(command)) { binding.trusted = false; return { decision: "ask" }; }
   if (FORK_BOMB.test(command)) return { decision: "deny", reason: "dangerous shell operation" };
 
-  let tokens;
-  try { tokens = parseShell(command); }
-  catch { binding.trusted = false; return { decision: "ask" }; }
+  const tokens = tryParseTokens(command, binding);
+  if (tokens === undefined) return { decision: "ask" };
 
-  const { segments, redirects, leftovers, complete } = parsedLine(command, binding);
+  const parsed = parsedLine(command, binding);
   // A redirection always names a file, so its target takes the full path-aware
   // check. Each simple command is judged by its own grammar: a pattern, script
   // or filter is data even when it is spelled like a path, while a file operand
@@ -320,25 +365,36 @@ function analyzeLine(command: string, projectDir: string | undefined, binding: H
   // substitution) keep the generic shell-word check. None of this depends on the
   // line parsing completely: a deny visible in the literal text must win over the
   // parser uncertainty.
-  if (protectedCommands({ segments, redirects, leftovers, complete }, projectDir))
-    return { decision: "deny", reason: "protected path access" };
-  // Deny rules that are already visible must win even when later arguments are
-  // dynamic (`sudo id $(...)`) and even when the line only parses partially.
-  for (const segment of segments) {
-    const blocked = denyInvocation(staticSegmentWords(segment));
-    if (blocked !== undefined) return { decision: "deny", reason: blocked };
-  }
-  if (hasRemoteShellPipe(tokens))
-    return { decision: "deny", reason: "remote download piped to a shell" };
+  const blocked = visibleLineDenyText(tokens, parsed, projectDir);
+  if (blocked !== undefined) return { decision: "deny", reason: blocked };
   // Bash closes the descriptor and runs the rest of the word as a command
   // (`2>&-sudo id` runs sudo), while shell-quote reads `-sudo` as the redirect
   // target. Neither reading may approve the invocation.
-  if (hasAmbiguousDescriptorClose(command)) return { decision: "ask" };
-  if (!complete || DYNAMIC_SYNTAX.test(command)) return { decision: "ask" };
+  if (hasAmbiguousDescriptorClose(command) || !parsed.complete || DYNAMIC_SYNTAX.test(command)) return { decision: "ask" };
+  return segmentVerdicts(parsed, projectDir);
+}
 
+function tryParseTokens(command: string, binding: HomeBinding): Token[] | undefined {
+  try { return parseShell(command); }
+  catch { binding.trusted = false; return undefined; }
+}
+
+/** Denies that are visible in the parsed text, in their precedence order. */
+function visibleLineDenyText(tokens: readonly Token[], parsed: ParsedShellCommands, projectDir?: string): string | undefined {
+  if (protectedCommands(parsed, projectDir)) return "protected path access";
+  // Deny rules that are already visible must win even when later arguments are
+  // dynamic (`sudo id $(...)`) and even when the line only parses partially.
+  for (const segment of parsed.segments) {
+    const blocked = denyInvocation(staticSegmentWords(segment));
+    if (blocked !== undefined) return blocked;
+  }
+  return hasRemoteShellPipe(tokens) ? "remote download piped to a shell" : undefined;
+}
+
+function segmentVerdicts(parsed: ParsedShellCommands, projectDir?: string): Verdict {
   let ask = false;
-  let review = commandsNeedPathReview(redirects, segments, projectDir);
-  for (const segment of segments) {
+  let review = commandsNeedPathReview(parsed.redirects, parsed.segments, projectDir);
+  for (const segment of parsed.segments) {
     const verdict = analyzeSegment(segment);
     if (verdict.decision === "deny") return verdict;
     if (verdict.decision === "ask") ask = true;
@@ -368,25 +424,16 @@ function analyzeLines(command: string, projectDir: string | undefined, binding: 
   return { decision: review ? "review" : "allow" };
 }
 
+interface HeredocBody { lines: string[]; quoted: boolean }
+type HeredocMarker = ReturnType<typeof heredocMarkers>[number];
+
 function analyzeHeredoc(command: string, projectDir: string | undefined, binding: HomeBinding): Verdict {
   const lines = command.split("\n");
   const firstLine = lines[0] ?? "";
   const markers = heredocMarkers(firstLine);
   if (!markers.length) return { decision: "ask" };
-  let index = 1;
-  const bodies: { lines: string[]; quoted: boolean }[] = [];
-  for (const marker of markers) {
-    const body: string[] = [];
-    let closed = false;
-    while (index < lines.length) {
-      const candidate = marker.stripTabs ? lines[index].replace(/^\t+/, "") : lines[index];
-      index++;
-      if (candidate === marker.delimiter) { closed = true; break; }
-      body.push(candidate);
-    }
-    if (!closed) return { decision: "ask" };
-    bodies.push({ lines: body, quoted: marker.quoted });
-  }
+  const collected = collectBodies(lines, markers);
+  if (collected === undefined) return { decision: "ask" };
 
   // The header line is script, and so is the text after the bodies — but only if
   // the bodies really end where the raw text says. The header is analyzed on its
@@ -399,34 +446,66 @@ function analyzeHeredoc(command: string, projectDir: string | undefined, binding
   // including the last one, whose `\`-newline joins the terminator line into the
   // body. That has to fail closed before the tail is judged, or a tail that is
   // really body data would deny. A quoted body keeps its backslashes literally.
-  for (const body of bodies) {
-    if (body.quoted) continue;
-    if (body.lines.some((line) => line.endsWith("\\"))) return { decision: "ask" };
+  if (collected.bodies.some(unstableBoundary)) return { decision: "ask" };
+  return heredocTailVerdict(firstLine, lines, collected, header, projectDir, binding);
+}
+
+/** Reads every heredoc body in order; undefined when one never terminates. */
+function collectBodies(lines: readonly string[], markers: readonly HeredocMarker[]): { bodies: HeredocBody[]; end: number } | undefined {
+  const bodies: HeredocBody[] = [];
+  let index = 1;
+  for (const marker of markers) {
+    const body: string[] = [];
+    let closed = false;
+    while (index < lines.length) {
+      const candidate = marker.stripTabs ? lines[index].replace(/^\t+/, "") : lines[index];
+      index++;
+      if (candidate === marker.delimiter) { closed = true; break; }
+      body.push(candidate);
+    }
+    if (!closed) return undefined;
+    bodies.push({ lines: body, quoted: marker.quoted });
   }
+  return { bodies, end: index };
+}
+
+/** True when a body line's trailing backslash can move the terminator. */
+function unstableBoundary(body: HeredocBody): boolean {
+  return !body.quoted && body.lines.some((line) => line.endsWith("\\"));
+}
+
+/** True when an unquoted body can run a substitution during expansion. */
+function expandedBody(body: HeredocBody): boolean {
+  return !body.quoted && DYNAMIC_SYNTAX.test(body.lines.join("\n"));
+}
+
+/** Judges the tail after the bodies and folds it with the header verdict. */
+function heredocTailVerdict(firstLine: string, lines: readonly string[], collected: { bodies: HeredocBody[]; end: number },
+  header: Verdict, projectDir: string | undefined, binding: HomeBinding): Verdict {
   // The tail is analyzed as its own script so a further heredoc there is routed
   // the same way, and a blocked command spanning a quoted newline is still seen
   // whole.
-  const tail = lines.slice(index).join("\n");
-  invalidateHeredocHome(bodies, binding);
+  const tail = lines.slice(collected.end).join("\n");
+  invalidateHeredocHome(collected.bodies, binding);
   const rest: Verdict = tail ? analyze(tail, projectDir, binding) : { decision: "allow" };
   if (rest.decision === "deny") return rest;
-  let ask = header.decision === "ask" || rest.decision === "ask";
-  const review = header.decision === "review" || rest.decision === "review";
   // Unquoted heredoc bodies undergo command and parameter expansion. That can run
   // a substitution, so it fails closed, but it cannot move the terminator: the
   // tail denied above stays a deny.
-  for (const body of bodies) {
-    if (body.quoted) continue;
-    if (DYNAMIC_SYNTAX.test(body.lines.join("\n"))) return { decision: "ask" };
-  }
+  const ask = header.decision === "ask" || rest.decision === "ask" ||
+    collected.bodies.some(expandedBody) || headerRunsShell(firstLine);
+  if (ask) return { decision: "ask" };
+  return { decision: header.decision === "review" || rest.decision === "review" ? "review" : "allow" };
+}
+
+/** True when the header's own executable is unbounded, or the header cannot parse. */
+function headerRunsShell(firstLine: string): boolean {
   try {
     const words = parseShell(firstLine).filter((token): token is string => typeof token === "string");
     const executable = resolveExecutable(words);
-    if (executable === undefined || SHELLS.has(executable.name) || SCRIPT_HOSTS.has(executable.name) ||
-        DYNAMIC.has(executable.name) || STATEFUL.has(executable.name)) ask = true;
-  } catch { return { decision: "ask" }; }
-  if (ask) return { decision: "ask" };
-  return { decision: review ? "review" : "allow" };
+    return executable === undefined || SHELLS.has(executable.name) || SCRIPT_HOSTS.has(executable.name) ||
+      DYNAMIC.has(executable.name) || STATEFUL.has(executable.name);
+  } catch { return true; }
 }
 
 /**
@@ -442,24 +521,29 @@ function analyzeHeredoc(command: string, projectDir: string | undefined, binding
  */
 export function recursiveExternalDelete(words: readonly string[], projectDir?: string, worktreeRoot?: string): boolean {
   if (words[0] !== "rm") return false;
-  let risky = false;
-  let end = false;
-  const targets: string[] = [];
-  for (const word of words.slice(1)) {
-    if (!end && word === "--") { end = true; continue; }
-    if (!end && word.startsWith("--")) {
-      // Prefix matching covers `--recursi`/`--forc` and other unambiguous prefixes.
-      if (isLongOption(word, "--recursive") || isLongOption(word, "--force")) risky = true;
-      continue;
-    }
-    if (!end && word.startsWith("-") && word.length > 1) {
-      if (/^-[^-]*[rRf]/.test(word)) risky = true;
-      continue;
-    }
-    targets.push(word);
+  const scan = scanRmArguments(words.slice(1));
+  if (!scan.risky || !scan.targets.length) return false;
+  return scan.targets.some((target) => establishedExternalTarget(target, projectDir, worktreeRoot));
+}
+
+/** Separates recursive/forced flags from operand targets, as `rm` reads them. */
+function scanRmArguments(args: readonly string[]): { risky: boolean; targets: string[] } {
+  const scan: RmScan = { risky: false, end: false, targets: [] };
+  for (const word of args) consumeRmWord(scan, word);
+  return { risky: scan.risky, targets: scan.targets };
+}
+
+interface RmScan { risky: boolean; end: boolean; targets: string[] }
+
+function consumeRmWord(scan: RmScan, word: string): void {
+  if (scan.end || !word.startsWith("-") || word.length <= 1) { scan.targets.push(word); return; }
+  if (word === "--") { scan.end = true; return; }
+  if (word.startsWith("--")) {
+    // Prefix matching covers `--recursi`/`--forc` and other unambiguous prefixes.
+    scan.risky ||= isLongOption(word, "--recursive") || isLongOption(word, "--force");
+    return;
   }
-  if (!risky || targets.length === 0) return false;
-  return targets.some((target) => establishedExternalTarget(target, projectDir, worktreeRoot));
+  scan.risky ||= /^-[^-]*[rRf]/.test(word);
 }
 
 /**
@@ -511,24 +595,40 @@ export function visibleShellDeny(resources: readonly string[], projectDir?: stri
     for (const line of lines.slice(0, certain)) {
       const visible = visiblePrefix(line).trim();
       if (!visible || visible.startsWith("#")) continue;
-      if (FORK_BOMB.test(visible)) return "dangerous shell operation";
-      const parsed = parseShellCommands(visible, { maxChars: MAX_COMMAND_BYTES, homeBinding });
-      if (parsed === undefined) { homeBinding.trusted = false; continue; }
-      if (protectedCommands(parsed, projectDir))
-        return "protected path access";
-      const commands = parsed.segments.map((segment) => effectiveInvocation(staticSegmentWords(segment)));
-      for (const command of commands) {
-        const blocked = denyInvocation(command.argv);
-        if (blocked !== undefined) return blocked;
-      }
-      if (commands.some((command) => recursiveExternalDelete(command.argv, projectDir, worktreeRoot)))
-        return "Recursive/force deletion outside the project";
-      if (!parsed.complete) continue;
-      try { if (hasRemoteShellPipe(parseShell(visible))) return "remote download piped to a shell"; }
-      catch { /* Unknown pipeline shape is review evidence, not a deny. */ }
+      const denied = visibleShellLineDeny(visible, projectDir, worktreeRoot, homeBinding);
+      if (denied !== undefined) return denied;
     }
   }
   return undefined;
+}
+
+/** Mandatory denies visible in one literal, balanced line prefix. */
+function visibleShellLineDeny(visible: string, projectDir: string | undefined, worktreeRoot: string | undefined,
+  homeBinding: HomeBinding): string | undefined {
+  if (FORK_BOMB.test(visible)) return "dangerous shell operation";
+  const parsed = parseShellCommands(visible, { maxChars: MAX_COMMAND_BYTES, homeBinding });
+  if (parsed === undefined) { homeBinding.trusted = false; return undefined; }
+  if (protectedCommands(parsed, projectDir)) return "protected path access";
+  const commands = parsed.segments.map((segment) => effectiveInvocation(staticSegmentWords(segment)));
+  const blocked = blockedInvocation(commands);
+  if (blocked !== undefined) return blocked;
+  if (commands.some((command) => recursiveExternalDelete(command.argv, projectDir, worktreeRoot)))
+    return "Recursive/force deletion outside the project";
+  if (!parsed.complete) return undefined;
+  return visibleRemotePipeDeny(visible);
+}
+
+function blockedInvocation(commands: readonly { argv: readonly string[] }[]): string | undefined {
+  for (const command of commands) {
+    const blocked = denyInvocation(command.argv);
+    if (blocked !== undefined) return blocked;
+  }
+  return undefined;
+}
+
+function visibleRemotePipeDeny(visible: string): string | undefined {
+  try { return hasRemoteShellPipe(parseShell(visible)) ? "remote download piped to a shell" : undefined; }
+  catch { return undefined; /* Unknown pipeline shape is review evidence, not a deny. */ }
 }
 
 function analyze(command: string, projectDir: string | undefined, binding: HomeBinding): Verdict {
@@ -587,9 +687,7 @@ function analyze(command: string, projectDir: string | undefined, binding: HomeB
 
 export function guardShell(resources: readonly string[], projectDir?: string): ReviewResult | undefined {
   if (process.platform === "win32") return { decision: "ask", reason: "Shell dialect requires manual approval" };
-  if (!resources.length || resources.length > 256 || resources.some((resource) => resource.length > MAX_COMMAND_CHARS) ||
-      resources.reduce((sum, resource) => sum + Buffer.byteLength(resource), 0) > MAX_COMMAND_BYTES)
-    return { decision: "ask", reason: "Shell command exceeds parsing limits" };
+  if (!withinGuardLimits(resources)) return { decision: "ask", reason: "Shell command exceeds parsing limits" };
   let ask = false;
   let review = false;
   for (const resource of resources) {
@@ -600,6 +698,13 @@ export function guardShell(resources: readonly string[], projectDir?: string): R
   }
   if (ask) return { decision: "ask", reason: "Shell syntax requires further review" };
   return review ? undefined : { decision: "allow", reason: "read-only command" };
+}
+
+/** Count and per-resource/aggregate byte caps for one guard invocation. */
+function withinGuardLimits(resources: readonly string[]): boolean {
+  return resources.length > 0 && resources.length <= 256 &&
+    resources.every((resource) => resource.length <= MAX_COMMAND_CHARS) &&
+    resources.reduce((sum, resource) => sum + Buffer.byteLength(resource), 0) <= MAX_COMMAND_BYTES;
 }
 
 function addPathRedirect(redirects: string[], target: string, operator: string, expanded: boolean): void {
