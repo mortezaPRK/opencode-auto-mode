@@ -17,8 +17,13 @@ import { codeModeIdentityRegression } from "./code-mode-identity.js";
 type Verdict = "allow" | "deny" | "ask";
 type DecisionMode = Verdict | "low" | "invalid" | "timeout";
 type Profile = { reviewer?: string; sameModelReviewer?: boolean; timeout?: boolean; reviewerFailure?: boolean; decision?: DecisionMode; tool?: FixtureTool; issued?: boolean };
+// Heavy first-request scoring can take over a second on a loaded machine. Keep
+// the scratch whole-review deadline above that startup cost; stage-local
+// timeout tests below still set their own short timeoutMs.
+const REVIEW_TIMEOUT_MS = 5_000;
 type SystemOneQuestion = { type?: string; criteria?: Record<string, unknown> };
 type SystemOneBody = { model: string; state?: unknown; questions: Record<string, SystemOneQuestion> };
+type OpenAiDecisionBody = { model: string; questions: { type: string; name: string }[]; input?: { role?: string; content?: unknown }[] };
 type ChatCompletionBody = { model: string; messages?: unknown; tools?: { function: { name: string } }[]; stream?: boolean };
 const plugin = resolve(process.env.OPENCODE_PLUGIN_PATH ?? fileURLToPath(new URL("..", import.meta.url)));
 const tempRoot = join(tmpdir(), "opencode"); mkdirSync(tempRoot, { recursive: true });
@@ -34,30 +39,76 @@ const results: string[] = [];
 let caseCount = 0;
 const markers: string[] = [];
 const reviewerInputs: string[] = [];
+// Predicate probabilities for the native decision fixture. `deny` stays a
+// confident negative answer: the decision stage must abstain and let the
+// configured LLM (or human) handle it rather than denying on its own.
+function decisionProbabilities(mode: DecisionMode): { safety: number; authorization: number } {
+  if (mode === "allow") return { safety: 0.98, authorization: 0.98 };
+  if (mode === "deny") return { safety: 0.02, authorization: 0.98 };
+  if (mode === "low") return { safety: 0.4, authorization: 0.3 };
+  if (mode === "ask") return { safety: 0.98, authorization: 0.4 };
+  return { safety: 0.98, authorization: 0.98 };
+}
 function sendJson(res: ServerResponse, value: unknown) {
   res.writeHead(200, { "content-type": "application/json" });
   res.end(JSON.stringify(value));
 }
-function decisionChoice(mode: DecisionMode): string {
-  return mode === "low" || mode === "invalid" ? "allow" : mode;
+function sendIncomplete(res: ServerResponse) {
+  res.writeHead(200);
+  res.write("{");
 }
-function decisionProbabilities(mode: DecisionMode): Record<string, number> {
-  if (mode === "invalid") return { allow: 0.98, deny: 0.98, ask: 0.98 };
-  if (mode === "low") return { allow: 0.4, deny: 0.3, ask: 0.3 };
-  const choice = decisionChoice(mode);
-  return Object.fromEntries(["allow", "deny", "ask"].map((value) => [value, value === choice ? 0.98 : 0.01]));
+function systemOneAnswers(mode: DecisionMode) {
+  const probabilities = decisionProbabilities(mode);
+  if (mode === "invalid")
+    // Structurally valid native output, but a choice answer where the plugin
+    // requires a predicate: exercise plugin validation rather than SDK wire rejection.
+    return { safety: { type: "choice", choice: "allow", probabilities: { allow: 0.98 }, confidence: 0.98 },
+      authorization: { type: "noul", noul: probabilities.authorization } };
+  return { safety: { type: "noul", noul: probabilities.safety },
+    authorization: { type: "noul", noul: probabilities.authorization } };
+}
+function openAiAnswers(mode: DecisionMode) {
+  const probabilities = decisionProbabilities(mode);
+  if (mode === "invalid")
+    // Native-valid refusal answer where the plugin requires predicates:
+    // exercise plugin validation rather than SDK wire rejection.
+    return [{ type: "refusal", name: "safety", message: "fixture refusal" },
+      { type: "predicate", name: "authorization", probability: probabilities.authorization }];
+  return [{ type: "predicate", name: "safety", probability: probabilities.safety },
+    { type: "predicate", name: "authorization", probability: probabilities.authorization }];
+}
+function handleDecisionSystemOne(res: ServerResponse, body: SystemOneBody) {
+  calls.push("decision");
+  // System One keys answers by the exact predicate question names and uses
+  // `noul` probabilities for predicate questions. The native SDK maps those
+  // back to the `{type:"predicate",name,probability}` array the plugin sees.
+  assert.deepEqual(Object.keys(body.questions).sort(), ["authorization", "safety"]);
+  assert.ok(["safety", "authorization"].every((name) => body.questions[name]?.type === "noul"),
+    "native SDK lowered predicate questions into System One noul questions");
+  const mode = profile.decision ?? "low";
+  if (mode === "timeout") { sendIncomplete(res); return; }
+  sendJson(res, { model: "decision", answers: systemOneAnswers(mode) });
 }
 function handleSystemOne(res: ServerResponse, body: SystemOneBody) {
-  calls.push("decision");
   assert.equal(body.model, "decision");
-  assert.ok(body.questions.permission && body.state, "native SDK lowered questions/input into decision wire protocol");
+  assert.ok(body.state, "native SDK lowered input into decision state");
+  const names = Object.keys(body.questions).sort().join(",");
+  assert.equal(names, "authorization,safety");
+  return handleDecisionSystemOne(res, body);
+}
+function handleOpenAiDecisions(req: IncomingMessage, res: ServerResponse, body: OpenAiDecisionBody) {
+  calls.push("openai-decision");
+  assert.equal(body.model, "decision");
+  assert.equal(req.headers.authorization, "Bearer fixture-key");
+  // OpenAI decisions receive the questions as an array and answer them as
+  // an array of native predicate results.
+  assert.deepEqual(body.questions.map(({ type, name }: { type: string; name: string }) => `${type}:${name}`),
+    ["predicate:safety", "predicate:authorization"]);
+  assert.ok(Array.isArray(body.input) && body.input[0]?.role === "user" && body.input[0]?.content,
+    "native SDK lowered decision input into an OpenAI user message");
   const mode = profile.decision ?? "low";
-  if (mode === "timeout") { res.writeHead(200); res.write("{"); return; }
-  // Structurally valid native output, but inconsistent probabilities in the
-  // invalid case: exercise plugin validation rather than SDK wire rejection.
-  sendJson(res, { model: "decision", answers: { permission: {
-    type: "choice", choice: decisionChoice(mode), confidence: mode === "low" ? 0.4 : 0.98, probabilities: decisionProbabilities(mode),
-  } } });
+  if (mode === "timeout") { sendIncomplete(res); return; }
+  sendJson(res, { model: "decision", answers: openAiAnswers(mode) });
 }
 // One explicitly opted-in case uses the agent model ID as the reviewer so a
 // same-model reviewer can be exercised without inventing a second identity.
@@ -80,7 +131,7 @@ function handleChatCompletion(req: IncomingMessage, res: ServerResponse, body: C
     reviewerInputs.push(JSON.stringify(body.messages));
     calls.push("reviewer");
     if (profile.reviewerFailure) { res.writeHead(400); res.end("fixture deliberate provider error"); return; }
-    if (profile.timeout) { res.writeHead(200, { "content-type": "application/json" }); res.write("{"); return; }
+    if (profile.timeout) { sendIncomplete(res); return; }
   }
   const tool = selectChatTool(body, reviewer);
   if (tool) profile.issued = true;
@@ -97,6 +148,7 @@ async function handleFixtureRequest(req: IncomingMessage, res: ServerResponse) {
     if (req.url?.startsWith("/marker/")) { markers.push(req.url); res.writeHead(200); res.end("fixture marker"); return; }
     const body = await readRequestBody(req);
     if (req.url === "/v1/systemone") return handleSystemOne(res, body as SystemOneBody);
+    if (req.url === "/v1/decisions") return handleOpenAiDecisions(req, res, body as OpenAiDecisionBody);
     return handleChatCompletion(req, res, body as ChatCompletionBody);
   } catch { res.writeHead(500); res.end("internal error"); }
 }
@@ -112,7 +164,10 @@ const globalConfig = {
     models: { [FIXTURE_AGENT_MODEL]: { name: "Invented worker fixture" }, [FIXTURE_REVIEWER_MODEL]: { name: "Invented reviewer fixture" } } },
     "fixture-decision": { package: "@opencode/ai/providers/opencode/decisions",
       settings: { baseURL: `${endpoint}/v1`, apiKey: "fixture-key" },
-      models: { decision: { name: "Invented native decision fixture", type: "decision" } } } },
+      models: { decision: { name: "Invented System One decision fixture", type: "decision" } } },
+    "fixture-openai-decision": { package: "@opencode/ai/providers/vercel-ai-gateway/decisions",
+      settings: { baseURL: `${endpoint}/v1`, apiKey: "fixture-key" },
+      models: { decision: { name: "Invented OpenAI decision fixture", type: "decision" } } } },
 };
 const configFile = join(root, "config/opencode/opencode.json");
 writeFileSync(configFile, JSON.stringify(globalConfig));
@@ -166,7 +221,7 @@ async function fixture(options: Record<string, unknown> = {}, permissions = [{ a
     ...(globalPolicies === undefined ? {} : { policies: globalPolicies }),
     plugins: [{ package: plugin, options: { classifiers: [{ type: "static" },
       { type: "llm", model: `${FIXTURE_PROVIDER}/${FIXTURE_REVIEWER_MODEL}` }],
-      reviewTimeoutMs: 1000, audit: { enabled: true }, ...options } }],
+      reviewTimeoutMs: REVIEW_TIMEOUT_MS, audit: { enabled: true }, ...options } }],
   }));
   // Sequential cases change only scratch global options. Explicitly target this
   // scratch server; never discover/reload the user's shared background service.
@@ -190,7 +245,7 @@ async function fixture(options: Record<string, unknown> = {}, permissions = [{ a
       // Invalid configuration must stay visibly invalid with its parse error;
       // valid configuration must expose the new review timeout.
       const matching = value.plugin?.state.status === "active" && value.status?.mode === expectedMode &&
-        (expectedMode === "invalid" ? typeof value.status?.configError === "string" : value.status?.reviewTimeoutMs === 1000);
+        (expectedMode === "invalid" ? typeof value.status?.configError === "string" : value.status?.reviewTimeoutMs === REVIEW_TIMEOUT_MS);
       const current = JSON.stringify(value);
       consecutive = matching ? current === fingerprint ? consecutive + 1 : 1 : 0;
       fingerprint = current;
@@ -595,18 +650,29 @@ try {
     await setMode(native, "off"); calls.length = 0;
     await expectPermission(native, "allow", ["cat .env"]); assert.deepEqual(calls, []);
   });
-  for (const mode of ["allow", "deny", "low", "ask", "invalid", "timeout"] as const) await run(`decision confidence routing: ${mode}`, async () => {
-    const f = await fixture({ classifiers: [{ type: "static" },
-      { type: "decision", model: "fixture-decision/decision", timeoutMs: 100, minConfidence: 0.9 },
-      { type: "llm", model: `${FIXTURE_PROVIDER}/${FIXTURE_REVIEWER_MODEL}` }] });
-    profile.decision = mode; calls.length = 0;
-    await expectPermission(f, mode === "deny" ? "deny" : "allow", ["bun test"]);
-    assert.deepEqual(calls, mode === "allow" || mode === "deny" ? ["decision"] : ["decision", "reviewer"]);
-  });
+  for (const decision of [
+    { name: "System One", model: "fixture-decision/decision", call: "decision" },
+    { name: "OpenAI", model: "fixture-openai-decision/decision", call: "openai-decision" },
+  ] as const) for (const mode of ["allow", "deny", "low", "ask", "invalid", "timeout"] as const)
+    await run(`decision confidence routing (${decision.name}): ${mode}`, async () => {
+      const f = await fixture({ classifiers: [{ type: "static" },
+        { type: "decision", model: decision.model, timeoutMs: 100, minConfidence: 0.9 },
+        { type: "llm", model: `${FIXTURE_PROVIDER}/${FIXTURE_REVIEWER_MODEL}` }] });
+      profile.decision = mode;
+      profile.reviewer = mode === "deny" ? "DENY: fixture decision-stage negative" : "ALLOW: fixture fallback authorized";
+      calls.length = 0;
+      await expectPermission(f, mode === "deny" ? "deny" : "allow", ["bun test"]);
+      assert.deepEqual(calls, mode === "allow" ? [decision.call] : [decision.call, "reviewer"]);
+      // A confident negative predicate and every uncertain/error case abstain
+      // from the decision stage; the LLM fallback, not the decision stage, decides.
+      assert.equal((await summary(f)).stage, mode === "allow" ? "decision" : "reviewer");
+    });
   for (const mode of ["invalid", "timeout"] as const) await run(`native decision ${mode} has categorized summary audit`, async () => {
-    const f = await fixture({ classifiers: [{ type: "decision", model: "fixture-decision/decision", timeoutMs: 100 }] });
+    // The OpenAI decisions array can carry a native-valid non-predicate answer,
+    // so the plugin, not the SDK wire schema, rejects the invalid case.
+    const f = await fixture({ classifiers: [{ type: "decision", model: "fixture-openai-decision/decision", timeoutMs: 100 }] });
     profile.decision = mode; calls.length = 0;
-    await expectPermission(f, "ask", ["bun test"]); assert.deepEqual(calls, ["decision"]);
+    await expectPermission(f, "ask", ["bun test"]); assert.deepEqual(calls, ["openai-decision"]);
     const record = await summary(f);
     assert.equal(record.errorKind, mode === "invalid" ? "invalid-output" : "timeout");
     assert.equal(record.stage, "decision"); assert.equal(record.decision, "ask");

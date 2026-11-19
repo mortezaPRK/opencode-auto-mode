@@ -19,7 +19,7 @@ review expectations.
 | `src/worktree.ts` | Discovers the session's current worktree root and canonical location. |
 | `src/gates.ts` | VCS preconditions for history-changing commands. Missing facts fail toward review. |
 | `src/classifier.ts` | Ordered classifier pipeline. First decisive allow/deny wins; otherwise ask. |
-| `src/decision.ts` | Native typed decision stage using `ctx.experimental.generate.decisions`. |
+| `src/decision.ts`, `src/decision-evidence.ts` | Native typed decision stage using `ctx.experimental.generate.decisions`, plus the compact evidence builder shared with replay. |
 | `src/reviewer.ts` | LLM reviewer prompt, evidence filtering, response parsing, and deny-gate behavior. |
 | `src/code-mode.ts` | Code Mode SHA-256 identity, save entry, identity validation, and reviewer source resource. |
 | `src/mode.ts` | Durable per-session mode, daily counts, breaker window, and cancellation repair. |

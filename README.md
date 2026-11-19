@@ -14,9 +14,12 @@ invalid configuration fail closed.
   and provider credentials belong in your personal OpenCode provider config.
   This repository supplies no model, endpoint, credential, or allowlist.
 - **Data egress:** a configured `decision` or `llm` stage sends the action and
-  resources (including full Code Mode source), agent, project/worktree, git
-  state, and up to 12 KB of user messages to that model's provider, even with
-  audit off. Choose a provider you trust.
+  resources (including full Code Mode source), project/worktree, and up to 12 KB
+  of user text to that model's provider, even with audit off. The decision stage
+  sends compact evidence plus selected operation details. The llm stage also
+  receives the agent, broader bounded evidence, and Git state. The decision
+  stage includes Git state only for git-related actions. Choose a provider you
+  trust.
 
 ## Install
 
@@ -54,7 +57,20 @@ For native typed decisions, add a `decision` stage between `static` and `llm`:
 ```
 
 Only add this stage if your OpenCode provider supports native decisions. The
-plugin has no HTTP decision adapter or custom endpoint option.
+plugin has no HTTP decision adapter or custom endpoint option. The stage asks
+two separate predicate questions, `safety` and `authorization`; they are not
+claimed to be statistically independent. It allows only when both model-reported
+probabilities meet `minConfidence` (default `0.9`); otherwise it abstains.
+Ordinary abstentions continue to the next configured stage. Terminal evidence
+loss is limited to resource-body redaction, an external directory without a
+verified target, or an explicitly incomplete operation whose only resources are
+`*`. It never denies. `minConfidence` is a per-predicate probability
+floor, not a confidence in a chosen label; lower values are more permissive and
+probabilities are not a calibrated certainty guarantee. The decision stage
+receives compact evidence: the action and resources, selected operation details
+when available, the host platform and requested shell interpreter (bounded), and
+one chronological user-message source. Ordinary incomplete operation evidence
+abstains before generation; terminal evidence loss is scoped as above.
 
 Keep the plugin registration in global config only. Do not add the full plugin to
 project config, `cli.json`, or `.opencode/plugins/` as well: the plugin reads its
@@ -111,7 +127,7 @@ Stage shapes:
 | Stage | Shape |
 | --- | --- |
 | `static` | `{ "type": "static", "allowInProjectEdits"?: boolean }` |
-| `decision` | `{ "type": "decision", "model": "<provider>/<model>", "timeoutMs"?: number, "minConfidence"?: number }` |
+| `decision` | `{ "type": "decision", "model": "<provider>/<model>", "timeoutMs"?: number, "minConfidence"?: number }`. Allows only when both `safety` and `authorization` predicates meet `minConfidence` (default `0.9`); otherwise abstains. |
 | `llm` | `{ "type": "llm", "model": "<provider>/<model>", "timeoutMs"?: number }` |
 
 ## How review works
@@ -133,8 +149,9 @@ Stage shapes:
    low-risk: it loads instructions, not executable code; later tool calls are
    checked separately.
 4. Configured classifiers run in array order. A static stage may resolve low-risk
-   work; a decision stage uses OpenCode's native decision API; an LLM stage uses
-   its explicit reviewer. The first decisive allow or deny stops the chain.
+   work; a decision stage uses OpenCode's native decision API and allows only
+   when both predicate probabilities clear the threshold; an LLM stage uses its
+   explicit reviewer. The first decisive allow or deny stops the chain.
 5. Exhaustion, unusable context, interruption, failure, or timeout resolves to
    **ask**. A deny ends with `Continue with a safer alternative.`
 
@@ -172,9 +189,9 @@ flowchart TD
     subgraph R [runClassifiers]
       R0{score deny/ask?} -- yes --> X1
       R0 -- no --> R1[static: low → ALLOW<br/>else abstain]
-      R1 -- abstain --> R2[decision: native generate.decisions<br/>confidence ≥ 0.9]
-      R2 -- ask / low confidence --> R3[llm: native generate.text]
-      R2 -- allow / deny --> T[terminal]
+      R1 -- abstain --> R2[decision: safety & authorization ≥ 0.9<br/>allow only when both clear]
+      R2 -- either below / malformed / error --> R3[llm: native generate.text]
+      R2 -- allow --> T[terminal]
       R3 -- allow / deny --> T
       R3 -- ask / unresolved --> X2
     end
@@ -184,6 +201,27 @@ flowchart TD
     T --> F
     F --> G[apply effect to host]
 ```
+
+### Decision evidence and fallback
+
+The decision stage builds compact evidence once: action and resources, optional
+selected operation details from host metadata and the captured tool call when
+available, the host platform and requested shell interpreter (bounded), one
+chronological user-message source, concrete static-analysis
+findings, and git state only for git-related actions. Raw metadata/source blobs
+and agent prose are not sent. If a shared call identity makes the capture
+unavailable or ambiguous, the operation is incomplete rather than guessed.
+
+Ordinary incomplete operation evidence abstains before generation and continues.
+Terminal evidence loss is limited to resource-body redaction, an external
+directory without a verified target, or an explicitly incomplete operation whose
+only resources are `*`. A complete unknown MCP operation with sanitized arguments
+is not terminal; it remains model-reviewed. Unknown capability is not
+structurally safe, so the safety probability must account for it. The LLM may
+infer semantics from the exact tool and arguments, but there is no declared
+verification. An ordinary abstain is not a deny: later stages may still allow,
+deny, or ask. LLM output is not ground truth. Malformed output, provider errors,
+timeouts, and exhaustion end in **ask** when no later stage decides.
 
 ## Safety limits
 
