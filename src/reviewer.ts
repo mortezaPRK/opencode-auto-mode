@@ -37,10 +37,11 @@ export interface ReviewResult extends Omit<StageResult, "decision"> { decision: 
 /** Excludes metadata/source blobs. Resources can still contain programs or file content;
  * omit recognizable inline HTTP bodies, but never obscure executable scripts as safe evidence. */
 export function reviewEvidence(req: PermissionRequest) {
+  const resourceIncomplete = req.resources.some((resource) => redactHttpBodies(resource) !== resource);
   return {
     action: req.action,
     resources: req.resources.map((resource) => redactHttpBodies(resource)),
-    ...(req.resources.some((resource) => redactHttpBodies(resource) !== resource) ? { incompleteEvidence: "Inline HTTP body or remaining arguments omitted; do not approve from partial evidence" } : {}),
+    ...(resourceIncomplete ? { incompleteEvidence: "Inline HTTP body or remaining arguments omitted; do not approve from partial evidence" } : {}),
     agent: req.agent,
     projectDir: req.projectDir,
     worktreeRoot: req.worktreeRoot,
@@ -98,22 +99,48 @@ export interface ReviewerContext {
 /** Opt-in local debugging only: receives the original exception, never a serialized result field. */
 export type ReviewErrorObserver = (error: unknown) => void;
 
+/** Shared terminal evidence check used by the LLM fallback. */
+function terminalEvidenceReason(request: PermissionRequest): string | undefined {
+  if (request.resources.some((resource) => redactHttpBodies(resource) !== resource))
+    return "Inline HTTP body or ambiguous serialized evidence requires human review";
+  return undefined;
+}
+
+/** Reject unusable inputs before building or sending the prompt. */
+function reviewInputError(model: string, timeoutMs: number, signal: AbortSignal): ReviewFailure | undefined {
+  if (signal.aborted) return new ReviewFailure("cancelled", "Review cancelled");
+  if (!model.trim() || !Number.isFinite(timeoutMs) || timeoutMs <= 0) return new ReviewFailure("context", "Reviewer not configured");
+  return undefined;
+}
+
+/** Build the prompt, enforcing the request size bound. */
+function reviewPrompt(request: PermissionRequest): string {
+  const prompt = buildReviewPrompt(request);
+  if (Buffer.byteLength(prompt) > 65_536) throw new EvidenceFailure("Review request too large");
+  return prompt;
+}
+
+function reviewErrorKind(error: unknown, signal: AbortSignal, bounded: AbortSignal | undefined): ReviewErrorKind {
+  const localTimeout = !signal.aborted && bounded?.aborted && bounded.reason instanceof DOMException && bounded.reason.name === "TimeoutError";
+  if (localTimeout) return "timeout";
+  return signal.aborted ? "cancelled" : errorKindOf(error);
+}
+
 /** One reasoning call, bounded even if a provider ignores cancellation. */
 export async function reviewRequest(ctx: ReviewerContext, request: PermissionRequest, model: string, signal: AbortSignal, timeoutMs: number, onError?: ReviewErrorObserver): Promise<StageResult> {
   let bounded: AbortSignal | undefined;
   try {
-    if (signal.aborted) throw new ReviewFailure("cancelled", "Review cancelled");
-    if (!model.trim() || !Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new ReviewFailure("context", "Reviewer not configured");
-    if (request.resources.some((resource) => redactHttpBodies(resource) !== resource))
-      return { decision: "ask", terminal: true, reason: "Inline HTTP body or ambiguous serialized evidence requires human review", stage: "reviewer", errorKind: "context" };
-    const prompt = buildReviewPrompt(request);
-    if (Buffer.byteLength(prompt) > 65_536) throw new EvidenceFailure("Review request too large");
+    const inputError = reviewInputError(model, timeoutMs, signal);
+    if (inputError !== undefined) throw inputError;
+    const terminalReason = terminalEvidenceReason(request);
+    if (terminalReason !== undefined)
+      return { decision: "ask", terminal: true, reason: terminalReason, stage: "reviewer", errorKind: "context" };
+    const prompt = reviewPrompt(request);
     bounded = AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]);
     const response = await withTimeout(ctx.experimental.generate.text({ prompt, model: Model.Ref.parse(model) }, { signal: bounded }), timeoutMs, signal);
     return { ...parseDecision(response.text), stage: "reviewer" };
   } catch (error) {
     try { onError?.(error); } catch { /* Debug collection must not affect permission decisions. */ }
-    const localTimeout = !signal.aborted && bounded?.aborted && bounded.reason instanceof DOMException && bounded.reason.name === "TimeoutError";
-    return { ...terminalEvidence(error), decision: "ask", reason: "Reviewer unavailable or returned invalid output", stage: "reviewer", errorKind: localTimeout ? "timeout" : signal.aborted ? "cancelled" : errorKindOf(error) };
+    return { ...terminalEvidence(error), decision: "ask", reason: "Reviewer unavailable or returned invalid output", stage: "reviewer", errorKind: reviewErrorKind(error, signal, bounded) };
   }
 }

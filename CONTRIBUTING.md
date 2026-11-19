@@ -148,32 +148,15 @@ result of each run rather than assuming a historical count.
 scanner. Build output, dependencies, lockfiles, and license text are outside its
 coverage.
 
-## Complexity linter
+## Complexity limits
 
-All new or extracted functions must meet these limits:
+`bun run lint` runs ESLint, which enforces these limits on all non-test code:
 
 - cyclomatic complexity **<= 10**;
 - **<= 60 nonblank/non-comment lines** per function;
 - **max depth <= 4**.
 
-`bun run lint` runs ESLint plus `node scripts/complexity-lint.js`. The linter
-applies those limits to all JavaScript/TypeScript and compares each function/rule
-exceedance with `scripts/complexity-baseline.json`. Entries are keyed by file,
-rule, function label, and function or depth-block start `line:column`; anonymous
-arrows, separate depth blocks, and repeated function names therefore each need
-their own exemption.
-New exceedances and increases over a legacy entry fail. Existing legacy entries may
-shrink but not grow. Moving a legacy violation (or lines before it) changes its
-identity and is reported as new until the baseline is refreshed in a reviewed
-change, so avoid unrelated movement around legacy entries. `src/score.ts`,
-`src/score/**`, and `scripts/complexity*` are strict: they cannot be baselined or
-exempted and must pass the limits directly. Tests are not exempt from these
-limits.
-
-`node scripts/complexity-lint.js --update` records improvements only. All failure
-checks run before the file is written, so it refuses without modifying the
-baseline while new, increased, or strict scoring/tooling violations exist. Do not
-cite a different threshold.
+Test files (`*.test.ts`, `*.test.tsx`) are exempt.
 
 ## Coding conventions
 
