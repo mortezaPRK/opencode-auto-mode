@@ -3,6 +3,7 @@ import type { PermissionRequest } from "../reviewer.js";
 import { projectRoot } from "../tiers.js";
 import { isFileAction, scoreFileAction } from "./files.js";
 import { checkRequestLimits } from "./limits.js";
+import { operationPathApproval } from "./operation.js";
 import { scoreShellRequest } from "./shell.js";
 import { high, low, type RequestScore } from "./types.js";
 
@@ -22,6 +23,10 @@ export function scoreRequest(request: PermissionRequest & { worktreeRoot?: strin
   // Reject malformed requests before root discovery touches the filesystem.
   const rejected = checkRequestLimits(action, resources);
   if (rejected) return rejected;
+  // Operation arguments can name a protected store even when resources are
+  // wildcard. Only established stores deny; ambiguous paths keep normal scoring.
+  const protectedOperation = operationPathApproval(request.operation, projectDir);
+  if (protectedOperation) return protectedOperation;
   const worktreeRoot = resolveWorktreeRoot(request);
   if (action === "shell") return scopeScore(request, scoreShellRequest(request, worktreeRoot));
   if (isFileAction(action)) return scopeScore(request, scoreFileAction(action, resources, options, projectDir, worktreeRoot));

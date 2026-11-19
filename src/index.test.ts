@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { type ModeState } from "./mode.js";
 import { codeModePermission } from "./code-mode.js";
 
-interface Evaluation { sessionID: string; action: string; resources: string[]; effect: "ask" | "allow" | "deny"; message?: string; metadata?: unknown }
+interface Evaluation { sessionID: string; action: string; resources: string[]; effect: "ask" | "allow" | "deny"; message?: string; metadata?: unknown; source?: unknown }
 const configuredModel = ["test-provider", "reviewer-fixture"].join("/");
 const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 async function until(predicate: () => boolean) { for (let i = 0; i < 100; i++) { if (predicate()) return; await tick(); } throw new Error("Test condition not reached"); }
@@ -1364,5 +1364,100 @@ it("a blocked mode change with invalid config emits only the disabled message", 
       assert.doesNotMatch(replies[0].text, /Auto mode: invalid/);
     }
     assert.equal(host.shared.size, 0);
+  } finally { await host.cleanup(); }
+});
+
+it("reviews grep with the actual search root instead of the root fallback", async () => {
+  const host = await setup();
+  try {
+    const input = { ...event("ask", "grep", ["needle"]), metadata: { pattern: "needle", root: ".", path: "src" } };
+    await host.evaluate(input);
+    assert.equal(input.effect, "allow");
+    const evidence = JSON.parse(host.prompts[0].split("\n")[2]);
+    assert.equal(evidence.operation.tool, "grep");
+    assert.equal(evidence.operation.access, "read");
+    assert.equal(evidence.operation.complete, true);
+    assert.deepEqual(evidence.operation.targets, [join(host.directory, "src")]);
+    assert.deepEqual(evidence.operation.arguments, { pattern: "needle", path: "src", root: "." });
+  } finally { await host.cleanup(); }
+});
+
+it("correlates external_directory with the exact execute.before input and keeps permission resources", async () => {
+  const host = await setup();
+  try {
+    await host.execute({ filePath: "/outside/secret.txt", content: "LIVE_CONTENT" }, "write");
+    const input = { ...event("ask", "external_directory", ["/outside/*"]),
+      metadata: { filepath: "/outside/secret.txt", parentDir: "/outside" },
+      source: { type: "tool", messageID: "message-fixture", id: "call-fixture" } };
+    await host.evaluate(input);
+    const evidence = JSON.parse(host.prompts[0].split("\n")[2]);
+    assert.deepEqual(evidence.resources, ["/outside/*"]);
+    assert.equal(evidence.operation.tool, "write");
+    assert.equal(evidence.operation.access, "write");
+    assert.equal(evidence.operation.complete, true);
+    assert.deepEqual(evidence.operation.targets, ["/outside/secret.txt", "/outside"]);
+    assert.deepEqual(evidence.operation.arguments, { filePath: "/outside/secret.txt" });
+    assert.doesNotMatch(host.prompts[0], /LIVE_CONTENT/);
+  } finally { await host.cleanup(); }
+});
+
+it("does not bind external_directory to a mismatched call or secret-bearing capture", async () => {
+  const host = await setup();
+  try {
+    await host.execute({ path: "/outside/file.txt", headers: { Authorization: "Bearer CAPTURE_SECRET" },
+      body: "PRIVATE_BODY" }, "mcp__filesystem__write");
+    const mismatched = { ...event("ask", "external_directory", ["/outside/*"]),
+      metadata: { filepath: "/outside/file.txt", parentDir: "/outside" },
+      source: { type: "tool", messageID: "message-fixture", id: "other-call" } };
+    await host.evaluate(mismatched);
+    assert.equal(mismatched.effect, "ask");
+    assert.equal(host.calls.generate, 0);
+    assert.equal(host.prompts.length, 0);
+
+    const correlated = { ...event("ask", "external_directory", ["/outside/*"]),
+      metadata: { filepath: "/outside/file.txt", parentDir: "/outside" },
+      source: { type: "tool", messageID: "message-fixture", id: "call-fixture" } };
+    await host.evaluate(correlated);
+    const evidence = JSON.parse(host.prompts[0].split("\n")[2]);
+    assert.equal(evidence.operation.tool, "mcp__filesystem__write");
+    assert.equal(evidence.operation.access, "unknown");
+    assert.equal(evidence.operation.complete, false);
+    assert.doesNotMatch(host.prompts[0], /CAPTURE_SECRET|PRIVATE_BODY/);
+  } finally { await host.cleanup(); }
+});
+
+it("drops execute.before evidence after execute.after", async () => {
+  const host = await setup();
+  try {
+    await host.execute({ filePath: "/outside/file.txt" }, "write");
+    await host.toolAfter({ status: "error", tool: "write", sessionID: "primary", messageID: "message-fixture",
+      id: "call-fixture", error: "fixture failure" });
+    const input = { ...event("ask", "external_directory", ["/outside/*"]),
+      metadata: { filepath: "/outside/file.txt", parentDir: "/outside" },
+      source: { type: "tool", messageID: "message-fixture", id: "call-fixture" } };
+    await host.evaluate(input);
+    assert.equal(input.effect, "ask");
+    assert.equal(host.calls.generate, 0);
+    assert.equal(host.prompts.length, 0);
+  } finally { await host.cleanup(); }
+});
+
+it("does not ask the model to approve an opaque incomplete external scope", async () => {
+  const host = await setup();
+  try {
+    const input = event("ask", "external_directory", ["/outside/*"]);
+    await host.evaluate(input);
+    assert.equal(input.effect, "ask");
+    assert.equal(host.calls.generate, 0);
+  } finally { await host.cleanup(); }
+});
+
+it("does not ask the model to approve an incomplete MCP wildcard scope", async () => {
+  const host = await setup();
+  try {
+    const input = event("ask", "mcp__opaque", ["*"]);
+    await host.evaluate(input);
+    assert.equal(input.effect, "ask");
+    assert.equal(host.calls.generate, 0);
   } finally { await host.cleanup(); }
 });
