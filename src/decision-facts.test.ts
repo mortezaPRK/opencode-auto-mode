@@ -1364,6 +1364,20 @@ it("abstains without a tool call when an execute script hides a protected path b
   }
 });
 
+it("abstains without a tool call when comments or regex literals hide a protected path", async () => {
+  const scripts = [
+    "// '\nawait tools.read({ path: '.env' });",
+    'const r = /"/; await tools.read({ path: ".env" });',
+  ];
+  for (const script of scripts) {
+    const fake = responder([toolReadonlyReply(true, 0.99)]);
+    const result = await classifyOperationFacts(fake.ctx, options(), executeRequest(script));
+    assert.equal(result.kind, "unknown", script);
+    assert.equal(result.errorKind, "context", script);
+    assert.equal(fake.calls(), 0, script);
+  }
+});
+
 it("keeps an execute script without protected paths eligible", async () => {
   const fake = responder([toolReadonlyReply(true, 0.97)]);
   const script = "const page = await tools.webfetch({ url: 'https://example.invalid/readme' });";
@@ -1387,6 +1401,23 @@ it("keeps access-unknown and access-read tool calls eligible for tool_readonly",
     assert.equal(result.kind, "inspection", access);
     assert.equal(fake.calls(), 1, access);
   }
+});
+
+it("asks the tool question for a complete operation with no captured arguments", async () => {
+  const inputs: string[] = [];
+  const ctx = context(async (input) => {
+    const part = input.input[0];
+    inputs.push(part?.type === "text" ? part.text : "");
+    return toolReadonlyReply(true, 0.96)();
+  });
+  const request: OperationFactRequest = {
+    action: "todoread", resources: [], projectDir: "/repo", worktreeRoot: "/repo",
+    operation: { tool: "todoread", access: "read", complete: true },
+  };
+  const result = await classifyOperationFacts(ctx, options(), request);
+  assert.equal(result.kind, "inspection");
+  assert.equal(result.probability, 0.96);
+  assert.deepEqual(JSON.parse(inputs[0] ?? ""), { tool: "todoread", access: "read", arguments: {} });
 });
 
 it("abstains without a tool call when the operation declares write access", async () => {

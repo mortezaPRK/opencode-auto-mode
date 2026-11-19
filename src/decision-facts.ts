@@ -209,7 +209,6 @@ const SCRIPT_PROTECTED_REASON = "Execute script names a protected path or creden
 const WRITE_ACCESS_REASON = "Declared write access has no read-only operation fact";
 /** Shared with fact-review: a write-capable tool can never certify inspection. */
 export const WRITE_TOOL_REFUSAL_REASON = "Write-capable tool has no read-only operation fact";
-const NO_ARGUMENTS_REASON = "Tool operation has no captured arguments";
 const NO_COMMAND_REASON = "Shell operation has no complete captured command";
 const NO_CWD_REASON = "Shell operation has no usable explicit cwd";
 const UNCONFINED_CD_REASON = "Shell leading cd target is not a confined literal path";
@@ -541,6 +540,9 @@ function toolCallTool(evidence: DecisionEvidence): ToolCall {
 
 /** One quoted string literal in a Code Mode script; escapes stay intact. */
 const SCRIPT_STRING = /(["'`])((?:\\[\s\S]|(?!\1)[^\\])*)\1/g;
+/** Raw-script token separator: quotes, comment markers, regex literals and
+ * punctuation split tokens, so no lexical context can join a protected name. */
+const SCRIPT_TOKEN_SEPARATOR = /[^A-Za-z0-9_.-]+/;
 /** Credential-store directories anywhere in one script string. */
 const PROTECTED_DIRECTORY = /^(?:\.ssh|\.aws|\.gnupg|\.git|\.docker|\.kube)$/i;
 const NETWORK_LITERAL = /^(?:[a-z][a-z0-9+.-]*:\/\/|\/\/[^/])/i;
@@ -571,9 +573,16 @@ function unresolvedLiteral(quote: string, value: string): boolean {
   return value.includes("\\") || (quote === "`" && value.includes("${"));
 }
 
-/** Code Mode is opaque code: any quoted protected path, or any literal that
- * hides one behind escapes or interpolation, abstains before asking. */
+/** Fail-closed whole-script lexical scan: whichever quoting, comment or regex
+ * context delimits a token, a protected name or store spelling still refuses. */
+const rawScriptNamesStore = (script: string): boolean =>
+  script.split(SCRIPT_TOKEN_SEPARATOR).some(protectedSegment);
+
+/** Code Mode is opaque code: the raw whole script is scanned whatever its lexical
+ * structure, and any quoted literal that hides a protected path behind escapes or
+ * interpolation abstains before asking. */
 function scriptNamesProtectedPath(script: string, projectDir: string | undefined): boolean {
+  if (rawScriptNamesStore(script)) return true;
   for (const match of script.matchAll(SCRIPT_STRING)) {
     const value = match[2] ?? "";
     if (unresolvedLiteral(match[1] ?? "", value) || protectedScriptString(value, projectDir)) return true;
@@ -599,10 +608,10 @@ function toolFactPlan(evidence: DecisionEvidence): ToolFactPlan {
   if (call.kind === "none") return { kind: "none" };
   if (call.kind === "refuse") return { kind: "refuse", reason: call.reason };
   if (call.tool === EXECUTE_TOOL) return executeFactInput(evidence);
-  const args = evidence.operation?.arguments;
-  return args === undefined
-    ? { kind: "refuse", reason: NO_ARGUMENTS_REASON }
-    : { kind: "input", input: { tool: call.tool, access: call.access, arguments: args } };
+  // `toolCallTool` admits only a complete operation, so an argumentless tool
+  // call (e.g. `todoread`) presents its empty argument object, never a refusal.
+  const args = evidence.operation?.arguments ?? {};
+  return { kind: "input", input: { tool: call.tool, access: call.access, arguments: args } };
 }
 
 /** Both shell aliases need one complete captured command and a usable explicit cwd. */
