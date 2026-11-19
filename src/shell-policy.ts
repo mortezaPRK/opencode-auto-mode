@@ -139,6 +139,11 @@ function longOptionArity(grammar: WrapperGrammar, option: string): OptionArity |
   return arities.size === 1 ? [...arities][0] : undefined;
 }
 
+/** True for a word a command may read as an option (`-x`, `--long`), but not a lone `-`. */
+function isOptionWord(word: string): boolean {
+  return word.startsWith("-") && word.length > 1;
+}
+
 /**
  * Index of the first word after a wrapper's options, or undefined when an
  * unknown option makes its arity — and therefore the effective executable —
@@ -150,25 +155,15 @@ function wrapperCommand(grammar: WrapperGrammar, words: readonly string[], start
     const word = words[index];
     if (word === "--") return index + 1;
     if (word.startsWith("--")) {
-      const separator = word.indexOf("=");
-      const arity = longOptionArity(grammar, separator === -1 ? word : word.slice(0, separator));
-      if (arity === undefined) return undefined;
-      index += arity === "value" && separator === -1 ? 2 : 1;
+      const consumed = wrapperLongOption(grammar, word);
+      if (consumed === undefined) return undefined;
+      index += consumed;
       continue;
     }
-    if (word.startsWith("-") && word.length > 1) {
-      const letters = word.slice(1);
-      if (grammar.numeric && /^\d+$/.test(letters)) { index++; continue; }
-      let separateValue = false;
-      for (let position = 0; position < letters.length; position++) {
-        const arity = grammar.short[letters[position]];
-        if (arity === undefined) return undefined;
-        if (arity === "flag") continue;
-        // Any remaining letters are the attached value (`-n5`).
-        separateValue = position === letters.length - 1;
-        break;
-      }
-      index += separateValue ? 2 : 1;
+    if (isOptionWord(word)) {
+      const consumed = wrapperShortOption(grammar, word);
+      if (consumed === undefined) return undefined;
+      index += consumed;
       continue;
     }
     return index;
@@ -176,10 +171,38 @@ function wrapperCommand(grammar: WrapperGrammar, words: readonly string[], start
   return index;
 }
 
+/** Words a long wrapper option consumes, or undefined when its arity is unknown. */
+function wrapperLongOption(grammar: WrapperGrammar, word: string): number | undefined {
+  const separator = word.indexOf("=");
+  const arity = longOptionArity(grammar, separator === -1 ? word : word.slice(0, separator));
+  if (arity === undefined) return undefined;
+  return arity === "value" && separator === -1 ? 2 : 1;
+}
+
+/** Words a short wrapper option bundle consumes, or undefined when its arity is unknown. */
+function wrapperShortOption(grammar: WrapperGrammar, word: string): number | undefined {
+  const letters = word.slice(1);
+  if (grammar.numeric && /^\d+$/.test(letters)) return 1;
+  for (let position = 0; position < letters.length; position++) {
+    const arity = grammar.short[letters[position]];
+    if (arity === undefined) return undefined;
+    if (arity === "flag") continue;
+    // Any remaining letters are the attached value (`-n5`).
+    return position === letters.length - 1 ? 2 : 1;
+  }
+  return 1;
+}
+
+/** Skips leading `NAME=value` assignments. */
+function skipAssignments(words: readonly string[], start: number): number {
+  let index = start;
+  while (index < words.length && ASSIGNMENT.test(words[index])) index++;
+  return index;
+}
+
 /** Resolves leading assignments and wrapper options to the effective executable. */
 export function resolveExecutable(words: readonly string[]): { name: string; index: number } | undefined {
-  let index = 0;
-  while (index < words.length && ASSIGNMENT.test(words[index])) index++;
+  let index = skipAssignments(words, 0);
   while (index < words.length) {
     const name = basename(words[index]);
     const grammar = WRAPPERS.has(name) ? WRAPPER_GRAMMARS[name] : undefined;
@@ -192,7 +215,7 @@ export function resolveExecutable(words: readonly string[]): { name: string; ind
       if (index >= words.length) return undefined;
       index++;
     }
-    while (index < words.length && ASSIGNMENT.test(words[index])) index++;
+    index = skipAssignments(words, index);
   }
   return index < words.length ? { name: basename(words[index]), index } : undefined;
 }
@@ -434,6 +457,27 @@ function pathOptionRoles(args: readonly string[], base: number, roles: RoleSets)
   }
 }
 
+/** Marks an attached (`--file=X`) or separate (`--file X`) path option value. */
+function takePathOption(attached: string | undefined, index: number, base: number,
+  args: readonly string[], roles: RoleSets): number {
+  if (attached !== undefined) {
+    recordPathValue(roles, attached, base + index);
+    return index;
+  }
+  if (index + 1 < args.length) roles.paths.add(base + ++index);
+  return index;
+}
+
+/** The resolved name of a long option word, when it names one. */
+function resolvedLongOption(part: { option: string } | undefined): string | undefined {
+  return part === undefined ? undefined : resolveLongOption(part.option);
+}
+
+/** The value role of a resolved long option, when it is known. */
+function longOptionRole(resolved: string | undefined): ValueRole | undefined {
+  return resolved === undefined ? undefined : LONG_OPTION_VALUES.get(resolved);
+}
+
 /** Adds every non-option positional as a path (`cat`, `sort`, checksums, ...). */
 function plainRoles(name: string, args: readonly string[], base: number, roles: RoleSets): void {
   const table = PLAIN_SHORT_VALUES[name] ?? {};
@@ -441,15 +485,21 @@ function plainRoles(name: string, args: readonly string[], base: number, roles: 
   for (let index = 0; index < args.length; index++) {
     const word = args[index];
     if (!endOfOptions && word === "--") { endOfOptions = true; continue; }
-    if (!endOfOptions && word.startsWith("-") && word.length > 1) {
-      if (word.startsWith("--")) continue;
-      const parsed = shortOption(word, table);
-      if (parsed !== undefined) index = takeShortValue(parsed, index, base, args, roles);
+    if (!endOfOptions && isOptionWord(word)) {
+      index = takePlainOption(word, table, index, base, args, roles);
       continue;
     }
     if (roles.data.has(base + index)) continue;
     roles.paths.add(base + index);
   }
+}
+
+/** Consumes one option word of a plain reader, returning the index it ended at. */
+function takePlainOption(word: string, table: Record<string, ValueRole>, index: number,
+  base: number, args: readonly string[], roles: RoleSets): number {
+  if (word.startsWith("--")) return index;
+  const parsed = shortOption(word, table);
+  return parsed === undefined ? index : takeShortValue(parsed, index, base, args, roles);
 }
 
 /**
@@ -464,32 +514,42 @@ function grepRoles(name: string, args: readonly string[], base: number, roles: R
   for (let index = 0; index < args.length; index++) {
     const word = args[index];
     if (!endOfOptions && word === "--") { endOfOptions = true; continue; }
-    if (!endOfOptions && word.startsWith("-") && word.length > 1) {
-      if (word.startsWith("--")) {
-        const part = longOptionPart(word);
-        const resolved = part === undefined ? undefined : resolveLongOption(part.option);
-        if (resolved === "--regexp") { seenPattern = true; continue; }
-        // Any path-valued long option names a file: `--file` (pattern file),
-        // `--exclude-from`/`--ignore-file` (files of patterns). Only `--file`
-        // supplies the pattern; the others leave the next positional a pattern.
-        if (resolved !== undefined && LONG_OPTION_VALUES.get(resolved) === "path") {
-          if (part?.attached !== undefined) recordPathValue(roles, part.attached, base + index);
-          else if (index + 1 < args.length) roles.paths.add(base + ++index);
-          if (resolved === "--file") seenPattern = true;
-          continue;
-        }
-        continue;
-      }
-      const parsed = shortOption(word, table);
-      if (parsed === undefined) continue;
-      index = takeShortValue(parsed, index, base, args, roles);
-      if (parsed.letter === "e" || parsed.letter === "f") seenPattern = true;
+    if (!endOfOptions && isOptionWord(word)) {
+      const scan = grepOption(word, table, index, base, args, roles, seenPattern);
+      index = scan.index;
+      seenPattern = scan.seenPattern;
       continue;
     }
     if (roles.data.has(base + index)) continue;
     if (!seenPattern) { roles.data.add(base + index); seenPattern = true; continue; }
     roles.paths.add(base + index);
   }
+}
+
+/** The result of reading one `grep`/`rg` option word. */
+interface GrepScan { index: number; seenPattern: boolean }
+
+/** Reads one `grep`/`rg` option word, recording its pattern or file value. */
+function grepOption(word: string, table: Record<string, ValueRole>, index: number, base: number,
+  args: readonly string[], roles: RoleSets, seenPattern: boolean): GrepScan {
+  if (word.startsWith("--")) return grepLongOption(word, index, base, args, roles, seenPattern);
+  const parsed = shortOption(word, table);
+  if (parsed === undefined) return { index, seenPattern };
+  const next = takeShortValue(parsed, index, base, args, roles);
+  return { index: next, seenPattern: seenPattern || parsed.letter === "e" || parsed.letter === "f" };
+}
+
+function grepLongOption(word: string, index: number, base: number, args: readonly string[],
+  roles: RoleSets, seenPattern: boolean): GrepScan {
+  const part = longOptionPart(word);
+  const resolved = resolvedLongOption(part);
+  if (resolved === "--regexp") return { index, seenPattern: true };
+  // Any path-valued long option names a file: `--file` (pattern file),
+  // `--exclude-from`/`--ignore-file` (files of patterns). Only `--file`
+  // supplies the pattern; the others leave the next positional a pattern.
+  if (longOptionRole(resolved) !== "path") return { index, seenPattern };
+  const next = takePathOption(part?.attached, index, base, args, roles);
+  return { index: next, seenPattern: seenPattern || resolved === "--file" };
 }
 
 /**
@@ -503,23 +563,10 @@ function sedRoles(args: readonly string[], base: number, roles: RoleSets): void 
   for (let index = 0; index < args.length; index++) {
     const word = args[index];
     if (!endOfOptions && word === "--") { endOfOptions = true; continue; }
-    if (!endOfOptions && word.startsWith("-") && word.length > 1) {
-      if (word.startsWith("--")) {
-        const part = longOptionPart(word);
-        const resolved = part === undefined ? undefined : resolveLongOption(part.option);
-        if (resolved === "--expression") { scripted = true; continue; }
-        if (resolved === "--file") {
-          if (part?.attached !== undefined) recordPathValue(roles, part.attached, base + index);
-          else if (index + 1 < args.length) roles.paths.add(base + ++index);
-          scripted = true;
-          continue;
-        }
-        continue;
-      }
-      const parsed = shortOption(word, SED_SHORT_VALUES);
-      if (parsed === undefined) continue;
-      index = takeShortValue(parsed, index, base, args, roles);
-      if (parsed.letter === "e" || parsed.letter === "f") scripted = true;
+    if (!endOfOptions && isOptionWord(word)) {
+      const scan = sedOption(word, index, base, args, roles, scripted);
+      index = scan.index;
+      scripted = scan.scripted;
       continue;
     }
     if (roles.data.has(base + index)) continue;
@@ -527,6 +574,36 @@ function sedRoles(args: readonly string[], base: number, roles: RoleSets): void 
     roles.paths.add(base + index);
   }
 }
+
+/** The result of reading one `sed` option word. */
+interface SedScan { index: number; scripted: boolean }
+
+/** Reads one `sed` option word, recording its script or script file. */
+function sedOption(word: string, index: number, base: number, args: readonly string[],
+  roles: RoleSets, scripted: boolean): SedScan {
+  if (word.startsWith("--")) return sedLongOption(word, index, base, args, roles, scripted);
+  const parsed = shortOption(word, SED_SHORT_VALUES);
+  if (parsed === undefined) return { index, scripted };
+  const next = takeShortValue(parsed, index, base, args, roles);
+  return { index: next, scripted: scripted || parsed.letter === "e" || parsed.letter === "f" };
+}
+
+function sedLongOption(word: string, index: number, base: number, args: readonly string[],
+  roles: RoleSets, scripted: boolean): SedScan {
+  const part = longOptionPart(word);
+  const resolved = resolvedLongOption(part);
+  if (resolved === "--expression") return { index, scripted: true };
+  if (resolved !== "--file") return { index, scripted };
+  return { index: takePathOption(part?.attached, index, base, args, roles), scripted: true };
+}
+
+/** `jq` options whose next two words are data (`--arg NAME VALUE`). */
+const JQ_DATA_VALUE_OPTIONS = new Set(["--arg", "--argjson"]);
+/** `jq` options that take a name (data) and then a file (path). */
+const JQ_FILE_VALUE_OPTIONS = new Set(["--slurpfile", "--rawfile", "--argfile"]);
+
+/** Filter state shared across `jq`'s arguments. */
+interface JqScanState { filterSupplied: boolean; positionalData: boolean }
 
 /**
  * `jq`: the first positional is the filter unless `-f`/`--from-file` supplies
@@ -536,62 +613,65 @@ function sedRoles(args: readonly string[], base: number, roles: RoleSets): void 
  * a file (path), and `--args`/`--jsonargs` make positionals string data.
  */
 function jqRoles(args: readonly string[], base: number, roles: RoleSets): void {
-  let filterSupplied = false;
-  let positionalData = false;
+  const state: JqScanState = { filterSupplied: false, positionalData: false };
   let endOfOptions = false;
-  const takeValues = (index: number, count: number, role: ValueRole): number => {
-    let taken = 0;
-    while (taken < count && index + 1 < args.length) {
-      const next = base + ++index;
-      (role === "data" ? roles.data : roles.paths).add(next);
-      taken++;
-    }
-    return index;
-  };
   for (let index = 0; index < args.length; index++) {
     const word = args[index];
     if (!endOfOptions && word === "--") { endOfOptions = true; continue; }
-    if (!endOfOptions && word.startsWith("-") && word.length > 1) {
-      if (word.startsWith("--")) {
-        const part = longOptionPart(word);
-        const option = part?.option;
-        const resolved = part === undefined ? undefined : resolveLongOption(part.option);
-        if (resolved === "--from-file") {
-          if (part?.attached !== undefined) recordPathValue(roles, part.attached, base + index);
-          else if (index + 1 < args.length) roles.paths.add(base + ++index);
-          filterSupplied = true;
-          continue;
-        }
-        if (option === "--arg" || option === "--argjson") { index = takeValues(index, 2, "data"); continue; }
-        if (option === "--slurpfile" || option === "--rawfile" || option === "--argfile") {
-          index = takeValues(index, 1, "data");
-          index = takeValues(index, 1, "path");
-          continue;
-        }
-        if (option === "--args" || option === "--jsonargs") { positionalData = true; continue; }
-        if (option === "--library-path") { index = jqLibraryPath(part, index, args, base, roles); continue; }
-        if (option === "--indent") { index = takeValues(index, 1, "data"); continue; }
-        continue;
-      }
-      const parsed = shortOption(word, JQ_SHORT_VALUES);
-      if (parsed !== undefined) {
-        index = takeShortValue(parsed, index, base, args, roles);
-        if (parsed.letter === "f") filterSupplied = true;
-      }
+    if (!endOfOptions && isOptionWord(word)) {
+      index = jqOption(word, index, base, args, roles, state);
       continue;
     }
     if (roles.data.has(base + index)) continue;
-    if (positionalData) { roles.data.add(base + index); continue; }
-    if (!filterSupplied) { roles.data.add(base + index); filterSupplied = true; continue; }
+    if (state.positionalData) { roles.data.add(base + index); continue; }
+    if (!state.filterSupplied) { roles.data.add(base + index); state.filterSupplied = true; continue; }
     roles.paths.add(base + index);
   }
 }
 
-/** `find` tests whose value is a path read for comparison, not a pattern. */
-function jqLibraryPath(part: { attached?: string } | undefined, index: number, args: readonly string[], base: number, roles: RoleSets): number {
-  const attached = part?.attached;
-  if (attached !== undefined) recordPathValue(roles, attached, base + index);
-  else if (index + 1 < args.length) roles.paths.add(base + ++index);
+/** Reads one `jq` option word, returning the index it ended at. */
+function jqOption(word: string, index: number, base: number, args: readonly string[],
+  roles: RoleSets, state: JqScanState): number {
+  if (word.startsWith("--")) return jqLongOption(word, index, base, args, roles, state);
+  const parsed = shortOption(word, JQ_SHORT_VALUES);
+  if (parsed === undefined) return index;
+  const next = takeShortValue(parsed, index, base, args, roles);
+  if (parsed.letter === "f") state.filterSupplied = true;
+  return next;
+}
+
+function jqLongOption(word: string, index: number, base: number, args: readonly string[],
+  roles: RoleSets, state: JqScanState): number {
+  const part = longOptionPart(word);
+  if (resolvedLongOption(part) === "--from-file") {
+    state.filterSupplied = true;
+    return takePathOption(part?.attached, index, base, args, roles);
+  }
+  return jqNamedOption(part?.option, part?.attached, index, base, args, roles, state);
+}
+
+function jqNamedOption(option: string | undefined, attached: string | undefined, index: number,
+  base: number, args: readonly string[], roles: RoleSets, state: JqScanState): number {
+  if (JQ_DATA_VALUE_OPTIONS.has(option ?? "")) return takeJqValues(args, index, base, roles, 2, "data");
+  if (JQ_FILE_VALUE_OPTIONS.has(option ?? "")) {
+    const next = takeJqValues(args, index, base, roles, 1, "data");
+    return takeJqValues(args, next, base, roles, 1, "path");
+  }
+  if (option === "--args" || option === "--jsonargs") { state.positionalData = true; return index; }
+  if (option === "--library-path") return takePathOption(attached, index, base, args, roles);
+  if (option === "--indent") return takeJqValues(args, index, base, roles, 1, "data");
+  return index;
+}
+
+/** Marks up to `count` following words as values of the given role. */
+function takeJqValues(args: readonly string[], index: number, base: number, roles: RoleSets,
+  count: number, role: ValueRole): number {
+  let taken = 0;
+  while (taken < count && index + 1 < args.length) {
+    const next = base + ++index;
+    (role === "data" ? roles.data : roles.paths).add(next);
+    taken++;
+  }
   return index;
 }
 
@@ -661,6 +741,20 @@ function findRoles(args: readonly string[], base: number, roles: RoleSets): void
   }
 }
 
+/** Subcommands whose positionals are refs, messages or other data, never files. */
+const GIT_REF_SUBCOMMANDS = new Set(["tag", "branch", "push", "fetch"]);
+
+/** Which operands a git subcommand treats as refs/data rather than paths. */
+interface GitRoleContext {
+  long: Record<string, ValueRole>;
+  short: Record<string, ValueRole>;
+  refs: boolean;
+  checkoutLike: boolean;
+}
+
+/** Loop state of the git operand scan. */
+interface GitRoleState { index: number; endOfOptions: boolean }
+
 /**
  * Git subcommands whose operands are refs, messages or other data rather than
  * files: `commit -m` messages, `branch <name>`, `checkout`/`switch` branches,
@@ -671,41 +765,63 @@ function gitRoles(args: readonly string[], base: number, roles: RoleSets): void 
   const subcommand = args[0];
   if (subcommand === undefined || !GIT_HANDLED.has(subcommand)) return;
   const rest = args.slice(1);
-  const long = GIT_LONG_VALUES[subcommand] ?? {};
-  const short = GIT_SHORT_VALUES[subcommand] ?? {};
-  const refs = subcommand === "tag" || subcommand === "branch" || subcommand === "push" || subcommand === "fetch";
-  let endOfOptions = false;
-  for (let index = 0; index < rest.length; index++) {
-    const word = rest[index];
-    const position = base + 1 + index;
-    if (!endOfOptions && word === "--") { endOfOptions = true; continue; }
-    if (!endOfOptions && word.startsWith("--") && word.length > 2) {
-      const part = longOptionPart(word);
-      const role = part === undefined ? undefined : long[part.option];
-      if (part === undefined || role === undefined) continue;
-      if (part.attached !== undefined) {
-        if (role === "path") recordPathValue(roles, part.attached, position);
-        else roles.data.add(position);
-        continue;
-      }
-      if (index + 1 < rest.length) {
-        const next = base + 1 + ++index;
-        (role === "data" ? roles.data : roles.paths).add(next);
-      }
-      continue;
-    }
-    if (!endOfOptions && word.startsWith("-") && word.length > 1) {
-      const parsed = shortOption(word, short);
-      if (parsed !== undefined) index = takeShortValue(parsed, index, base + 1, rest, roles);
-      continue;
-    }
-    if (roles.data.has(position)) continue;
-    // `checkout`/`switch` treat positionals before `--` as refs and after it as
-    // paths; `commit` positionals are always paths.
-    if (refs || ((subcommand === "checkout" || subcommand === "switch") && !endOfOptions))
-      roles.data.add(position);
-    else roles.paths.add(position);
+  const context: GitRoleContext = {
+    long: GIT_LONG_VALUES[subcommand] ?? {},
+    short: GIT_SHORT_VALUES[subcommand] ?? {},
+    refs: GIT_REF_SUBCOMMANDS.has(subcommand),
+    checkoutLike: subcommand === "checkout" || subcommand === "switch",
+  };
+  const state: GitRoleState = { index: 0, endOfOptions: false };
+  while (state.index < rest.length) {
+    const word = rest[state.index];
+    if (consumeGitOption(state, word, base + 1, rest, roles, context)) continue;
+    const position = base + 1 + state.index;
+    if (!roles.data.has(position)) markGitPosition(state, position, roles, context);
+    state.index++;
   }
+}
+
+/** Consumes a `--` terminator or one git option word; false for an operand. */
+function consumeGitOption(state: GitRoleState, word: string, base: number, rest: readonly string[],
+  roles: RoleSets, context: GitRoleContext): boolean {
+  if (!state.endOfOptions && word === "--") { state.endOfOptions = true; state.index++; return true; }
+  if (!state.endOfOptions && word.startsWith("--") && word.length > 2) {
+    state.index = gitLongRole(word, state.index, base, rest, roles, context.long) + 1;
+    return true;
+  }
+  if (!state.endOfOptions && isOptionWord(word)) {
+    const parsed = shortOption(word, context.short);
+    const end = parsed === undefined ? state.index : takeShortValue(parsed, state.index, base, rest, roles);
+    state.index = end + 1;
+    return true;
+  }
+  return false;
+}
+
+/** Records a git option's attached or separate value; returns its last word index. */
+function gitLongRole(word: string, index: number, base: number, rest: readonly string[],
+  roles: RoleSets, long: Record<string, ValueRole>): number {
+  const part = longOptionPart(word);
+  const role = part === undefined ? undefined : long[part.option];
+  if (part === undefined || role === undefined) return index;
+  if (part.attached !== undefined) {
+    if (role === "path") recordPathValue(roles, part.attached, base + index);
+    else roles.data.add(base + index);
+    return index;
+  }
+  if (index + 1 < rest.length) {
+    (role === "data" ? roles.data : roles.paths).add(base + index + 1);
+    return index + 1;
+  }
+  return index;
+}
+
+/** Marks a positional operand as ref/data, or as a path, per the subcommand. */
+function markGitPosition(state: GitRoleState, position: number, roles: RoleSets, context: GitRoleContext): void {
+  // `checkout`/`switch` treat positionals before `--` as refs and after it as
+  // paths; `commit` positionals are always paths.
+  if (context.refs || (context.checkoutLike && !state.endOfOptions)) roles.data.add(position);
+  else roles.paths.add(position);
 }
 
 /** The path and data roles of one simple command's argv. */
@@ -862,6 +978,29 @@ function isFilesystemRoot(target: string): boolean {
   return trimmed === "" || posix.normalize(trimmed) === "/";
 }
 
+/** Whether an `rm` argument is recursive, and its non-option targets. */
+interface RootRemovalScan { recursive: boolean; targets: string[] }
+
+/** True for an option that makes `rm` recursive (`-r`, `-R`, `--recursi`). */
+function isRecursiveRemovalOption(arg: string): boolean {
+  if (arg.startsWith("--")) return isLongOption(arg, "--recursive");
+  return /[rR]/.test(arg.slice(1));
+}
+
+/** Splits `rm` arguments into the recursion flag and its targets. */
+function scanRootRemoval(args: readonly string[]): RootRemovalScan {
+  let recursive = false;
+  let endOfOptions = false;
+  const targets: string[] = [];
+  for (const arg of args) {
+    if (endOfOptions) { targets.push(arg); continue; }
+    if (arg === "--") { endOfOptions = true; continue; }
+    if (isOptionWord(arg)) { recursive = recursive || isRecursiveRemovalOption(arg); continue; }
+    targets.push(arg);
+  }
+  return { recursive, targets };
+}
+
 /**
  * True when `rm` removes the filesystem root recursively. Force is irrelevant:
  * a writable root is already destroyed by `rm -r / --no-preserve-root`.
@@ -871,26 +1010,9 @@ function isFilesystemRoot(target: string): boolean {
  * the root instead of deleting it, while `rm -r -- /` still denies.
  */
 function isRecursiveRootRemoval(args: readonly string[]): boolean {
-  let recursive = false;
-  let endOfOptions = false;
-  const targets: string[] = [];
-  for (const arg of args) {
-    if (endOfOptions) { targets.push(arg); continue; }
-    if (arg === "--") { endOfOptions = true; continue; }
-    if (arg.startsWith("--")) {
-      // GNU option parsing accepts `--recursi` for `--recursive`.
-      if (isLongOption(arg, "--recursive")) recursive = true;
-      continue;
-    }
-    if (arg.startsWith("-") && arg.length > 1) {
-      const letters = arg.slice(1);
-      if (letters.includes("r") || letters.includes("R")) recursive = true;
-      continue;
-    }
-    targets.push(arg);
-  }
-  if (!recursive || targets.length === 0) return false;
-  return targets.some(isFilesystemRoot);
+  const scan = scanRootRemoval(args);
+  if (!scan.recursive || scan.targets.length === 0) return false;
+  return scan.targets.some(isFilesystemRoot);
 }
 
 /** Shell options that take no value and may follow `-c` before its script. */
@@ -938,6 +1060,59 @@ function scriptArgument(name: string, args: readonly string[]): string | undefin
   return undefined;
 }
 
+/** A copied slice of the command, the offset after it, and the new word boundary. */
+interface CommandSegment { text: string; next: number; boundary: boolean }
+
+/** Copies a `\`-escaped character (or a trailing lone backslash). */
+function escapeSegment(command: string, index: number): CommandSegment {
+  return { text: command.slice(index, index + 2), next: index + 2, boundary: false };
+}
+
+/** Copies a single-quoted run, which has no escapes. */
+function singleQuotedSegment(command: string, index: number): CommandSegment {
+  const end = command.indexOf("'", index + 1);
+  const stop = end === -1 ? command.length : end + 1;
+  return { text: command.slice(index, stop), next: stop, boundary: false };
+}
+
+/** Copies a `$'...'` run, where a backslash escapes the closing quote. */
+function ansiQuotedSegment(command: string, index: number): CommandSegment {
+  let cursor = index + 2;
+  while (cursor < command.length && command[cursor] !== "'") cursor += command[cursor] === "\\" ? 2 : 1;
+  const stop = Math.min(cursor + 1, command.length);
+  return { text: command.slice(index, stop), next: stop, boundary: false };
+}
+
+/** Copies a `"..."` run, where a backslash escapes the next character. */
+function doubleQuotedSegment(command: string, index: number): CommandSegment {
+  let cursor = index + 1;
+  while (cursor < command.length && command[cursor] !== '"') cursor += command[cursor] === "\\" ? 2 : 1;
+  const stop = Math.min(cursor + 1, command.length);
+  return { text: command.slice(index, stop), next: stop, boundary: false };
+}
+
+/** Copies a digit run; a run adjacent to a redirection is a descriptor and becomes a space. */
+function descriptorSegment(command: string, index: number): CommandSegment {
+  let cursor = index;
+  while (cursor < command.length && /\d/.test(command[cursor])) cursor++;
+  // Replace the run with a space instead of deleting it: `&2>` is `&`
+  // followed by a redirect, and deleting the `2` would fuse `&` and `>`
+  // into the different `&>` operator.
+  if (command[cursor] === ">" || command[cursor] === "<") return { text: " ", next: cursor, boundary: true };
+  return { text: command.slice(index, cursor), next: cursor, boundary: false };
+}
+
+/** The segment starting at `index`, or undefined when it is one ordinary character. */
+function descriptorSegmentAt(command: string, index: number, boundary: boolean): CommandSegment | undefined {
+  const character = command[index];
+  if (character === "\\") return escapeSegment(command, index);
+  if (character === "'") return singleQuotedSegment(command, index);
+  if (character === "$" && command[index + 1] === "'") return ansiQuotedSegment(command, index);
+  if (character === '"') return doubleQuotedSegment(command, index);
+  if (boundary && /\d/.test(character)) return descriptorSegment(command, index);
+  return undefined;
+}
+
 /**
  * Removes file-descriptor prefixes (`2` in `2>/dev/null`) that are adjacent to
  * the redirection operator in the source.
@@ -951,62 +1126,69 @@ export function stripDescriptorPrefixes(command: string): string {
   let boundary = true;
   let index = 0;
   while (index < command.length) {
-    const character = command[index];
-    if (character === "\\") {
-      result += command.slice(index, index + 2);
-      boundary = false;
-      index += 2;
+    const segment = descriptorSegmentAt(command, index, boundary);
+    if (segment === undefined) {
+      const character = command[index];
+      result += character;
+      boundary = /[ \t\n;|&()<>]/.test(character);
+      index++;
       continue;
     }
-    if (character === "'") {
-      const end = command.indexOf("'", index + 1);
-      const stop = end === -1 ? command.length : end + 1;
-      result += command.slice(index, stop);
-      boundary = false;
-      index = stop;
-      continue;
-    }
-    // ANSI-C quoting (`$'...'`) is the one quoted form where a backslash escapes
-    // the closing quote, so its body needs the same escape handling as `"..."`.
-    if (character === "$" && command[index + 1] === "'") {
-      let cursor = index + 2;
-      while (cursor < command.length && command[cursor] !== "'") cursor += command[cursor] === "\\" ? 2 : 1;
-      const stop = Math.min(cursor + 1, command.length);
-      result += command.slice(index, stop);
-      boundary = false;
-      index = stop;
-      continue;
-    }
-    if (character === '"') {
-      let cursor = index + 1;
-      while (cursor < command.length && command[cursor] !== '"') cursor += command[cursor] === "\\" ? 2 : 1;
-      const stop = Math.min(cursor + 1, command.length);
-      result += command.slice(index, stop);
-      boundary = false;
-      index = stop;
-      continue;
-    }
-    if (boundary && /\d/.test(character)) {
-      let cursor = index;
-      while (cursor < command.length && /\d/.test(command[cursor])) cursor++;
-      if (command[cursor] === ">" || command[cursor] === "<") {
-        // Replace the run with a space instead of deleting it: `&2>` is `&`
-        // followed by a redirect, and deleting the `2` would fuse `&` and `>`
-        // into the different `&>` operator.
-        result += " ";
-        index = cursor;
-        continue;
-      }
-      result += command.slice(index, cursor);
-      boundary = false;
-      index = cursor;
-      continue;
-    }
-    result += character;
-    boundary = /[ \t\n;|&()<>]/.test(character);
-    index++;
+    result += segment.text;
+    boundary = segment.boundary;
+    index = segment.next;
   }
   return result;
+}
+
+/** The quote forms the hash scan tracks. */
+type HashQuote = "'" | '"' | "$'";
+
+/** One consumed slice of a hash scan, with the quote and word-start state after it. */
+interface HashSegment { text: string; next: number; quote: HashQuote | undefined; wordStart: boolean }
+
+/** Copies one character inside a quoted run; a backslash escapes the next one outside `'...'`. */
+function quotedHashSegment(command: string, index: number, quote: HashQuote): HashSegment {
+  const character = command[index];
+  const closing = quote === "$'" ? "'" : quote;
+  if (character === "\\" && quote !== "'") {
+    const stop = Math.min(index + 2, command.length);
+    return { text: command.slice(index, stop), next: stop, quote, wordStart: false };
+  }
+  return { text: character, next: index + 1, quote: character === closing ? undefined : quote, wordStart: false };
+}
+
+/** Copies a `\`-escaped character; a `\`-newline keeps the current word start. */
+function escapedHashSegment(command: string, index: number, wordStart: boolean): HashSegment {
+  if (index + 1 >= command.length) return { text: "\\", next: index + 1, quote: undefined, wordStart: false };
+  const escaped = command[index + 1];
+  return { text: command.slice(index, index + 2), next: index + 2, quote: undefined,
+    wordStart: escaped === "\n" ? wordStart : false };
+}
+
+/** Opens a quoted run at its `'`, `"`, or `$'` opener. */
+function openHashQuote(command: string, index: number): HashSegment {
+  const character = command[index];
+  if (command[index + 1] === "'" && character === "$")
+    return { text: command.slice(index, index + 2), next: index + 2, quote: "$'", wordStart: false };
+  return { text: character, next: index + 1, quote: character as "'" | '"', wordStart: false };
+}
+
+/** Copies a `#` at a word start as a comment through the end of the command. */
+function commentHashSegment(command: string, index: number, wordStart: boolean): HashSegment {
+  if (wordStart) return { text: command.slice(index), next: command.length, quote: undefined, wordStart };
+  return { text: "\\#", next: index + 1, quote: undefined, wordStart };
+}
+
+/** One consumed slice of an unquoted run of the hash scan. */
+function unquotedHashSegment(command: string, index: number, wordStart: boolean): HashSegment {
+  const character = command[index];
+  if (character === "\\") return escapedHashSegment(command, index, wordStart);
+  if (character === "'" || character === '"' || (character === "$" && command[index + 1] === "'"))
+    return openHashQuote(command, index);
+  if (character === "#") return commentHashSegment(command, index, wordStart);
+  if (WORD_BREAK.test(character)) return { text: character, next: index + 1, quote: undefined, wordStart: true };
+  return { text: character, next: index + 1, quote: undefined, wordStart: false };
 }
 
 /**
@@ -1021,68 +1203,95 @@ export function stripDescriptorPrefixes(command: string): string {
  */
 export function escapeLiteralHashes(command: string): string {
   let result = "";
+  let quote: HashQuote | undefined;
   let wordStart = true;
-  let quote: "'" | '"' | "$'" | undefined;
-  for (let index = 0; index < command.length; index++) {
-    const character = command[index];
-    if (quote === "'") {
-      result += character;
-      if (character === "'") quote = undefined;
-      continue;
-    }
-    if (quote === "$'") {
-      result += character;
-      if (character === "\\") {
-        if (index + 1 < command.length) result += command[++index];
-      } else if (character === "'") quote = undefined;
-      continue;
-    }
-    if (quote === '"') {
-      result += character;
-      if (character === "\\") {
-        if (index + 1 < command.length) result += command[++index];
-      } else if (character === '"') quote = undefined;
-      continue;
-    }
-    if (character === "\\") {
-      result += character;
-      if (index + 1 < command.length) {
-        const escaped = command[++index];
-        result += escaped;
-        if (escaped !== "\n") wordStart = false;
-      } else wordStart = false;
-      continue;
-    }
-    if (character === "'" || character === '"' || (character === "$" && command[index + 1] === "'")) {
-      result += character;
-      wordStart = false;
-      if (character === "'" || character === '"') quote = character;
-      else {
-        quote = "$'";
-        result += command[++index];
-      }
-      continue;
-    }
-    if (character === "#") {
-      if (wordStart) {
-        result += command.slice(index);
-        break;
-      }
-      result += "\\#";
-      continue;
-    }
-    if (WORD_BREAK.test(character)) {
-      result += character;
-      wordStart = true;
-      continue;
-    }
-    result += character;
-    wordStart = false;
+  let index = 0;
+  while (index < command.length) {
+    const segment: HashSegment = quote === undefined
+      ? unquotedHashSegment(command, index, wordStart)
+      : quotedHashSegment(command, index, quote);
+    result += segment.text;
+    index = segment.next;
+    quote = segment.quote;
+    wordStart = segment.wordStart;
   }
   return result;
 }
 
 export interface HeredocMarker { delimiter: string; quoted: boolean; stripTabs: boolean }
+
+/** Index just past the closing quote of a quoted run whose body starts at `start`. */
+function skipQuotedRun(text: string, start: number, closing: string, escapes: boolean): number {
+  let index = start;
+  while (index < text.length) {
+    const character = text[index];
+    if (character === closing) return index + 1;
+    index += escapes && character === "\\" ? 2 : 1;
+  }
+  return index;
+}
+
+/** Index past a `'...'` or `"..."` run that opens at `index`, when one does. */
+function quotedEndAt(text: string, index: number): number | undefined {
+  const character = text[index];
+  if (character === "'") return skipQuotedRun(text, index + 1, "'", false);
+  if (character === '"') return skipQuotedRun(text, index + 1, '"', true);
+  return undefined;
+}
+
+/** Index past a `'...'`, `"..."`, or `$'...'` run that opens at `index`, when one does. */
+function quotedRunEndAt(text: string, index: number): number | undefined {
+  if (text[index] === "$" && text[index + 1] === "'") return skipQuotedRun(text, index + 2, "'", true);
+  return quotedEndAt(text, index);
+}
+
+/** True for the `<<` of a here-document (not `<<<`, and not the tail of a longer `<`). */
+function isHeredocOperator(line: string, index: number): boolean {
+  return line[index] === "<" && line[index + 1] === "<" && line[index + 2] !== "<" && line[index - 1] !== "<";
+}
+
+/** True for a `<<` this reader cannot place (not `<<<`, and not the tail of a longer `<`). */
+function isUndecodableHeredocStart(line: string, index: number): boolean {
+  return line[index + 1] === "<" && line[index + 2] !== "<" && line[index - 1] !== "<";
+}
+
+/** Skips spaces and tabs. */
+function skipBlanks(line: string, start: number): number {
+  let index = start;
+  while (line[index] === " " || line[index] === "\t") index++;
+  return index;
+}
+
+/** A here-document delimiter word and the offset after it. */
+interface DelimiterRead { delimiter: string; quoted: boolean; end: number }
+
+/** Reads a quoted here-document delimiter word, rejecting escapes this reader cannot decode. */
+function readQuotedDelimiter(line: string, start: number): DelimiterRead | undefined {
+  const closing = line[start];
+  let index = start + 1;
+  let delimiter = "";
+  while (index < line.length) {
+    const character = line[index];
+    if (character === closing) return { delimiter, quoted: true, end: index + 1 };
+    if (closing === '"' && character === "\\") return undefined;
+    delimiter += character;
+    index++;
+  }
+  return undefined;
+}
+
+/** Reads a bare here-document delimiter word (`[A-Za-z0-9_]`). */
+function readBareDelimiter(line: string, start: number): DelimiterRead {
+  let index = start;
+  while (index < line.length && /[A-Za-z0-9_]/.test(line[index])) index++;
+  return { delimiter: line.slice(start, index), quoted: false, end: index };
+}
+
+/** Reads a here-document delimiter word, quoted or bare. */
+function readDelimiter(line: string, start: number): DelimiterRead | undefined {
+  if (line[start] === "'" || line[start] === '"') return readQuotedDelimiter(line, start);
+  return readBareDelimiter(line, start);
+}
 
 /**
  * Reads the here-document marker that starts at `<<`, returning the marker and
@@ -1096,35 +1305,14 @@ export interface HeredocMarker { delimiter: string; quoted: boolean; stripTabs: 
  * an unterminated quote all return undefined, and callers fail closed.
  */
 function heredocMarkerAt(line: string, index: number): { marker: HeredocMarker; end: number } | undefined {
-  if (line[index] !== "<" || line[index + 1] !== "<" || line[index + 2] === "<" || line[index - 1] === "<")
-    return undefined;
-  let cursor = index + 2;
-  const stripTabs = line[cursor] === "-";
-  if (stripTabs) cursor++;
-  while (line[cursor] === " " || line[cursor] === "\t") cursor++;
-  let delimiter = "";
-  let quoted = false;
-  if (line[cursor] === "'" || line[cursor] === '"') {
-    const closing = line[cursor];
-    quoted = true;
-    cursor++;
-    let closed = false;
-    while (cursor < line.length) {
-      const character = line[cursor];
-      if (character === closing) { closed = true; cursor++; break; }
-      if (closing === '"' && character === "\\") return undefined;
-      delimiter += character;
-      cursor++;
-    }
-    if (!closed) return undefined;
-  } else {
-    while (cursor < line.length && /[A-Za-z0-9_]/.test(line[cursor])) delimiter += line[cursor++];
-  }
-  if (!delimiter) return undefined;
+  if (!isHeredocOperator(line, index)) return undefined;
+  const stripTabs = line[index + 2] === "-";
+  const read = readDelimiter(line, skipBlanks(line, index + (stripTabs ? 3 : 2)));
+  if (read === undefined || !read.delimiter) return undefined;
   // The delimiter word must end here; a quoted run glued to more word text is a
   // concatenation this parser does not decode.
-  if (cursor < line.length && !WORD_BREAK.test(line[cursor])) return undefined;
-  return { marker: { delimiter, quoted, stripTabs }, end: cursor };
+  if (read.end < line.length && !WORD_BREAK.test(line[read.end])) return undefined;
+  return { marker: { delimiter: read.delimiter, quoted: read.quoted, stripTabs }, end: read.end };
 }
 
 interface HeredocScan { markers: HeredocMarker[]; unsupported: boolean }
@@ -1143,30 +1331,25 @@ function scanHeredoc(line: string): HeredocScan {
   const markers: HeredocMarker[] = [];
   let unsupported = false;
   let wordStart = true;
-  let quote: "'" | '"' | undefined;
-  for (let index = 0; index < line.length; index++) {
+  let index = 0;
+  while (index < line.length) {
+    const quoted = quotedEndAt(line, index);
+    if (quoted !== undefined) { index = quoted; wordStart = false; continue; }
     const character = line[index];
-    if (quote === "'") { if (character === "'") quote = undefined; continue; }
-    if (quote === '"') {
-      if (character === "\\") { index++; continue; }
-      if (character === '"') quote = undefined;
-      continue;
-    }
-    if (character === "'" || character === '"') { quote = character; wordStart = false; continue; }
-    if (character === "\\") { index++; wordStart = false; continue; }
+    if (character === "\\") { index += 2; wordStart = false; continue; }
     if (character === "#" && wordStart) break;
     if (character === "<") {
       const parsed = heredocMarkerAt(line, index);
-      if (parsed === undefined) {
-        if (line[index + 1] === "<" && line[index + 2] !== "<" && line[index - 1] !== "<") unsupported = true;
-      } else {
+      if (parsed !== undefined) {
         markers.push(parsed.marker);
-        index = parsed.end - 1;
+        index = parsed.end;
         wordStart = false;
         continue;
       }
+      unsupported = unsupported || isUndecodableHeredocStart(line, index);
     }
     wordStart = WORD_BREAK.test(character);
+    index++;
   }
   return { markers, unsupported };
 }
@@ -1182,21 +1365,26 @@ export function heredocMarkers(line: string): HeredocMarker[] {
  * the command line.
  */
 export function hasHeredoc(text: string): boolean {
-  let quote: "'" | '"' | undefined;
-  for (let index = 0; index < text.length; index++) {
+  let index = 0;
+  while (index < text.length) {
+    const quoted = quotedEndAt(text, index);
+    if (quoted !== undefined) { index = quoted; continue; }
     const character = text[index];
-    if (quote === "'") { if (character === "'") quote = undefined; continue; }
-    if (quote === '"') {
-      if (character === "\\") { index++; continue; }
-      if (character === '"') quote = undefined;
-      continue;
-    }
-    if (character === "'" || character === '"') { quote = character; continue; }
-    if (character === "\\") { index++; continue; }
-    if (character === "<" && text[index + 1] === "<" && text[index + 2] !== "<" &&
-        text[index - 1] !== "<") return true;
+    if (character === "\\") { index += 2; continue; }
+    if (character === "<" && isUndecodableHeredocStart(text, index)) return true;
+    index++;
   }
   return false;
+}
+
+/** A raw command line and the offset of the newline that ends it. */
+interface CommandLine { line: string; end: number }
+
+/** The line up to a comment's newline, which ends the line. */
+function commentLineAt(command: string, start: number, index: number): CommandLine {
+  const end = command.indexOf("\n", index);
+  const stop = end === -1 ? command.length : end;
+  return { line: command.slice(start, stop), end: stop };
 }
 
 /**
@@ -1204,32 +1392,18 @@ export function hasHeredoc(text: string): boolean {
  * that ends it. Quoted newlines and `\`-newlines stay inside the line; a
  * comment's newline ends it.
  */
-function commandLineAt(command: string, start: number): { line: string; end: number } {
-  let quote: "'" | '"' | "$'" | undefined;
+function commandLineAt(command: string, start: number): CommandLine {
   let wordStart = true;
-  for (let index = start; index < command.length; index++) {
+  let index = start;
+  while (index < command.length) {
+    const quoted = quotedRunEndAt(command, index);
+    if (quoted !== undefined) { index = quoted; wordStart = false; continue; }
     const character = command[index];
-    if (quote === "'") { if (character === "'") quote = undefined; continue; }
-    if (quote === "$'") {
-      if (character === "\\") index++;
-      else if (character === "'") quote = undefined;
-      continue;
-    }
-    if (quote === '"') {
-      if (character === "\\") index++;
-      else if (character === '"') quote = undefined;
-      continue;
-    }
-    if (character === "\\") { index++; continue; }
-    if (character === "'" || character === '"') { quote = character; wordStart = false; continue; }
-    if (character === "$" && command[index + 1] === "'") { quote = "$'"; index++; wordStart = false; continue; }
-    if (character === "#" && wordStart) {
-      const end = command.indexOf("\n", index);
-      return { line: command.slice(start, end === -1 ? command.length : end),
-        end: end === -1 ? command.length : end };
-    }
+    if (character === "\\") { index += 2; continue; }
+    if (character === "#" && wordStart) return commentLineAt(command, start, index);
     if (character === "\n") return { line: command.slice(start, index), end: index };
     wordStart = WORD_BREAK.test(character);
+    index++;
   }
   return { line: command.slice(start), end: command.length };
 }
@@ -1322,6 +1496,78 @@ function heredocBodies(command: string, start: number, markers: readonly Heredoc
   return { text, end: index, unstable };
 }
 
+/** One consumed slice of the continuation scan, with the word-start state after it. */
+interface ContinuationStep { text: string; next: number; wordStart: boolean; marker?: HeredocMarker }
+
+/** Copies a `\`-newline (removed), a trailing `\`, or a `\`-escaped character. */
+function backslashStep(command: string, index: number, wordStart: boolean): ContinuationStep {
+  const next = command[index + 1];
+  if (next === "\n") return { text: "", next: index + 2, wordStart };
+  if (next === undefined) return { text: "\\", next: index + 1, wordStart };
+  return { text: command.slice(index, index + 2), next: index + 2, wordStart: false };
+}
+
+/** Copies a single-quoted run, which holds a backslash and a newline as data. */
+function singleQuotedStep(command: string, index: number): ContinuationStep {
+  const end = command.indexOf("'", index + 1);
+  const stop = end === -1 ? command.length : end + 1;
+  return { text: command.slice(index, stop), next: stop, wordStart: false };
+}
+
+/** Copies a `$'...'` run, which holds a backslash and a newline as data. */
+function ansiQuotedStep(command: string, index: number): ContinuationStep {
+  let cursor = index + 2;
+  while (cursor < command.length && command[cursor] !== "'") cursor += command[cursor] === "\\" ? 2 : 1;
+  const stop = Math.min(cursor + 1, command.length);
+  return { text: command.slice(index, stop), next: stop, wordStart: false };
+}
+
+/** Copies a `"..."` run, deleting `\`-newlines a shell removes inside it. */
+function doubleQuotedStep(command: string, index: number): ContinuationStep {
+  let cursor = index + 1;
+  let text = "\"";
+  while (cursor < command.length) {
+    const inner = command[cursor];
+    if (inner === "\\") {
+      const next = command[cursor + 1];
+      if (next === "\n") { cursor += 2; continue; }
+      text += next === undefined ? inner : inner + next;
+      cursor += next === undefined ? 1 : 2;
+      continue;
+    }
+    text += inner;
+    cursor++;
+    if (inner === '"') break;
+  }
+  return { text, next: cursor, wordStart: false };
+}
+
+/** Copies a comment, which runs to (but not past) its newline. */
+function commentContinuationStep(command: string, index: number): ContinuationStep {
+  const end = command.indexOf("\n", index);
+  const stop = end === -1 ? command.length : end;
+  return { text: command.slice(index, stop), next: stop, wordStart: false };
+}
+
+/** Copies a here-document marker word and records it for its body. */
+function heredocContinuationStep(command: string, index: number): ContinuationStep | undefined {
+  const parsed = heredocMarkerAt(command, index);
+  if (parsed === undefined) return undefined;
+  return { text: command.slice(index, parsed.end), next: parsed.end, wordStart: false, marker: parsed.marker };
+}
+
+/** The step for a character that starts a quoted run, comment, or marker. */
+function continuationStepAt(command: string, index: number, wordStart: boolean): ContinuationStep | undefined {
+  const character = command[index];
+  if (character === "\\") return backslashStep(command, index, wordStart);
+  if (character === "'") return singleQuotedStep(command, index);
+  if (character === "$" && command[index + 1] === "'") return ansiQuotedStep(command, index);
+  if (character === '"') return doubleQuotedStep(command, index);
+  if (character === "#" && wordStart) return commentContinuationStep(command, index);
+  if (character === "<") return heredocContinuationStep(command, index);
+  return undefined;
+}
+
 /**
  * Removes `\`-newline continuations so the command is validated and parsed as
  * the shell would run it.
@@ -1345,73 +1591,8 @@ export function normalizeContinuations(command: string): string {
   let wordStart = true;
   let pending: HeredocMarker[] = [];
   while (index < command.length) {
-    const character = command[index];
-    if (character === "\\") {
-      const next = command[index + 1];
-      if (next === "\n") { index += 2; continue; }
-      if (next === undefined) { result += character; break; }
-      result += character + next;
-      wordStart = false;
-      index += 2;
-      continue;
-    }
-    if (character === "'") {
-      const end = command.indexOf("'", index + 1);
-      const stop = end === -1 ? command.length : end + 1;
-      result += command.slice(index, stop);
-      wordStart = false;
-      index = stop;
-      continue;
-    }
-    if (character === "$" && command[index + 1] === "'") {
-      let cursor = index + 2;
-      while (cursor < command.length && command[cursor] !== "'") cursor += command[cursor] === "\\" ? 2 : 1;
-      const stop = Math.min(cursor + 1, command.length);
-      result += command.slice(index, stop);
-      wordStart = false;
-      index = stop;
-      continue;
-    }
-    if (character === '"') {
-      let cursor = index + 1;
-      let quoted = "\"";
-      while (cursor < command.length) {
-        const inner = command[cursor];
-        if (inner === "\\") {
-          const next = command[cursor + 1];
-          if (next === "\n") { cursor += 2; continue; }
-          quoted += next === undefined ? inner : inner + next;
-          cursor += next === undefined ? 1 : 2;
-          continue;
-        }
-        quoted += inner;
-        cursor++;
-        if (inner === '"') break;
-      }
-      result += quoted;
-      wordStart = false;
-      index = cursor;
-      continue;
-    }
-    if (character === "#" && wordStart) {
-      const end = command.indexOf("\n", index);
-      const stop = end === -1 ? command.length : end;
-      result += command.slice(index, stop);
-      index = stop;
-      continue;
-    }
-    if (character === "<") {
-      const parsed = heredocMarkerAt(command, index);
-      if (parsed !== undefined) {
-        result += command.slice(index, parsed.end);
-        pending.push(parsed.marker);
-        wordStart = false;
-        index = parsed.end;
-        continue;
-      }
-    }
-    if (character === "\n") {
-      result += character;
+    if (command[index] === "\n") {
+      result += "\n";
       index++;
       wordStart = true;
       if (pending.length) {
@@ -1422,9 +1603,17 @@ export function normalizeContinuations(command: string): string {
       }
       continue;
     }
-    result += character;
-    wordStart = WORD_BREAK.test(character);
-    index++;
+    const step = continuationStepAt(command, index, wordStart);
+    if (step === undefined) {
+      result += command[index];
+      wordStart = WORD_BREAK.test(command[index]);
+      index++;
+      continue;
+    }
+    result += step.text;
+    index = step.next;
+    wordStart = step.wordStart;
+    if (step.marker !== undefined) pending.push(step.marker);
   }
   return result;
 }
@@ -1439,6 +1628,80 @@ export interface LogicalScript {
    * but later entries may be body data.
    */
   certain: number;
+}
+
+/** State shared across the logical-line scan. */
+interface LogicalScan {
+  lines: string[];
+  start: number;
+  pending: HeredocMarker[];
+  certain: number | undefined;
+}
+
+/** Records that everything from the line at `line` onwards may be data. */
+function markUncertain(scan: LogicalScan, line: number): void {
+  if (scan.certain === undefined) scan.certain = line + 1;
+}
+
+/** Ends the current line at `end` and jumps past the bodies of its markers. */
+function endLogicalLine(scan: LogicalScan, command: string, end: number): void {
+  scan.lines.push(command.slice(scan.start, end));
+  scan.start = end + 1;
+  if (!scan.pending.length) return;
+  const bodies = heredocBodies(command, scan.start, scan.pending);
+  if (bodies.unstable) markUncertain(scan, scan.lines.length - 1);
+  scan.start = bodies.end;
+  scan.pending = [];
+}
+
+/** One scan step: the next index and word-start state. */
+interface LogicalStep { next: number; wordStart: boolean }
+
+/** Skips the `\`-escaped character at `index`. */
+function backslashLogicalStep(command: string, index: number, wordStart: boolean): LogicalStep {
+  if (index + 1 >= command.length) return { next: index + 1, wordStart: false };
+  const escaped = command[index + 1];
+  return { next: index + 2, wordStart: escaped === "\n" ? wordStart : false };
+}
+
+/** Ends the line at a comment's newline and jumps past its heredoc bodies. */
+function commentLogicalStep(scan: LogicalScan, command: string, index: number): LogicalStep {
+  const end = command.indexOf("\n", index);
+  if (end === -1) return { next: command.length, wordStart: true };
+  endLogicalLine(scan, command, end);
+  return { next: scan.start, wordStart: true };
+}
+
+/** Ends the line at a newline and jumps past its heredoc bodies. */
+function newlineLogicalStep(scan: LogicalScan, command: string, index: number): LogicalStep {
+  endLogicalLine(scan, command, index);
+  return { next: scan.start, wordStart: true };
+}
+
+/** Records a heredoc marker at `index`; returns the index after it, or undefined when none. */
+function heredocLogicalStep(scan: LogicalScan, command: string, index: number): number | undefined {
+  const parsed = heredocMarkerAt(command, index);
+  if (parsed === undefined) {
+    if (isUndecodableHeredocStart(command, index)) markUncertain(scan, scan.lines.length);
+    return undefined;
+  }
+  scan.pending.push(parsed.marker);
+  return parsed.end;
+}
+
+/** One step of the logical-line scan at `index`. */
+function logicalStepAt(scan: LogicalScan, command: string, index: number, wordStart: boolean): LogicalStep {
+  const quoted = quotedRunEndAt(command, index);
+  if (quoted !== undefined) return { next: quoted, wordStart: false };
+  const character = command[index];
+  if (character === "\\") return backslashLogicalStep(command, index, wordStart);
+  if (character === "#" && wordStart) return commentLogicalStep(scan, command, index);
+  if (character === "<") {
+    const markerEnd = heredocLogicalStep(scan, command, index);
+    if (markerEnd !== undefined) return { next: markerEnd, wordStart: false };
+  }
+  if (character === "\n") return newlineLogicalStep(scan, command, index);
+  return { next: index + 1, wordStart: WORD_BREAK.test(character) };
 }
 
 /**
@@ -1457,85 +1720,16 @@ export interface LogicalScript {
  * whose script/data split is known; callers must not auto-approve past it.
  */
 export function logicalLines(command: string): LogicalScript {
-  const lines: string[] = [];
-  let certain: number | undefined;
-  let start = 0;
+  const scan: LogicalScan = { lines: [], start: 0, pending: [], certain: undefined };
   let wordStart = true;
-  let quote: "'" | '"' | "$'" | undefined;
-  let pending: HeredocMarker[] = [];
-  /** Records that everything from the line at `line` onwards may be data. */
-  const markUncertain = (line: number) => {
-    if (certain === undefined) certain = line + 1;
-  };
-  /** Ends the current line at `end` and jumps past the bodies of its markers. */
-  const endLine = (end: number) => {
-    lines.push(command.slice(start, end));
-    start = end + 1;
-    if (!pending.length) return;
-    const bodies = heredocBodies(command, start, pending);
-    if (bodies.unstable) markUncertain(lines.length - 1);
-    start = bodies.end;
-    pending = [];
-  };
-  for (let index = 0; index < command.length; index++) {
-    const character = command[index];
-    if (quote === "'") {
-      if (character === "'") quote = undefined;
-      continue;
-    }
-    if (quote === "$'") {
-      if (character === "\\") index++;
-      else if (character === "'") quote = undefined;
-      continue;
-    }
-    if (quote === '"') {
-      if (character === "\\") index++;
-      else if (character === '"') quote = undefined;
-      continue;
-    }
-    if (character === "\\") {
-      if (index + 1 < command.length) {
-        if (command[++index] !== "\n") wordStart = false;
-      } else wordStart = false;
-      continue;
-    }
-    if (character === "'" || character === '"' || (character === "$" && command[index + 1] === "'")) {
-      wordStart = false;
-      if (character === "'" || character === '"') quote = character;
-      else { quote = "$'"; index++; }
-      continue;
-    }
-    if (character === "#" && wordStart) {
-      // A comment runs to the end of the physical line; quotes inside it are text.
-      const end = command.indexOf("\n", index);
-      if (end === -1) break;
-      endLine(end);
-      index = start - 1;
-      wordStart = true;
-      continue;
-    }
-    if (character === "<") {
-      const parsed = heredocMarkerAt(command, index);
-      if (parsed !== undefined) {
-        pending.push(parsed.marker);
-        wordStart = false;
-        index = parsed.end - 1;
-        continue;
-      }
-      if (command[index + 1] === "<" && command[index + 2] !== "<" && command[index - 1] !== "<")
-        markUncertain(lines.length);
-    }
-    if (character === "\n") {
-      endLine(index);
-      // Resume after the bodies, if this line opened any.
-      index = start - 1;
-      wordStart = true;
-      continue;
-    }
-    wordStart = WORD_BREAK.test(character);
+  let index = 0;
+  while (index < command.length) {
+    const step = logicalStepAt(scan, command, index, wordStart);
+    index = step.next;
+    wordStart = step.wordStart;
   }
-  lines.push(command.slice(start));
-  return { lines, certain: certain ?? lines.length };
+  scan.lines.push(command.slice(scan.start));
+  return { lines: scan.lines, certain: scan.certain ?? scan.lines.length };
 }
 
 /**
@@ -1553,6 +1747,25 @@ export function parseShell(command: string): ParseEntry[] {
   return parse(escapeLiteralHashes(stripDescriptorPrefixes(normalizeContinuations(command))), (key) => `$${key}`);
 }
 
+/** True when a descriptor close (`>&-` or `<&-`) starts at `index`. */
+function isDescriptorClose(command: string, index: number): boolean {
+  const character = command[index];
+  return (character === ">" || character === "<") && command[index + 1] === "&" && command[index + 2] === "-";
+}
+
+/** True when a descriptor close is immediately followed by more word text. */
+function hasDescriptorCloseTail(command: string, index: number, delimiter: RegExp): boolean {
+  if (!isDescriptorClose(command, index)) return false;
+  const next = command[index + 3];
+  return next !== undefined && !delimiter.test(next);
+}
+
+/** The offset just past a comment's newline, or the end of the command. */
+function skipComment(command: string, index: number): number {
+  const end = command.indexOf("\n", index);
+  return end === -1 ? command.length : end + 1;
+}
+
 /**
  * True when a descriptor close (`>&-` or `<&-`) is immediately followed by more
  * word characters.
@@ -1567,76 +1780,52 @@ export function hasAmbiguousDescriptorClose(command: string): boolean {
   let boundary = true;
   let index = 0;
   while (index < command.length) {
+    const quoted = quotedRunEndAt(command, index);
+    if (quoted !== undefined) { index = quoted; boundary = false; continue; }
     const character = command[index];
     if (character === "\\") { index += 2; boundary = false; continue; }
-    if (character === "'") {
-      const end = command.indexOf("'", index + 1);
-      index = end === -1 ? command.length : end + 1;
-      boundary = false;
-      continue;
-    }
-    if (character === "$" && command[index + 1] === "'") {
-      let cursor = index + 2;
-      while (cursor < command.length && command[cursor] !== "'") cursor += command[cursor] === "\\" ? 2 : 1;
-      index = Math.min(cursor + 1, command.length);
-      boundary = false;
-      continue;
-    }
-    if (character === '"') {
-      let cursor = index + 1;
-      while (cursor < command.length && command[cursor] !== '"') cursor += command[cursor] === "\\" ? 2 : 1;
-      index = Math.min(cursor + 1, command.length);
-      boundary = false;
-      continue;
-    }
-    if (boundary && character === "#") {
-      const end = command.indexOf("\n", index);
-      index = end === -1 ? command.length : end;
-      continue;
-    }
-    if ((character === ">" || character === "<") && command[index + 1] === "&" && command[index + 2] === "-") {
-      const next = command[index + 3];
-      if (next !== undefined && !delimiter.test(next)) return true;
-    }
+    if (boundary && character === "#") { index = skipComment(command, index); continue; }
+    if (hasDescriptorCloseTail(command, index, delimiter)) return true;
     boundary = delimiter.test(character);
     index++;
   }
   return false;
 }
 
+/** Builder state for one script's simple commands. */
+interface InvocationBuilder { words: string[]; commands: string[][]; skipNext: boolean }
+
+/** Adds a word unless the previous token was a redirection operator. */
+function pushTokenWord(builder: InvocationBuilder, word: string): void {
+  if (!builder.skipNext) builder.words.push(word);
+  builder.skipNext = false;
+}
+
+/** Folds one parsed token into the current simple command. */
+function consumeToken(builder: InvocationBuilder, token: ParseEntry): void {
+  if (typeof token === "string") { pushTokenWord(builder, token); return; }
+  if ("comment" in token) return;
+  if (!("op" in token)) return;
+  if (token.op === "glob") { pushTokenWord(builder, token.pattern); return; }
+  if (CONTROL_OPERATORS.has(token.op)) {
+    if (builder.words.length) builder.commands.push(builder.words);
+    builder.words = [];
+    builder.skipNext = false;
+    return;
+  }
+  // A redirection does not end a simple command; only its target is dropped.
+  // Descriptor prefixes were already removed from the source before parsing.
+  if (REDIRECT_OPERATORS.has(token.op)) builder.skipNext = true;
+}
+
 /** Splits a script into simple commands, dropping redirection targets. */
 function invocations(command: string): string[][] {
   let tokens;
   try { tokens = parseShell(command); } catch { return []; }
-  const result: string[][] = [];
-  let words: string[] = [];
-  let skipNext = false;
-  for (const token of tokens) {
-    if (typeof token === "string") {
-      if (!skipNext) words.push(token);
-      skipNext = false;
-      continue;
-    }
-    if ("comment" in token) continue;
-    if ("op" in token) {
-      if (token.op === "glob") {
-        if (!skipNext) words.push(token.pattern);
-        skipNext = false;
-        continue;
-      }
-      if (CONTROL_OPERATORS.has(token.op)) {
-        if (words.length) result.push(words);
-        words = [];
-        skipNext = false;
-        continue;
-      }
-      // A redirection does not end a simple command; only its target is dropped.
-      // Descriptor prefixes were already removed from the source before parsing.
-      if (REDIRECT_OPERATORS.has(token.op)) skipNext = true;
-    }
-  }
-  if (words.length) result.push(words);
-  return result;
+  const builder: InvocationBuilder = { words: [], commands: [], skipNext: false };
+  for (const token of tokens) consumeToken(builder, token);
+  if (builder.words.length) builder.commands.push(builder.words);
+  return builder.commands;
 }
 
 /** Offset of the first `$'`, `$"`, or `$[` in the normalized text. */
@@ -1681,6 +1870,35 @@ export function denyCleanPrefix(normalized: string, depth = 0): string | undefin
   return undefined;
 }
 
+/** Deny reason for any of `lines`, stopping at the first dangerous invocation. */
+function denyLines(lines: readonly string[], depth: number): string | undefined {
+  for (const line of lines) {
+    for (const words of invocations(line)) {
+      const reason = denyInvocation(words, depth);
+      if (reason !== undefined) return reason;
+    }
+  }
+  return undefined;
+}
+
+/** Deny reason in the certain prefix of a raw heredoc script. */
+function denyRawLines(lines: readonly string[], depth: number): string | undefined {
+  for (const line of lines) {
+    // A line whose own normalization assembles unsupported quoting cannot be
+    // parsed safely; its deny is left to the caller's manual approval.
+    if (hasAssembledUndecodedSyntax(line)) continue;
+    const reason = denyLines([line], depth);
+    if (reason !== undefined) return reason;
+  }
+  return undefined;
+}
+
+/** Deny reason in the certain prefix of a normalized script. */
+function denyLogicalLines(normalized: string, depth: number): string | undefined {
+  const { lines, certain } = logicalLines(normalized);
+  return denyLines(lines.slice(0, certain), depth);
+}
+
 /**
  * Deny reason for a nested script (`sh -c`, `eval`), or undefined when nothing in
  * it is a dangerous operation.
@@ -1704,32 +1922,14 @@ function denyScript(command: string, depth: number): string | undefined {
   if (FORK_BOMB.test(command)) return DANGEROUS;
   const normalized = normalizeContinuations(command);
   const raw = rawHeredocScript(command);
-  if (raw.ambiguous) {
-    for (const line of raw.lines) {
-      // A line whose own normalization assembles unsupported quoting cannot be
-      // parsed safely; its deny is left to the caller's manual approval.
-      if (hasAssembledUndecodedSyntax(line)) continue;
-      for (const words of invocations(line)) {
-        const reason = denyInvocation(words, depth);
-        if (reason !== undefined) return reason;
-      }
-    }
-    return undefined;
-  }
+  if (raw.ambiguous) return denyRawLines(raw.lines, depth);
   // Normalization can assemble quoting this reader does not decode. The inner
   // shell could then run a command the projection does not place, so the rest of
   // the projection stands down; a deny already visible in the clean prefix still
   // keeps its precedence, and the caller asks when there is none.
   if (!hasUndecodedSyntax(command) && hasUndecodedSyntax(normalized))
     return denyCleanPrefix(normalized, depth);
-  const { lines, certain } = logicalLines(normalized);
-  for (const line of lines.slice(0, certain)) {
-    for (const words of invocations(line)) {
-      const reason = denyInvocation(words, depth);
-      if (reason !== undefined) return reason;
-    }
-  }
-  return undefined;
+  return denyLogicalLines(normalized, depth);
 }
 
 /**
@@ -1790,6 +1990,9 @@ const UNIQ_LONG_FLAGS = new Set(["--count", "--repeated", "--ignore-case", "--un
 const UNIQ_LONG_OPTIONAL_FLAGS = new Set(["--all-repeated", "--group"]);
 const UNIQ_LONG_VALUE_FLAGS = new Set(["--skip-fields", "--skip-chars", "--check-chars"]);
 
+/** Loop state of the `uniq` operand scan. */
+interface UniqScan { operands: number; endOfOptions: boolean }
+
 /**
  * `uniq INPUT OUTPUT` writes OUTPUT. macOS stops option parsing at the first
  * operand, so `uniq in.txt -out.txt` writes a file named `-out.txt`; every
@@ -1801,40 +2004,38 @@ const UNIQ_LONG_VALUE_FLAGS = new Set(["--skip-fields", "--skip-chars", "--check
  * `isReadOnlyInvocation` already refuses before any policy runs.
  */
 function isReadOnlyUniq(args: readonly string[]): boolean {
-  let operands = 0;
-  let endOfOptions = false;
+  const scan: UniqScan = { operands: 0, endOfOptions: false };
   for (let index = 0; index < args.length; index++) {
     const arg = args[index];
-    if (endOfOptions || operands > 0) { operands++; continue; }
-    if (arg === "--") { endOfOptions = true; continue; }
-    if (arg === "-") { operands++; continue; }
-    if (arg.startsWith("--") && arg.length > 2) {
-      const name = arg.split("=", 1)[0];
-      const attached = arg.length > name.length;
-      if (UNIQ_LONG_VALUE_FLAGS.has(name)) {
-        if (!attached) index++;
-        continue;
-      }
-      if (UNIQ_LONG_OPTIONAL_FLAGS.has(name) || (UNIQ_LONG_FLAGS.has(name) && !attached)) continue;
-      operands++;
-      continue;
-    }
-    if (arg.startsWith("-")) {
-      const letters = arg.slice(1);
-      let known = true;
-      for (let position = 0; position < letters.length; position++) {
-        if (UNIQ_VALUE_FLAGS.has(letters[position])) {
-          if (position === letters.length - 1) index++;
-          break;
-        }
-        if (!UNIQ_FLAGS.has(letters[position])) { known = false; break; }
-      }
-      if (!known) operands++;
-      continue;
-    }
-    operands++;
+    if (scan.endOfOptions || scan.operands > 0 || arg === "-") { scan.operands++; continue; }
+    if (arg === "--") { scan.endOfOptions = true; continue; }
+    if (arg.startsWith("--") && arg.length > 2) { index = uniqLongOption(scan, args, index); continue; }
+    if (arg.startsWith("-")) { index = uniqShortOption(scan, args, index); continue; }
+    scan.operands++;
   }
-  return operands <= 1;
+  return scan.operands <= 1;
+}
+
+/** Reads one `--long` option of `uniq`; returns the index it ended at. */
+function uniqLongOption(scan: UniqScan, args: readonly string[], index: number): number {
+  const arg = args[index];
+  const name = arg.split("=", 1)[0];
+  const attached = arg.length > name.length;
+  if (UNIQ_LONG_VALUE_FLAGS.has(name)) return attached ? index : index + 1;
+  if (UNIQ_LONG_OPTIONAL_FLAGS.has(name) || (UNIQ_LONG_FLAGS.has(name) && !attached)) return index;
+  scan.operands++;
+  return index;
+}
+
+/** Reads one short `uniq` option bundle; returns the index it ended at. */
+function uniqShortOption(scan: UniqScan, args: readonly string[], index: number): number {
+  const letters = args[index].slice(1);
+  for (let position = 0; position < letters.length; position++) {
+    if (UNIQ_VALUE_FLAGS.has(letters[position]))
+      return position === letters.length - 1 ? index + 1 : index;
+    if (!UNIQ_FLAGS.has(letters[position])) { scan.operands++; return index; }
+  }
+  return index;
 }
 
 const DATE_FLAGS = new Set(["u", "R", "j"]);
@@ -1843,47 +2044,57 @@ const DATE_LONG_FLAGS = new Set(["--utc", "--universal", "--rfc-email", "--rfc-2
   "--debug", "--help", "--version"]);
 const DATE_LONG_VALUE_FLAGS = new Set(["--date", "--reference", "--file", "--rfc-3339"]);
 
+/** The next `date` argument to inspect, or undefined when the call is not read-only. */
+function dateLongOptionNext(args: readonly string[], index: number): number | undefined {
+  const arg = args[index];
+  const name = arg.split("=", 1)[0];
+  const attached = arg.length > name.length;
+  // `--file DATEFILE` reads dates from a file, which may be project data.
+  if (name === "--file" || resolveLongOption(name) === "--file") return undefined;
+  if (DATE_LONG_VALUE_FLAGS.has(name)) return attached ? index + 1 : index + 2;
+  if (DATE_LONG_FLAGS.has(name)) return index + 1;
+  return undefined;
+}
+
+/** The next `date` argument to inspect, or undefined when a short bundle is not read-only. */
+function dateShortOptionNext(args: readonly string[], index: number): number | undefined {
+  const arg = args[index];
+  for (let position = 1; position < arg.length; position++) {
+    const letter = arg[position];
+    if (letter === "I") break;
+    // `-f FILE` / `-fFILE` also reads a date file.
+    if (letter === "f") return undefined;
+    // `-rFILE` hides the reference file from the word scan; only the separate
+    // `-r FILE` form stays available to the path check.
+    if (letter === "r") return position === arg.length - 1 ? index + 2 : undefined;
+    if (DATE_VALUE_FLAGS.has(letter)) return position === arg.length - 1 ? index + 2 : index + 1;
+    if (!DATE_FLAGS.has(letter)) return undefined;
+  }
+  return index + 1;
+}
+
+/** The next `date` argument to inspect, or undefined when this one needs review. */
+function dateOptionNext(args: readonly string[], index: number): number | undefined {
+  const arg = args[index];
+  if (arg.startsWith("--") && arg.length > 2) return dateLongOptionNext(args, index);
+  if (!arg.startsWith("-") || arg === "-") return undefined;
+  return dateShortOptionNext(args, index);
+}
+
 /**
  * `date` is read-only only when every argument is a known read-only option or a
  * `+FORMAT` operand. A positional operand sets the system clock
  * (`date 010100002030`), so it requires review.
  */
 function isReadOnlyDate(args: readonly string[]): boolean {
-  for (let index = 0; index < args.length; index++) {
+  let index = 0;
+  while (index < args.length) {
     const arg = args[index];
-    if (arg.startsWith("+")) continue;
+    if (arg.startsWith("+")) { index++; continue; }
     if (arg === "--") return args.slice(index + 1).every((operand) => operand.startsWith("+"));
-    if (arg.startsWith("--") && arg.length > 2) {
-      const name = arg.split("=", 1)[0];
-      const attached = arg.length > name.length;
-      // `--file DATEFILE` reads dates from a file, which may be project data.
-      if (name === "--file" || resolveLongOption(name) === "--file") return false;
-      if (DATE_LONG_VALUE_FLAGS.has(name)) {
-        if (!attached) index++;
-        continue;
-      }
-      if (DATE_LONG_FLAGS.has(name)) continue;
-      return false;
-    }
-    if (!arg.startsWith("-") || arg === "-") return false;
-    for (let position = 1; position < arg.length; position++) {
-      const letter = arg[position];
-      if (letter === "I") break;
-      // `-f FILE` / `-fFILE` also reads a date file.
-      if (letter === "f") return false;
-      // `-rFILE` hides the reference file from the word scan; only the separate
-      // `-r FILE` form stays available to the path check.
-      if (letter === "r") {
-        if (position !== arg.length - 1) return false;
-        index++;
-        break;
-      }
-      if (DATE_VALUE_FLAGS.has(letter)) {
-        if (position === arg.length - 1) index++;
-        break;
-      }
-      if (!DATE_FLAGS.has(letter)) return false;
-    }
+    const next = dateOptionNext(args, index);
+    if (next === undefined) return false;
+    index = next;
   }
   return true;
 }
@@ -1907,6 +2118,25 @@ function isReadOnlyJq(args: readonly string[]): boolean {
   return true;
 }
 
+/** True for a long option that makes `grep` follow directories or symlinks. */
+function isRecursiveGrepLongOption(option: string, value: string | undefined): boolean {
+  if ("--recursive".startsWith(option) || "--dereference-recursive".startsWith(option)) return true;
+  return "--directories".startsWith(option) && value === "recurse";
+}
+
+/** True when one `grep` argument selects recursive or symlink-following search. */
+function isRecursiveGrepArg(args: readonly string[], index: number): boolean {
+  const arg = args[index];
+  if (/[rR]/.test(shortFlags(arg, GREP_SHORT_VALUES))) return true;
+  const parsed = shortOption(arg, GREP_SHORT_VALUES);
+  if (parsed?.letter === "d" && (parsed.attached ?? args[index + 1]) === "recurse") return true;
+  if (!arg.startsWith("--") || arg.length <= 2) return false;
+  const separator = arg.indexOf("=");
+  const option = separator === -1 ? arg : arg.slice(0, separator);
+  const value = separator === -1 ? args[index + 1] : arg.slice(separator + 1);
+  return isRecursiveGrepLongOption(option, value);
+}
+
 /**
  * `grep -r`/`-R` and `-d recurse` follow directories instead of reading only
  * the named operands, so they can dump protected or external trees. `-R` also
@@ -1914,16 +2144,7 @@ function isReadOnlyJq(args: readonly string[]): boolean {
  */
 function isReadOnlyGrep(args: readonly string[]): boolean {
   for (let index = 0; index < args.length; index++) {
-    const arg = args[index];
-    if (/[rR]/.test(shortFlags(arg, GREP_SHORT_VALUES))) return false;
-    const parsed = shortOption(arg, GREP_SHORT_VALUES);
-    if (parsed?.letter === "d" && (parsed.attached ?? args[index + 1]) === "recurse") return false;
-    if (!arg.startsWith("--") || arg.length <= 2) continue;
-    const separator = arg.indexOf("=");
-    const option = separator === -1 ? arg : arg.slice(0, separator);
-    if ("--recursive".startsWith(option) || "--dereference-recursive".startsWith(option)) return false;
-    if ("--directories".startsWith(option) &&
-        (separator === -1 ? args[index + 1] : arg.slice(separator + 1)) === "recurse") return false;
+    if (isRecursiveGrepArg(args, index)) return false;
   }
   return true;
 }
@@ -1993,18 +2214,13 @@ const READ_ONLY = new Set(["pwd", "whoami", "id", "groups", "ls", "cat", "head",
   "true", ":", "grep", "cut", "tr", "jq", "stat", "du", "df", "which", "type", "basename", "dirname", "realpath",
   "diff", "test", "sleep", "uname"]);
 
+/** True for `status`, `rev-parse`, `diff`, `log`, `show` and the checked `branch` forms. */
 function isReadOnlyGit(args: readonly string[]): boolean {
-  if (args.some((arg) =>
-    /^(?:-c|--git-dir|--work-tree|--exec-path|--config-env)(?:=|$)/.test(arg) ||
-    arg === "--ext-diff" || arg === "--exec" || arg.startsWith("--output"))) return false;
+  if (hasGitGlobalOverride(args)) return false;
   const subcommand = args[0];
   if (subcommand === undefined) return false;
-  if (["status", "diff", "log", "show", "rev-parse"].includes(subcommand)) return true;
-  if (subcommand !== "branch") return false;
-  if (args.length === 1) return true;
-  return args.slice(1).every((arg) =>
-    ["--show-current", "--list", "-a", "-r", "-v", "-vv", "--merged", "--no-merged", "--contains", "--points-at", "--format"]
-      .some((safe) => arg === safe || arg.startsWith(`${safe}=`)));
+  if (subcommand === "branch") return isReadOnlyGitBranch(args);
+  return ["status", "diff", "log", "show", "rev-parse"].includes(subcommand);
 }
 
 function isReadOnlySed(args: readonly string[]): boolean {
@@ -2023,6 +2239,42 @@ function isReadOnlyGh(args: readonly string[]): boolean {
   }
   return new Set(["pr view", "pr list", "pr diff", "pr checks", "issue view", "issue list", "run view",
     "run list", "repo view", "auth status", "status", "search"]).has(`${group} ${subcommand}`);
+}
+
+/** True when `printf` gets a `-v` variable-assignment option before `--`. */
+function hasPrintfVariableOption(args: readonly string[]): boolean {
+  for (const arg of args) {
+    if (arg === "--") return false;
+    if (/^-v/.test(arg)) return true;
+  }
+  return false;
+}
+
+/** True only when `find` has no output (`-fprint`, `-fprint0`, `-fprintf`, `-fls`) or files-from option. */
+function isReadOnlyFind(args: readonly string[]): boolean {
+  return !args.some((arg) => /^--?(?:fprint|fprint0|fprintf|fls)$/.test(arg) || /^--?files0/.test(arg));
+}
+
+/** True only for `docker logs`. */
+function isReadOnlyDocker(args: readonly string[]): boolean {
+  return args[0] === "logs";
+}
+
+/** True for `bun test`, `bun run lint`, and `bun run typecheck`. */
+function isReadOnlyBun(args: readonly string[]): boolean {
+  if (args[0] === "test") return true;
+  return args[0] === "run" && (args[1] === "lint" || args[1] === "typecheck");
+}
+
+/** Read-only policy for commands that need a bespoke check rather than a table. */
+function specialReadOnlyPolicy(command: string, args: readonly string[]): boolean {
+  if (command === "git") return isReadOnlyGit(args);
+  if (command === "find") return isReadOnlyFind(args);
+  if (command === "sed") return isReadOnlySed(args);
+  if (command === "gh") return isReadOnlyGh(args);
+  if (command === "docker") return isReadOnlyDocker(args);
+  if (command === "bun") return isReadOnlyBun(args);
+  return false;
 }
 
 /**
@@ -2044,26 +2296,27 @@ export function isReadOnlyInvocation(words: readonly string[], globs: readonly b
   if ((words[0] ?? "").includes("/")) return false;
   const command = basename(words[0] ?? "");
   const args = words.slice(1);
-  if (command === "printf") {
-    // Any `-v` option assigns a shell variable, attached or separate. `--` ends
-    // option parsing, so `printf -- -v` keeps `-v` as literal format text.
-    for (const arg of args) {
-      if (arg === "--") break;
-      if (/^-v/.test(arg)) return false;
-    }
-  }
+  // Any `-v` option assigns a shell variable, attached or separate. `--` ends
+  // option parsing, so `printf -- -v` keeps `-v` as literal format text.
+  if (command === "printf" && hasPrintfVariableOption(args)) return false;
   // Own properties only: `./constructor` must not resolve to `Object`.
   if (Object.hasOwn(POLICIES, command)) return POLICIES[command](args);
   if (READ_ONLY.has(command)) return true;
-  if (command === "git") return isReadOnlyGit(args);
-  if (command === "find")
-    return !args.some((arg) => /^--?(?:fprint|fprint0|fprintf|fls)$/.test(arg) || /^--?files0/.test(arg));
-  if (command === "sed") return isReadOnlySed(args);
-  if (command === "gh") return isReadOnlyGh(args);
-  if (command === "docker") return args[0] === "logs";
-  if (command === "bun")
-    return args[0] === "test" || (args[0] === "run" && (args[1] === "lint" || args[1] === "typecheck"));
-  return false;
+  return specialReadOnlyPolicy(command, args);
+}
+
+/** True when a git option replaces configuration, a diff helper or the output target. */
+function hasGitGlobalOverride(args: readonly string[]): boolean {
+  return args.some((arg) =>
+    /^(?:-c|--git-dir|--work-tree|--exec-path|--config-env)(?:=|$)/.test(arg) ||
+    arg === "--ext-diff" || arg === "--exec" || arg.startsWith("--output"));
+}
+
+function isReadOnlyGitBranch(args: readonly string[]): boolean {
+  if (args.length === 1) return true;
+  return args.slice(1).every((arg) =>
+    ["--show-current", "--list", "-a", "-r", "-v", "-vv", "--merged", "--no-merged", "--contains", "--points-at", "--format"]
+      .some((safe) => arg === safe || arg.startsWith(`${safe}=`)));
 }
 
 const REVISION_REQUIRED = ["--date", "--encoding"];
