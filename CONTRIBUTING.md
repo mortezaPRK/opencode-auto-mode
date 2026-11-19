@@ -19,6 +19,7 @@ review expectations.
 | `src/worktree.ts` | Discovers the session's current worktree root and canonical location. |
 | `src/gates.ts` | VCS preconditions for history-changing commands. Missing facts fail toward review. |
 | `src/classifier.ts` | Ordered classifier pipeline. First decisive allow/deny wins; otherwise ask. |
+| `src/authority.ts` | Root user-authority collection: follows the parent chain to the root within 16 sessions, rejects cycles, keeps root user messages as authority and descendant prompts as separate nonauthority delegation context, and enforces the combined 12 KB text budget. Missing, cyclic, overdeep, or oversized evidence is terminal. |
 | `src/decision.ts`, `src/decision-evidence.ts` | Native typed decision stage using `ctx.experimental.generate.decisions`, plus the compact evidence builder shared with replay. |
 | `src/reviewer.ts` | LLM reviewer prompt, evidence filtering, response parsing, and deny-gate behavior. |
 | `src/code-mode.ts` | Code Mode SHA-256 identity, save entry, identity validation, and reviewer source resource. |

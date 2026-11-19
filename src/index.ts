@@ -3,6 +3,7 @@ import { Plugin } from "@opencode/plugin";
 import type { Agent } from "@opencode/schema/agent";
 import type { Session } from "@opencode/schema/session";
 import { DEFAULT_AUDIT_MAX_BYTES, DEFAULT_REVIEW_TIMEOUT_MS, parseOptions, type ClassifierOptions } from "./config.js";
+import { collectAuthority, DEFAULT_AUTHORITY_MAX_BYTES, DEFAULT_AUTHORITY_MAX_DEPTH, type AuthorityLookups, type AuthoritySessionInfo } from "./authority.js";
 import { reviewRequest, type PermissionRequest, type ReviewResult } from "./reviewer.js";
 import { decisionStage } from "./decision.js";
 import { runClassifiers } from "./classifier.js";
@@ -44,6 +45,7 @@ type RpcHandle = {
 };
 type PermissionEvent = Parameters<Parameters<SetupContext["permission"]["hook"]>[1]>[0];
 type Score = ReturnType<typeof scoreRequest>;
+type SessionInfo = Awaited<ReturnType<SetupContext["session"]["get"]>>;
 type Correlation = { reviewID?: string; sessionID?: string; callID?: string; stageIndex?: number };
 type Debug = (type: string, data: unknown, correlation?: Correlation) => void;
 type Observe = <T>(type: string, input: unknown, work: () => Promise<T>, correlation?: Correlation) => Promise<T>;
@@ -416,7 +418,7 @@ type WorkOutcome =
   | { kind: "cancelled" }
   | { kind: "reviewed"; result: ReviewResult };
 
-type PreparedRequest = { kind: "cancelled" } | { kind: "ready"; request: PermissionRequest };
+type PreparedRequest = { kind: "cancelled" } | { kind: "ready"; request: PermissionRequest; info: SessionInfo };
 
 function decisionPayload(entry: AutoModeDecision, tripped: boolean) {
   return {
@@ -595,25 +597,21 @@ async function prepareRequest(deps: Runtime, event: PermissionEvent, handle: Rev
   if (handle.signal.aborted) return { kind: "cancelled" };
   const request = reviewRequestFor(event, reviewResourcesFor(event), facts, deps.toolInputs);
   if (handle.signal.aborted) return { kind: "cancelled" };
-  return { kind: "ready", request };
+  return { kind: "ready", request, info };
 }
 
 async function runReviewStages(
   deps: Runtime, settings: PluginOptions, event: PermissionEvent, prepared: Extract<PreparedRequest, { kind: "ready" }>,
   scored: Score, handle: ReviewHandle, cancelledNow: () => boolean, meta: ReviewMeta,
 ): Promise<ReviewResult> {
-  const { request } = prepared;
+  const { request, info } = prepared;
   let transcript: Promise<string> | undefined;
   const authorize = async () => {
     if (cancelledNow()) throw new Error(INTERRUPTED_REASON);
-    transcript ??= (async () => {
-      // Classifier context is user-only; local debug retains the full response.
-      const messages = await deps.sdk("session.context", { sessionID: event.sessionID }, () => deps.ctx.session.context({ sessionID: event.sessionID }, { signal: handle.signal }), handle.signal, meta.correlation);
-      const users = messages.filter((message) => message.type === "user").map((message) => message.text);
-      if (users.length === 0 || users.some((text) => typeof text !== "string") || Buffer.byteLength(users.join("\n")) > 12_000)
-        throw new ReviewFailure("context", "User authorization context is unavailable or oversized");
-      return (request.userMessages = users).join("\n");
-    })().catch(unavailableAuthorization);
+    transcript ??= collectRequestAuthority(event.sessionID, info, {
+      get: async (sessionID, lookupSignal) => await deps.sdk("session.get", { sessionID }, () => deps.ctx.session.get({ sessionID }, { signal: lookupSignal ?? handle.signal }), lookupSignal ?? handle.signal, meta.correlation),
+      context: async (sessionID, lookupSignal) => await deps.sdk("session.context", { sessionID }, () => deps.ctx.session.context({ sessionID }, { signal: lookupSignal ?? handle.signal }), lookupSignal ?? handle.signal, meta.correlation),
+    }, request, meta.startedAt, handle.signal).catch(unavailableAuthorization);
     request.transcript = await transcript;
     if (cancelledNow()) throw new Error(INTERRUPTED_REASON);
   };
@@ -856,6 +854,27 @@ function unavailableAuthorization(error: unknown): never {
 function lostToolCapture(event: { action: string; source?: unknown }, capture: unknown): boolean {
   return capture === undefined && event.action !== "execute" &&
     isRecord(event.source) && event.source.type === "tool";
+}
+
+/** Root user messages stay the only authority; delegated prompts are separate
+ * nonauthority context. The current session info is never fetched twice. */
+function collectRequestAuthority(
+  sessionID: string,
+  current: AuthoritySessionInfo,
+  lookups: Pick<AuthorityLookups, "get" | "context">,
+  request: PermissionRequest,
+  startedAt: number,
+  signal: AbortSignal | undefined,
+): Promise<string> {
+  return collectAuthority(sessionID, {
+    get: (id, lookupSignal) => id === sessionID ? Promise.resolve(current) : lookups.get(id, lookupSignal),
+    context: lookups.context,
+  }, { signal, asOf: startedAt, maxBytes: DEFAULT_AUTHORITY_MAX_BYTES, maxDepth: DEFAULT_AUTHORITY_MAX_DEPTH }).then((authority) => {
+    request.userMessages = authority.userMessages;
+    if (authority.delegations.length > 0)
+      request.delegations = authority.delegations.flatMap((delegation) => delegation.messages);
+    return authority.userMessages.join("\n");
+  });
 }
 
 function reviewRequestFor(
