@@ -32,6 +32,8 @@ const MAX_TOOL_CAPTURES = 256;
 const MAX_DETAIL_ROWS = 200;
 const MAX_RECORDED_PLATFORM_CHARS = 64;
 const MAX_RECORDED_SHELL_CHARS = 500;
+const MAX_RECORDED_TARGETS = 64;
+const MAX_RECORDED_TARGET_CHARS = 2_000;
 const MAX_PROBLEMS = 8;
 const CLI_MAX_BUFFER = 2 * 1024 * 1024;
 const DELEGATION_LOSS = "Delegated context was redacted or lost";
@@ -159,6 +161,13 @@ interface State {
   nonDecisionStage: number;
 }
 
+interface RecordedOperation {
+  /** Bounded target spellings carried by the record. */
+  targets?: string[];
+  /** True only for a complete record whose targets are bounded canonical evidence. */
+  canonical: boolean;
+}
+
 interface RecordedEvidence {
   action?: string;
   resources?: string[];
@@ -168,6 +177,9 @@ interface RecordedEvidence {
   scopeResolution?: "unknown";
   platform?: string;
   shell?: { platform?: string; interpreter?: string };
+  /** Targets were resolved on the recording host; replay must not re-resolve
+   * their spellings under this host's rules or a changed filesystem. */
+  operation?: RecordedOperation;
   /** Recorded execution context that cannot be replayed faithfully; the request
    * must abstain before generation instead of substituting the replay host. */
   contextLoss?: "platform" | "shell";
@@ -434,8 +446,13 @@ function stringArray(value: unknown): string[] | undefined {
   return Array.isArray(value) && value.every((item) => typeof item === "string") ? value as string[] : undefined;
 }
 
+/** Own-property-safe: untrusted names such as `constructor` or `__proto__` are
+ * ordinary count keys, not inherited attributes or prototype writes. */
 function bump(counts: Counts, key: string): void {
-  counts[key] = (counts[key] ?? 0) + 1;
+  Object.defineProperty(counts, key, {
+    value: (Object.hasOwn(counts, key) ? counts[key]! : 0) + 1,
+    enumerable: true, configurable: true, writable: true,
+  });
 }
 
 function sortedCounts(counts: Counts): Counts {
@@ -787,6 +804,25 @@ function onToolExecute(state: State, env: Json): void {
   state.toolInputs.capture(capture);
 }
 
+function toolRelease(env: Json): { sessionID: string; messageID: string; id: string } | undefined {
+  const payload = isRecord(env.payload) ? env.payload : undefined;
+  const sessionID = stringValue(payload?.sessionID);
+  const messageID = stringValue(payload?.messageID);
+  const id = stringValue(payload?.id);
+  return sessionID && messageID && id ? { sessionID, messageID, id } : undefined;
+}
+
+/** Completion releases the exact capture, matching the runtime lifecycle
+ * (`src/index.ts` execute.after): a sequentially reused identity is a new call,
+ * not an overlap, so its arguments stay available. */
+function onToolRelease(state: State, env: Json): void {
+  const release = toolRelease(env);
+  if (!release) return;
+  const key = `tool.execute.after|${release.sessionID}|${release.messageID}|${release.id}|${stringValue(env.ts) ?? "-"}`;
+  if (seenBefore(state, key)) return;
+  state.toolInputs.release(release);
+}
+
 function stageStartFrom(env: Json, stageIndex: number): StageStart | undefined {
   const payload = isRecord(env.payload) ? env.payload : undefined;
   const type = stringValue(payload?.type);
@@ -963,6 +999,7 @@ function decisionEvent(state: State, type: string | undefined, env: Json, filter
 function dispatch(state: State, env: Json, filter: ModelFilter): void {
   const type = stringValue(env.type);
   if (type === "tool.execute.before") { onToolExecute(state, env); return; }
+  if (type === "tool.execute.after") { onToolRelease(state, env); return; }
   if (type === "permission.evaluate.before") { onPermission(state, env); return; }
   if (type === "classifier.start") { onStageStart(state, env); return; }
   if (type === "classifier.end") { onStageEnd(state, env); return; }
@@ -1101,6 +1138,23 @@ function recordedShell(value: unknown): { shell?: RecordedEvidence["shell"]; los
   };
 }
 
+function recordedTargets(value: unknown): { targets?: string[]; canonical: boolean } {
+  if (!Array.isArray(value)) return { canonical: false };
+  const targets = value.slice(0, MAX_RECORDED_TARGETS + 1)
+    .filter((item): item is string => typeof item === "string");
+  const canonical = targets.length === value.length && targets.length > 0 && targets.length <= MAX_RECORDED_TARGETS &&
+    targets.every((target) => target.length > 0 && target.length <= MAX_RECORDED_TARGET_CHARS);
+  return { ...(targets.length === 0 ? {} : { targets }), canonical };
+}
+
+function recordedOperation(value: unknown): RecordedOperation | undefined {
+  if (value === undefined) return undefined;
+  const object = jsonRecord(value);
+  if (!object) return { canonical: false };
+  const targets = recordedTargets(object.targets);
+  return { ...(targets.targets === undefined ? {} : { targets: targets.targets }), canonical: targets.canonical && object.complete === true };
+}
+
 function recordedEvidence(text: string | undefined): RecordedEvidence | undefined {
   if (text === undefined || text.length > MAX_EVIDENCE_TEXT_CHARS) return undefined;
   let parsed: unknown;
@@ -1122,6 +1176,7 @@ function recordedEvidence(text: string | undefined): RecordedEvidence | undefine
     scopeResolution: scope,
     platform: platform.value,
     shell: shell.shell,
+    operation: recordedOperation(object.operation),
     contextLoss: platform.loss ? "platform" : shell.loss ? "shell" : recordedShellLoss,
     userMessages: chronology(object.userMessages),
     delegations: delegations.delegations,
@@ -1149,12 +1204,39 @@ function hostResources(host: HostEvent): string[] | undefined {
   catch { return undefined; }
 }
 
-function hostOperation(host: HostEvent, recorded: RecordedEvidence | undefined): OperationEvidence {
+function sameTargets(left: readonly string[] | undefined, right: readonly string[] | undefined): boolean {
+  if (left === undefined || right === undefined) return left === right;
+  return left.length === right.length && left.every((target, index) => target === right[index]);
+}
+
+/** Rebuilt targets follow this host's path rules and current filesystem. A
+ * complete recorded list is canonical; otherwise the rebuild must match the
+ * recorded targets, and a differing platform can still change resolution. */
+function historicalTargets(operation: OperationEvidence, recorded: RecordedEvidence | undefined):
+  { targets?: string[]; preGeneration?: "platform" | "operation" } {
+  const historical = recorded?.operation;
+  if (historical?.canonical === true && historical.targets !== undefined) return { targets: historical.targets };
+  if (historical !== undefined && !sameTargets(operation.targets, historical.targets)) return { preGeneration: "operation" };
+  if (operation.targets !== undefined && recorded?.platform !== process.platform) return { preGeneration: "platform" };
+  return {};
+}
+
+interface HostOperation {
+  operation: OperationEvidence;
+  targetLoss?: "platform" | "operation";
+}
+
+function hostOperation(host: HostEvent, recorded: RecordedEvidence | undefined): HostOperation {
   const operation = buildOperationEvidence(
     { action: host.action, resources: host.resources, metadata: host.metadata, sessionID: host.sessionID },
     { projectDir: recorded?.projectDir ?? host.projectDir, capture: host.capture },
   );
-  return host.metadataInvalid ? { ...operation, complete: false } : operation;
+  const repaired = host.metadataInvalid ? { ...operation, complete: false } : operation;
+  const targets = historicalTargets(repaired, recorded);
+  return {
+    operation: targets.targets === undefined ? repaired : { ...repaired, targets: targets.targets },
+    ...(targets.preGeneration === undefined ? {} : { targetLoss: targets.preGeneration }),
+  };
 }
 
 function hostAgent(host: HostEvent, recorded: RecordedEvidence | undefined): string | undefined {
@@ -1195,9 +1277,10 @@ function delegationLoss(recorded: RecordedEvidence | undefined, evidence: Decisi
 }
 
 function preGenerationOf(evidence: DecisionEvidence, bytes: number, request: DecisionEvidenceRequest,
-  contextLoss: RecordedEvidence["contextLoss"]): Candidate["preGeneration"] {
+  contextLoss: RecordedEvidence["contextLoss"], targetLoss?: "platform" | "operation"): Candidate["preGeneration"] {
   if (resourceLoss(request)) return "resources";
   if (contextLoss !== undefined) return contextLoss;
+  if (targetLoss !== undefined) return targetLoss;
   if (evidence.incompleteEvidenceKind === "shell") return "shell";
   if (evidence.incompleteEvidenceKind === "delegations") return "delegations";
   if (evidence.operation?.complete === false) return "operation";
@@ -1265,8 +1348,8 @@ function candidateFor(review: ReviewState, request: DecisionRequestAudit): Candi
   if (!review.host) return missingHostCandidate(recorded);
   const resources = hostResources(review.host);
   if (!resources) return codeModeCandidate(review.host, fallback);
-  const operation = hostOperation(review.host, recorded);
-  const built = requestFromHost(review.host, recorded, resources, operation);
+  const rebuilt = hostOperation(review.host, recorded);
+  const built = requestFromHost(review.host, recorded, resources, rebuilt.operation);
   const evidence = delegationLoss(recorded, buildDecisionEvidence(built));
   const bytes = Buffer.byteLength(JSON.stringify(evidence));
   return {
@@ -1274,7 +1357,7 @@ function candidateFor(review: ReviewState, request: DecisionRequestAudit): Candi
     missingChronology: missingChronologyOf(recorded), operationMissing: evidence.operation === undefined,
     metadataInvalid: review.host.metadataInvalid, codeModeError: false,
     terminal: opaqueOperation(evidence, built) ? "opaque" : undefined,
-    preGeneration: preGenerationOf(evidence, bytes, built, recorded?.contextLoss), bytes, ...rebuildFlags(recorded, evidence),
+    preGeneration: preGenerationOf(evidence, bytes, built, recorded?.contextLoss, rebuilt.targetLoss), bytes, ...rebuildFlags(recorded, evidence),
   };
 }
 

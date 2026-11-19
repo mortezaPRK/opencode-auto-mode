@@ -536,6 +536,39 @@ test("missing or malformed recorded execution context is pre-generation and neve
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test("replayed operations reuse recorded canonical targets or abstain when resolution cannot be reproduced", () => {
+  const root = mkdtempSync(join(tmpdir(), "auto-mode-recorded-targets-"));
+  try {
+    const rows = [
+      ...decisionRows("review-targets-recorded", {
+        action: "grep", resources: ["src"], userMessages: ["search src"],
+        operation: { tool: "grep", access: "read", targets: ["C:\\recorded\\repo\\src"], complete: true },
+      }, { tool: "grep", input: { path: "src" } }),
+      ...decisionRows("review-targets-platform", {
+        action: "grep", resources: ["src"], userMessages: ["search src"], platform: RECORDED_PLATFORM,
+      }, { tool: "grep", input: { path: "src" } }),
+      ...decisionRows("review-targets-differ", {
+        action: "grep", resources: ["src"], userMessages: ["search src"],
+        operation: { tool: "grep", access: "read", targets: ["/recorded/other/src"], complete: false },
+      }, { tool: "grep", input: { path: "src" } }),
+    ];
+    const input = writeRows(root, rows);
+    const dry = run(["--input", input, "--model", "fixture/judge", "--json"]);
+    expect(dry.status).toBe(0);
+    const report = JSON.parse(dry.stdout);
+    expect(report.evidence.preGeneration).toEqual({ operation: 1, platform: 1 });
+    expect(report.eligibility.eligible).toBe(1);
+    const body = join(root, "body.json");
+    const live = run(["--input", input, "--model", "fixture/judge", "--live", "--limit", "1", "--holdout", "0",
+      "--opencode-bin", fakeCli(root), "--json"], { FAKE_BODY: body });
+    expect(live.status).toBe(0);
+    expect(JSON.parse(live.stdout).live.selected).toBe(1);
+    const sent = JSON.parse(readFileSync(body, "utf8"));
+    const evidence = JSON.parse(sent.input[0].text);
+    expect(evidence.operation.targets).toEqual(["C:\\recorded\\repo\\src"]);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test("untrusted actions get their own summaries instead of inherited properties", () => {
   const root = mkdtempSync(join(tmpdir(), "auto-mode-action-names-"));
   try {
@@ -550,6 +583,9 @@ test("untrusted actions get their own summaries instead of inherited properties"
       expect(report.actions[action].requests).toBe(1);
       expect(report.actions[action].predicate).toEqual({ allow: 1 });
     }
+    expect(report.rebuild.operationTool.constructor).toBe(1);
+    expect(report.rebuild.operationTool.__proto__).toBe(1);
+    expect(Object.keys(report.rebuild.operationTool).sort()).toEqual(["__proto__", "constructor"]);
     const result = run(["--input", input, "--model", "fixture/judge", "--live", "--limit", "2",
       "--opencode-bin", fakeCli(root), "--json"], { FAKE_BODY: join(root, "body.json") });
     expect(result.status).toBe(0);
@@ -559,6 +595,38 @@ test("untrusted actions get their own summaries instead of inherited properties"
       expect(liveReport.live.actions[action].requests).toBe(1);
       expect(liveReport.live.actions[action].statuses).toEqual({ allow: 1 });
     }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("completed tool calls release their capture so a reused identity is a fresh call", () => {
+  const root = mkdtempSync(join(tmpdir(), "auto-mode-tool-release-"));
+  try {
+    const messageID = "msg_reused", callID = "call_reused";
+    const row = (type: string, ts: string, extra: Record<string, unknown>) => ({
+      ts, type, payload: { sessionID: "ses_fixture", messageID, id: callID, tool: "read", ...extra },
+    });
+    const rows = [
+      row("tool.execute.before", "2026-01-01T00:00:01.000Z", { input: { path: "/tmp/fixture-project/first.ts" } }),
+      permission("review-first", "read", ["/tmp/fixture-project/first.ts"], undefined, { type: "tool", messageID, id: callID }),
+      decisionStart("review-first"),
+      decisionBefore("review-first", { action: "read", resources: ["/tmp/fixture-project/first.ts"], userMessages: ["read first"] }, "predicate", callID),
+      decisionAfter("review-first", PREDICATE_HIGH.answers, callID),
+      stageEnd("review-first", "allow"),
+      row("tool.execute.after", "2026-01-01T00:00:02.000Z", { status: "completed", result: { content: "first" } }),
+      row("tool.execute.before", "2026-01-01T00:00:03.000Z", { input: { path: "/tmp/fixture-project/second.ts" } }),
+      permission("review-second", "read", ["/tmp/fixture-project/second.ts"], undefined, { type: "tool", messageID, id: callID }),
+      decisionStart("review-second"),
+      decisionBefore("review-second", { action: "read", resources: ["/tmp/fixture-project/second.ts"], userMessages: ["read second"] }, "predicate", callID),
+      decisionAfter("review-second", PREDICATE_HIGH.answers, callID),
+      stageEnd("review-second", "allow"),
+    ];
+    const input = writeRows(root, rows);
+    const result = run(["--input", input, "--model", "fixture/judge", "--json"]);
+    expect(result.status).toBe(0);
+    const report = JSON.parse(result.stdout);
+    expect(report.evidence.operationIncomplete).toBe(0);
+    expect(report.rebuild.operationArguments).toBe(2);
+    expect(report.eligibility.eligible).toBe(2);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
