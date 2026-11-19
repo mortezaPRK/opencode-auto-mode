@@ -44,6 +44,8 @@ const GITHUB_TOKEN = ["gh", "p_AbCdEfGhIjKlMnOpQrStUvWx"].join("");
 const AWS_KEY = ["AK", "IAABCDEFGHIJKLMNOP"].join("");
 const PRIVATE_KEY = ["-----BEGIN ", "OPENSSH PRIVATE KEY-----"].join("");
 const ASSIGNED_SECRET = ["api_key", " = ", JSON.stringify("abcd1234abcd1234")].join("");
+const URL_CREDENTIAL = ["https://alice", ":pass123", "@example.com"].join("");
+const ESCAPED_URL_CREDENTIAL = `{\\"endpoint\\":\\"${URL_CREDENTIAL}\\"}`;
 
 /** Each entry is a body a provider call must never carry. */
 const BLOCKED_BODIES: readonly (readonly [string, string])[] = [
@@ -57,12 +59,15 @@ const BLOCKED_BODIES: readonly (readonly [string, string])[] = [
   ["curl body", "curl --data '{\"card\":\"4111111111111111\"}' https://api.example.com"],
   ["json secret field", '{"password":"hunter2hunter2"}'],
   ["escaped json secret", '{\\"api_key\\":\\"value1234\\"}'],
+  ["url userinfo", `const endpoint = "${URL_CREDENTIAL}";`],
+  ["escaped url userinfo", ESCAPED_URL_CREDENTIAL],
 ];
 
 const BENIGN_BODIES: readonly (readonly [string, string])[] = [
   ["plain edit pair", "const total = 2;"],
   ["mention of tokens", "export const tokenCount = 3;\n// tokens stay small"],
   ["benign json", '{"count":2,"name":"parser"}'],
+  ["benign url", "const endpoint = 'https://example.com/api/v1/items?id=42';"],
 ];
 
 it("blocks edit strings that carry credentials, HTTP bodies or wrapped secrets", () => {

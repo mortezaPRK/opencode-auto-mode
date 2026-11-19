@@ -1,7 +1,7 @@
 import { lstatSync, readFileSync, realpathSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
 import type { Generate } from "@opencode/schema/generate";
-import { redactHttpBodies } from "./audit.js";
+import { redactCredentialSyntax, redactHttpBodies } from "./audit.js";
 import {
   capturedEditArgs,
   isUsableEditPath,
@@ -314,8 +314,11 @@ function jsonLeak(value: string): boolean {
   return nestedJsonLeak(value, 0, { nodes: 0 });
 }
 
+/** Any redaction loss, literal credential syntax or obvious secret blocks
+ * egress; nothing is redacted and sent. */
 function textSafe(value: string): boolean {
-  return redactHttpBodies(value) === value && !textLeak(value) && !jsonLeak(value);
+  return redactHttpBodies(value) === value && redactCredentialSyntax(value) === value &&
+    !textLeak(value) && !jsonLeak(value);
 }
 
 /** Any redaction loss or obvious secret blocks egress; nothing is redacted and sent. */
