@@ -257,7 +257,12 @@ describe("external_directory correlation", () => {
     assert.equal(evidence.access, "write");
     assert.deepEqual(evidence.arguments, { filePath: "/outside/secret.txt" });
     assert.deepEqual(evidence.targets, ["/outside/secret.txt", "/outside"]);
-    assert.equal(evidence.complete, true);
+    // The omitted write payload keeps the evidence incomplete without dropping
+    // its verified targets, so the loss stays non-terminal.
+    assert.equal(evidence.complete, false);
+    assert.equal(isOpaqueOperationLoss({
+      action: "external_directory", resources: ["/outside/*"], operation: evidence,
+    }), false);
     assert.equal(store.get({ type: "tool", messageID: "message", id: "other" }, "session"), undefined);
     assert.equal(store.get({ type: "tool", messageID: "message", id: "call" }, "other-session"), undefined);
   });

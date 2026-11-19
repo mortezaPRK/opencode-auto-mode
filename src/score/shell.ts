@@ -1,12 +1,12 @@
 import { isAbsolute } from "node:path";
 import { resolvePhysicalDirectory } from "../path-policy.js";
 import type { OperationEvidence, PermissionRequest, ReviewResult } from "../reviewer.js";
-import { guardShell, parseShellCommands, visibleShellDeny } from "../shell.js";
+import { guardShell, parseShellCommands, visibleShellDeny, type ParsedShellCommands } from "../shell.js";
 import { scanShell, type ShellScan } from "./shell-argv.js";
 import { scoreShellBaseline } from "./shell-baseline.js";
 import { shellSafetyScore } from "./shell-safety.js";
 import { ask, deny, high, type RequestScore } from "./types.js";
-import { supportsPosixReview } from "../shell-policy.js";
+import { normalizeContinuations, supportsPosixReview } from "../shell-policy.js";
 
 const EXECUTION_DIRECTORY_KEYS = ["workdir", "cwd", "directory"] as const;
 const INVALID_DIRECTORY = /^(?:undefined|null)$/i;
@@ -59,36 +59,84 @@ function commandValues(operation: OperationEvidence | undefined): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
 }
 
-function segmentKeys(value: string): Set<string> | undefined {
+type ShellSegment = ParsedShellCommands["segments"][number];
+
+function segmentKey(segment: ShellSegment): string {
+  return JSON.stringify([segment.words, segment.write, segment.globs, segment.homes]);
+}
+
+/** Redirects and expansion flags are identity-bearing, not decorative. */
+function segmentEffects(segment: ShellSegment): boolean {
+  return segment.write || segment.globs.some(Boolean) || segment.homes.some(Boolean);
+}
+
+interface CommandShape {
+  keys: Set<string>;
+  effects: boolean;
+}
+
+function commandShape(value: string): CommandShape | undefined {
   const parsed = parseShellCommands(value);
   if (parsed === undefined || !parsed.complete || parsed.segments.length === 0) return undefined;
-  return new Set(parsed.segments.map((segment) => JSON.stringify(segment.words)));
+  return {
+    keys: new Set(parsed.segments.map(segmentKey)),
+    effects: parsed.redirects.length > 0 || parsed.segments.some(segmentEffects),
+  };
+}
+
+function commandShapes(values: readonly string[]): CommandShape[] | undefined {
+  const shapes: CommandShape[] = [];
+  for (const value of values) {
+    const shape = commandShape(value);
+    if (shape === undefined) return undefined;
+    shapes.push(shape);
+  }
+  return shapes;
 }
 
 function sameSegments(left: ReadonlySet<string>, right: ReadonlySet<string>): boolean {
   return left.size === right.size && [...left].every((key) => right.has(key));
 }
 
+/** The only escape from the effect gate: the same text after continuation
+ * normalization, so the scored resources still describe the captured command. */
+function exactCommandMatch(command: string, resources: readonly string[]): boolean {
+  return resources.length === 1 && normalizeContinuations(command).trim() === normalizeContinuations(resources[0]!).trim();
+}
+
+/** A redirect or write/expansion flag makes the segment identity wider than its
+ * argv, so only the exact text may reach the resource-only safety checks. */
+function commandConflict(captured: CommandShape, scored: readonly CommandShape[], command: string,
+  resources: readonly string[]): boolean {
+  if (captured.effects || scored.some((shape) => shape.effects))
+    return !exactCommandMatch(command, resources);
+  const keys = new Set(scored.flatMap((shape) => [...shape.keys]));
+  return !sameSegments(captured.keys, keys);
+}
+
+function capturedCommand(operation: OperationEvidence): string | undefined {
+  const commands = commandValues(operation);
+  if (commands.length !== 1) return undefined;
+  const [command] = commands;
+  return command !== undefined && command.trim().length > 0 ? command : undefined;
+}
+
 /** The captured command must name exactly the commands the permission resources
  * describe; missing or conflicting command evidence cannot clear statically. */
 function commandEvidenceConflicts(operation: OperationEvidence | undefined, resources: readonly string[]): boolean {
   if (operation === undefined) return false;
+  // Lost captured evidence cannot clear even when its retained prefix parses:
+  // a destructive suffix may have been dropped at the capture bound.
+  if (operation.complete === false) return true;
   // No captured arguments at all means this request never carried a conflicting
-  // command claim; incompleteness still marks captured evidence as lost.
-  if (operation.arguments === undefined) return operation.complete === false;
-  const commands = commandValues(operation);
-  if (commands.length !== 1) return true;
-  const [command] = commands;
-  if (command === undefined || command.trim().length === 0) return true;
-  const captured = segmentKeys(command);
+  // command claim.
+  if (operation.arguments === undefined) return false;
+  const command = capturedCommand(operation);
+  if (command === undefined) return true;
+  const captured = commandShape(command);
   if (captured === undefined) return true;
-  const scored = new Set<string>();
-  for (const resource of resources) {
-    const keys = segmentKeys(resource);
-    if (keys === undefined) return true;
-    for (const key of keys) scored.add(key);
-  }
-  return !sameSegments(captured, scored);
+  const scored = commandShapes(resources);
+  return scored === undefined || commandConflict(captured, scored, command, resources);
 }
 
 /** Preserve visible denies; parser uncertainty must reach configured reviewers. */

@@ -251,6 +251,69 @@ it("does not clear a file action when the captured target leaves the permission 
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+it("does not clear a file action when its captured call cannot be correlated", () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "auto-mode-file-capture-")));
+  try {
+    mkdirSync(join(root, ".git"));
+    writeFileSync(join(root, "safe.txt"), "");
+    const edits = parseOptions({ classifiers: [{ type: "static", allowInProjectEdits: true }] });
+    const store = createToolInputStore();
+    const capture = (id: string, tool: string, input: Record<string, unknown>) => {
+      store.capture({ sessionID: "s", messageID: "m", id, tool, input });
+      return store.get({ type: "tool", messageID: "m", id }, "s");
+    };
+    const incompatible = buildOperationEvidence({ action: "edit", resources: ["safe.txt"] },
+      { projectDir: root, capture: capture("incompatible", "shell", { command: "cat safe.txt" }) });
+    assert.equal(incompatible.correlated, false);
+    const rejected = scoreRequest({ action: "edit", resources: ["safe.txt"], projectDir: root, operation: incompatible }, edits);
+    assert.equal(rejected.band, "high");
+    assert.equal(rejected.deny, undefined);
+    capture("duplicate", "write", { filePath: "safe.txt", content: "first" });
+    const duplicate = buildOperationEvidence({ action: "write", resources: ["safe.txt"] },
+      { projectDir: root, capture: capture("duplicate", "write", { filePath: "safe.txt", content: "second" }) });
+    assert.equal(duplicate.correlated, false);
+    const blocked = scoreRequest({ action: "write", resources: ["safe.txt"], projectDir: root, operation: duplicate }, edits);
+    assert.equal(blocked.band, "high");
+    assert.equal(blocked.deny, undefined);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+it("requires review for redirect-bearing or flag-sensitive captured commands", () => {
+  const request = { action: "shell" as const, resources: ["pwd"], projectDir: "/repo" };
+  for (const command of ["pwd > /repo/.env", "pwd >> out.txt", "pwd < in.txt"]) {
+    const result = scoreRequest({
+      ...request,
+      operation: { tool: "shell", access: "execute", complete: true, arguments: { command } },
+    }, options);
+    assert.equal(result.band, "high", command);
+    assert.equal(result.deny, undefined, command);
+  }
+  // A quoted glob is a literal word, not the resource's expansion.
+  const expansion = scoreRequest({
+    action: "shell", resources: ["ls *"], projectDir: "/repo",
+    operation: { tool: "shell", access: "execute", complete: true, arguments: { command: "ls '*'" } },
+  }, options);
+  assert.equal(expansion.band, "high");
+  // An exact redirect-bearing match still reaches the normal safety checks.
+  const exact = scoreRequest({
+    action: "shell", resources: ["cat < file\npwd"], projectDir: "/repo",
+    operation: { tool: "shell", access: "execute", complete: true, arguments: { command: "cat < file\npwd" } },
+  }, options);
+  assert.equal(exact.band, "low");
+});
+
+it("treats incomplete captured shell evidence as a conflict even when its prefix reconciles", () => {
+  const store = createToolInputStore();
+  store.capture({ sessionID: "s", messageID: "m", id: "c", tool: "shell",
+    input: { command: `pwd${" ".repeat(2048)}rm -rf /outside` } });
+  const operation = buildOperationEvidence({ action: "shell", resources: ["pwd"] },
+    { projectDir: "/repo", capture: store.get({ type: "tool", messageID: "m", id: "c" }, "s") });
+  assert.equal(operation.complete, false);
+  assert.equal(typeof operation.arguments?.command, "string");
+  const result = scoreRequest({ action: "shell", resources: ["pwd"], projectDir: "/repo", operation }, options);
+  assert.equal(result.band, "high");
+});
+
 it("keeps a verified in-project edit low when only its payload was omitted", () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "auto-mode-file-payload-")));
   try {
@@ -261,6 +324,9 @@ it("keeps a verified in-project edit low when only its payload was omitted", () 
     const operation = buildOperationEvidence({ action: "edit", resources: ["safe.txt"] },
       { projectDir: root, capture: store.get({ type: "tool", messageID: "m", id: "c" }, "s") });
     assert.equal(operation.complete, false);
+    // Payload omission is distinct from capture correlation and keeps the
+    // verified in-project target eligible for a low score.
+    assert.equal(operation.correlated, true);
     assert.equal(operation.arguments?.content, undefined);
     const edits = parseOptions({ classifiers: [{ type: "static", allowInProjectEdits: true }] });
     assert.equal(scoreRequest({ action: "edit", resources: ["safe.txt"], projectDir: root, operation }, edits).band, "low");

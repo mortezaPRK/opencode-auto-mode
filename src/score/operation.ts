@@ -65,11 +65,14 @@ function verifiedTarget(target: string, write: boolean, projectDir?: string, wor
   return isScopedPath(target, projectDir, worktreeRoot ?? projectRoot(projectDir));
 }
 
-/** A low file score needs every captured target to name a permission resource
- * that stays verified in scope; omitted payloads add no target, so they alone
- * do not block. Conflicting or external targets must not clear statically. */
+/** A low file score needs a correlated capture (when one was supplied) whose
+ * every captured target names a permission resource that stays verified in
+ * scope. An omitted payload adds no target and keeps correlation valid, while a
+ * mismatched, duplicate or dropped capture cannot clear statically. */
 export function operationScopeApproval(operation: OperationEvidence | undefined, action: string,
   resources: readonly string[], projectDir?: string, worktreeRoot?: string): RequestScore | undefined {
+  if (operation?.correlated === false)
+    return high("Captured operation evidence does not match the permission request");
   const targets = operationTargets(operation, action);
   if (targets.length === 0) return undefined;
   const write = WRITE_ACTIONS.has(action);

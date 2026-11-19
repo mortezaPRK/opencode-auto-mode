@@ -1394,7 +1394,10 @@ it("correlates external_directory with the exact execute.before input and keeps 
     assert.deepEqual(evidence.resources, ["/outside/*"]);
     assert.equal(evidence.operation.tool, "write");
     assert.equal(evidence.operation.access, "write");
-    assert.equal(evidence.operation.complete, true);
+    // The write payload was intentionally omitted from capture, so the evidence
+    // is incomplete while its verified targets still reach the reviewer.
+    assert.equal(evidence.operation.complete, false);
+    assert.match(host.prompts[0], /Operation evidence is incomplete/);
     assert.deepEqual(evidence.operation.targets, ["/outside/secret.txt", "/outside"]);
     assert.deepEqual(evidence.operation.arguments, { filePath: "/outside/secret.txt" });
     assert.doesNotMatch(host.prompts[0], /LIVE_CONTENT/);

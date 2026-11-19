@@ -441,6 +441,15 @@ function capturedArguments(action: string, capture: CapturedToolInput | undefine
   return capture !== undefined && toolMatchesAction(action, capture.tool) ? capture.arguments : undefined;
 }
 
+/** A supplied capture clears correlation only when it matched this action and
+ * retained its selected target arguments; the payload-omission marker stays a
+ * separate `complete` concern, so an omitted edit payload does not fail here. */
+function knownCorrelation(action: string, capture: CapturedToolInput | undefined,
+  argumentsComplete: readonly boolean[]): boolean | undefined {
+  if (capture === undefined) return undefined;
+  return allComplete([toolMatchesAction(action, capture.tool), capture.complete, ...argumentsComplete]);
+}
+
 function knownEvidence(event: OperationEvent, metadata: Record<string, unknown> | undefined, metadataInvalid: boolean,
   options: OperationEvidenceOptions): OperationEvidence {
   const selected = selectArguments(event.action, metadata);
@@ -451,7 +460,9 @@ function knownEvidence(event: OperationEvent, metadata: Record<string, unknown> 
   const targets = operationTargets(event.action, event.resources, merged.arguments, options.projectDir);
   const checks = [!metadataInvalid, selected.complete, tool.complete, targets.complete, merged.complete, !PAYLOAD_TOOLS.has(event.action)];
   if (capture !== undefined) checks.push(compatible, capture.complete);
-  return composeOperation(tool.tool, TOOL_ACCESS[event.action] ?? "unknown", targets.targets, merged.arguments, allComplete(checks));
+  const evidence = composeOperation(tool.tool, TOOL_ACCESS[event.action] ?? "unknown", targets.targets, merged.arguments, allComplete(checks));
+  const correlated = knownCorrelation(event.action, capture, [selected.complete, merged.complete]);
+  return correlated === undefined ? evidence : { ...evidence, correlated };
 }
 
 function unknownCompleteness(input: unknown, metadataInvalid: boolean, nested: SelectedArguments, merged: SelectedArguments,
@@ -519,8 +530,11 @@ function externalEvidence(event: OperationEvent, metadata: Record<string, unknow
     !externalScopeContained(event.resources, metadata, merged.arguments, options.projectDir);
   const targets = externalTargets(capture, conflict, metadata, merged.arguments, options.projectDir);
   const shellWithoutExact = (tool.tool === "shell" || tool.tool === "bash") && !hasExactTargets(metadata, merged.arguments);
+  // A correlated payload tool never captured its content, so the evidence is
+  // incomplete even though the verified destination targets are retained.
+  const payloadOmitted = capture !== undefined && PAYLOAD_TOOLS.has(capture.tool);
   const checks = [!metadataInvalid, capture !== undefined, capture?.complete === true, nested.complete,
-    tool.complete, targets.complete, targets.targets !== undefined, merged.complete, !conflict, !shellWithoutExact];
+    tool.complete, targets.complete, targets.targets !== undefined, merged.complete, !conflict, !shellWithoutExact, !payloadOmitted];
   return composeOperation(tool.tool, accessForTool(tool.tool), targets.targets, merged.arguments, allComplete(checks));
 }
 

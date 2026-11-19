@@ -13,6 +13,10 @@ export interface OperationEvidence {
   targets?: readonly string[];
   arguments?: Record<string, unknown>;
   complete: boolean;
+  /** Capture correlation, separate from payload completeness: `false` when a
+   * supplied call capture could not be matched to this action or lost its
+   * target arguments. An intentionally omitted payload keeps it `true`. */
+  correlated?: boolean;
 }
 
 export interface PermissionRequest {
