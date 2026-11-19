@@ -147,7 +147,12 @@ function boundedString(value: string, target: SanitizeState): string {
   const length = Math.min(value.length, MAX_STRING_CHARS);
   if (length < value.length) target.incomplete = true;
   if (!takeCharacters(target, length)) return TRUNCATED;
-  return value.slice(0, length);
+  const bounded = value.slice(0, length);
+  // Every retained string is screened, not just a built-in shell `command`:
+  // unknown/MCP arguments can carry the same inline HTTP body.
+  const redacted = redactHttpBodies(bounded);
+  if (redacted !== bounded) target.incomplete = true;
+  return redacted;
 }
 
 function sanitizeArray(value: readonly unknown[], depth: number, target: SanitizeState): unknown[] {
@@ -155,11 +160,24 @@ function sanitizeArray(value: readonly unknown[], depth: number, target: Sanitiz
   return value.slice(0, MAX_ARRAY_ITEMS).map((item) => sanitizeValue(item, depth + 1, target));
 }
 
+/** Enumerates keys without reading values, so oversized inputs cannot charge
+ * synchronous work for properties that the key bound discards. */
+function boundedKeys(value: object, target: SanitizeState): string[] {
+  const keys: string[] = [];
+  for (const key in value) {
+    if (!Object.hasOwn(value, key)) continue;
+    if (keys.length === MAX_ARGUMENT_KEYS) {
+      target.incomplete = true;
+      break;
+    }
+    keys.push(key);
+  }
+  return keys;
+}
+
 function sanitizeObject(value: object, depth: number, target: SanitizeState): Record<string, unknown> {
-  const entries = Object.entries(value);
-  if (entries.length > MAX_ARGUMENT_KEYS) target.incomplete = true;
   const result: Record<string, unknown> = {};
-  for (const [key, item] of entries.slice(0, MAX_ARGUMENT_KEYS)) {
+  for (const key of boundedKeys(value, target)) {
     if (["__proto__", "constructor", "prototype"].includes(key)) {
       target.incomplete = true;
       continue;
@@ -173,7 +191,7 @@ function sanitizeObject(value: object, depth: number, target: SanitizeState): Re
       result[key] = REDACTED;
       continue;
     }
-    result[key] = sanitizeValue(item, depth + 1, target);
+    result[key] = sanitizeValue((value as Record<string, unknown>)[key], depth + 1, target);
   }
   return result;
 }
@@ -221,13 +239,6 @@ function sanitizeArguments(input: unknown): SelectedArguments {
   }
 }
 
-function selectedField(field: string, value: unknown, target: SanitizeState): unknown {
-  if (field !== "command" || typeof value !== "string") return sanitizeValue(value, 0, target);
-  const redacted = redactHttpBodies(value);
-  if (redacted !== value) target.incomplete = true;
-  return boundedString(redacted, target);
-}
-
 function selectArguments(tool: string, input: unknown): SelectedArguments {
   const fields = SELECTED_ARGUMENTS[tool];
   if (fields === undefined) return input === undefined ? { arguments: {}, complete: true } : sanitizeArguments(input);
@@ -238,7 +249,7 @@ function selectArguments(tool: string, input: unknown): SelectedArguments {
   try {
     for (const field of fields) {
       if (!Object.hasOwn(input, field) || input[field] === undefined) continue;
-      result[field] = selectedField(field, input[field], target);
+      result[field] = sanitizeValue(input[field], 0, target);
     }
     return { arguments: result, complete: !target.incomplete };
   } catch {

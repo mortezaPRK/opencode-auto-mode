@@ -88,3 +88,55 @@ it("leaves ordinary operation paths and existing action scoring unchanged", () =
   }, options);
   assert.equal(protectedShell.deny, true);
 });
+
+it("honors grep and glob path-over-root precedence without weakening unknown tools", () => {
+  for (const action of ["grep", "glob"] as const) {
+    const result = scoreRequest({
+      action, resources: ["needle"], projectDir: "/repo",
+      operation: { tool: action, access: "read", complete: true, targets: ["/repo/src"],
+        arguments: { pattern: "needle", path: "src", root: ".env" } },
+    }, options);
+    assert.notEqual(result.deny, true, action);
+    assert.equal(result.band, "high", action);
+  }
+  const rootOnly = scoreRequest({
+    action: "grep", resources: ["needle"], projectDir: "/repo",
+    operation: { tool: "grep", access: "read", complete: true, targets: ["/repo/.env"],
+      arguments: { pattern: "needle", root: ".env" } },
+  }, options);
+  assert.equal(rootOnly.deny, true);
+  const mcp = scoreRequest({
+    action: "mcp__search", resources: ["*"], projectDir: "/repo",
+    operation: { tool: "mcp__search", access: "unknown", complete: true, arguments: { path: "src", root: ".env" } },
+  }, options);
+  assert.equal(mcp.deny, true);
+});
+
+it("resolves shell operands against the verified working directory and fails closed on unknown scope", () => {
+  for (const command of ["cat shadow", "cat < shadow"]) {
+    const result = scoreRequest({
+      action: "shell", resources: [command], projectDir: "/repo",
+      operation: { tool: "shell", access: "execute", complete: true, targets: ["/etc"],
+        arguments: { command, workdir: "/etc" } },
+    }, options);
+    assert.equal(result.deny, true, command);
+    assert.match(result.reason, /protected path access/i, command);
+  }
+  for (const command of ["cat passwd", "cat < passwd"]) {
+    const result = scoreRequest({
+      action: "shell", resources: [command], projectDir: "/repo",
+      operation: { tool: "shell", access: "execute", complete: true, targets: ["/etc"],
+        arguments: { command, workdir: "/etc" } },
+    }, options);
+    assert.equal(result.deny, undefined, command);
+    assert.equal(result.band, "high", command);
+  }
+  for (const operationArguments of [{ workdir: "/etc", cwd: "/tmp" }, { workdir: "~/outside" }, { workdir: "relative" }]) {
+    const result = scoreRequest({
+      action: "shell", resources: ["pwd"], projectDir: operationArguments.workdir === "relative" ? undefined : "/repo",
+      operation: { tool: "shell", access: "execute", complete: true, arguments: { command: "pwd", ...operationArguments } },
+    }, options);
+    assert.equal(result.band, "high", JSON.stringify(operationArguments));
+    assert.equal(result.deny, undefined, JSON.stringify(operationArguments));
+  }
+});

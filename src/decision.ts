@@ -1,7 +1,7 @@
 import { Model } from "@opencode/schema/model";
 import type { Generate } from "@opencode/schema/generate";
 import { errorKindOf, EvidenceFailure, terminalEvidence, ReviewFailure } from "./errors.js";
-import { AUTHORITY_RULES, reviewEvidence, type PermissionRequest, type ReviewErrorObserver, type StageResult } from "./reviewer.js";
+import { AUTHORITY_RULES, reviewEvidence, terminalEvidenceReason, type PermissionRequest, type ReviewErrorObserver, type StageResult } from "./reviewer.js";
 import { withTimeout } from "./timeout.js";
 
 export interface DecisionOptions { model: string; timeoutMs?: number; minConfidence?: number }
@@ -106,8 +106,13 @@ export async function decisionStage(ctx: DecisionContext, options: DecisionOptio
   try {
     if (signal?.aborted) throw new ReviewFailure("cancelled", "Decision cancelled");
     const { timeoutMs, minConfidence } = limits(options);
+    // Opaque scope and HTTP-body loss stay terminal for every stage. Ordinary
+    // operation incompleteness (for example an omitted edit payload) does not:
+    // this stage abstains non-terminally so a configured fallback still reviews.
+    if (terminalEvidenceReason(request) !== undefined) throw new EvidenceFailure("Incomplete decision evidence");
     const evidence = reviewEvidence(request);
-    if (evidence.incompleteEvidence) throw new EvidenceFailure("Incomplete decision evidence");
+    if (evidence.incompleteEvidence !== undefined)
+      return { decision: "abstain", stage: "decision", reason: "Operation evidence is incomplete; deferring to later classifiers" };
     const input = decisionInput(options, evidence);
     bounded = boundedSignal(signal, timeoutMs);
     const response = await withTimeout(ctx.experimental.generate.decisions(input, { signal: bounded }), timeoutMs, signal);

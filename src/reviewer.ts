@@ -131,8 +131,10 @@ export interface ReviewerContext {
 /** Opt-in local debugging only: receives the original exception, never a serialized result field. */
 export type ReviewErrorObserver = (error: unknown) => void;
 
-/** Shared terminal evidence check used by both the LLM fallback and reviewEvidence. */
-function terminalEvidenceReason(request: PermissionRequest): string | undefined {
+/** Shared terminal evidence classification for both model paths. Ordinary
+ * operation incompleteness is intentionally absent: each model stage may still
+ * review retained evidence or abstain non-terminally. */
+export function terminalEvidenceReason(request: PermissionRequest): string | undefined {
   if (request.resources.some((resource) => redactHttpBodies(resource) !== resource))
     return "Inline HTTP body or ambiguous serialized evidence requires human review";
   if (isOpaqueOperationLoss(request))

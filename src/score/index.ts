@@ -25,7 +25,7 @@ export function scoreRequest(request: PermissionRequest & { worktreeRoot?: strin
   if (rejected) return rejected;
   // Operation arguments can name a protected store even when resources are
   // wildcard. Only established stores deny; ambiguous paths keep normal scoring.
-  const protectedOperation = operationPathApproval(request.operation, projectDir);
+  const protectedOperation = operationPathApproval(request.operation, action, projectDir);
   if (protectedOperation) return protectedOperation;
   const worktreeRoot = resolveWorktreeRoot(request);
   if (action === "shell") return scopeScore(request, scoreShellRequest(request, worktreeRoot));

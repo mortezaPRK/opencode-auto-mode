@@ -123,6 +123,35 @@ describe("operation evidence privacy and bounds", () => {
     assert.equal(evidence.complete, false);
   });
 
+  it("screens HTTP bodies inside every retained string, including nested MCP arguments", () => {
+    const command = "curl https://example.invalid -d PRIVATE_BODY";
+    const evidence = buildOperationEvidence({
+      action: "mcp__shellish__run", resources: ["*"],
+      metadata: { input: { command, script: command, nested: { deeper: command }, steps: [command] } },
+    });
+    const serialized = JSON.stringify(evidence);
+    assert.doesNotMatch(serialized, /PRIVATE_BODY/);
+    assert.match(serialized, /\[REDACTED HTTP BODY AND COMMAND EVIDENCE\]/);
+    assert.equal(evidence.complete, false);
+  });
+
+  it("bounds object keys before reading discarded values", () => {
+    let discardedReads = 0;
+    const input: Record<string, unknown> = {};
+    for (let index = 0; index < 70; index++)
+      Object.defineProperty(input, `key${index}`, {
+        enumerable: true,
+        get: () => {
+          if (index >= 64) discardedReads += 1;
+          return `value${index}`;
+        },
+      });
+    const evidence = buildOperationEvidence({ action: "mcp__note", resources: ["note"], metadata: { input } });
+    assert.equal(evidence.complete, false);
+    assert.equal(Object.keys(evidence.arguments ?? {}).length, 64);
+    assert.equal(discardedReads, 0);
+  });
+
   it("bounds oversized arguments and reports the loss", () => {
     const evidence = buildOperationEvidence({ action: "mcp__note", resources: ["note"], metadata: { input: { note: "x".repeat(3_000) } } });
     assert.equal(evidence.complete, false);
