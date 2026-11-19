@@ -19,6 +19,8 @@ export interface AutoModeOptions {
 
 export const DEFAULT_REVIEW_TIMEOUT_MS = 15_000;
 export const MAX_REVIEW_TIMEOUT_MS = 120_000;
+export const MIN_FACT_REVIEW_CONFIDENCE = 0.8;
+export const DEFAULT_FACT_REVIEW_CONFIDENCE = 0.9;
 /** Audited JSONL rotation limit; the debug event sink uses the same 10 MiB cap. */
 export const DEFAULT_AUDIT_MAX_BYTES = 10_485_760;
 const DEFAULT_BREAKER: BreakerOptions = { consecutiveDenies: 3, windowDenies: 10, windowSize: 50 };
