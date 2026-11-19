@@ -160,6 +160,24 @@ describe("operation evidence privacy and bounds", () => {
     assert.equal(evidence.complete, false);
   });
 
+  it("redacts camelCase and PascalCase credential field names as word sequences", () => {
+    const secrets = ["SECRET_ACCESS_VALUE", "SESSION_TOKEN_VALUE", "CLIENT_SECRET_VALUE", "PASCAL_SECRET_VALUE",
+      "PRIVATE_KEY_VALUE", "API_KEY_VALUE", "NESTED_SECRET_ACCESS_VALUE"];
+    const evidence = buildOperationEvidence({
+      action: "mcp__opaque", resources: ["*"], metadata: { input: {
+        secretAccessKey: secrets[0], sessionToken: secrets[1], clientSecret: secrets[2],
+        ClientSecret: secrets[3], privateKey: secrets[4], apiKey: secrets[5],
+        nested: { secretAccessKey: secrets[6] },
+      } },
+    });
+    const serialized = JSON.stringify(evidence);
+    assert.doesNotMatch(serialized, /SECRET_ACCESS_VALUE|SESSION_TOKEN_VALUE|CLIENT_SECRET_VALUE|PASCAL_SECRET_VALUE|PRIVATE_KEY_VALUE|API_KEY_VALUE/);
+    for (const key of ["secretAccessKey", "sessionToken", "clientSecret", "ClientSecret", "privateKey", "apiKey"])
+      assert.equal(evidence.arguments?.[key], "[REDACTED]", key);
+    assert.equal((evidence.arguments?.nested as Record<string, unknown>).secretAccessKey, "[REDACTED]");
+    assert.equal(evidence.complete, false);
+  });
+
   it("bounds object keys before reading discarded values", () => {
     let discardedReads = 0;
     const input: Record<string, unknown> = {};
@@ -177,10 +195,33 @@ describe("operation evidence privacy and bounds", () => {
     assert.equal(discardedReads, 0);
   });
 
-  it("bounds oversized arguments and reports the loss", () => {
+  it("replaces oversized argument strings with a loss marker instead of slicing them", () => {
     const evidence = buildOperationEvidence({ action: "mcp__note", resources: ["note"], metadata: { input: { note: "x".repeat(3_000) } } });
     assert.equal(evidence.complete, false);
-    assert.equal((evidence.arguments?.note as string).length, 2_048);
+    assert.equal(evidence.arguments?.note, "[TRUNCATED]");
+  });
+
+  it("omits a URL whose credential spans the string cutoff", () => {
+    const filler = "p".repeat(3_000);
+    const evidence = buildOperationEvidence({
+      action: "mcp__fetch", resources: ["https://example.invalid"],
+      metadata: { input: { url: `https://user:${filler}@example.invalid/` } },
+    });
+    assert.equal(evidence.complete, false);
+    assert.equal(evidence.arguments?.url, "[TRUNCATED]");
+    assert.doesNotMatch(JSON.stringify(evidence), /user:|pppp/);
+  });
+
+  it("omits an over-limit target instead of slicing it into a protected .env prefix", () => {
+    const projectDir = "/repo";
+    const target = `${projectDir}/${"a".repeat(2037)}/.env.example`;
+    const evidence = buildOperationEvidence({ action: "read", resources: [target] }, { projectDir });
+    assert.equal(evidence.complete, false);
+    assert.equal(Object.hasOwn(evidence, "targets"), false);
+    assert.doesNotMatch(JSON.stringify(evidence), /\.env/);
+    const score = scoreRequest({ action: "read", resources: [target], projectDir, operation: evidence },
+      parseOptions({ classifiers: [{ type: "static" }] }));
+    assert.equal(score.deny, undefined);
   });
 
   it("marks circular, prototype, non-finite and over-deep arguments incomplete", () => {

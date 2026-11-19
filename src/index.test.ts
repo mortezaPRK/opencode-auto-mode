@@ -1445,6 +1445,37 @@ it("drops execute.before evidence after execute.after", async () => {
   } finally { await host.cleanup(); }
 });
 
+it("fails closed when a tool-sourced permission lost its captured input", async () => {
+  const host = await setup({ classifiers: [{ type: "static" }] });
+  try {
+    const direct = event("ask", "shell", ["cat shadow"]);
+    await host.evaluate(direct);
+    assert.equal(direct.effect, "allow");
+    await host.execute({ command: "cat shadow", workdir: "/etc" }, "shell");
+    await host.toolAfter({ status: "completed", tool: "shell", sessionID: "primary",
+      messageID: "message-fixture", id: "call-fixture" });
+    const lost = { ...event("ask", "shell", ["cat shadow"]),
+      source: { type: "tool", messageID: "message-fixture", id: "call-fixture" } };
+    await host.evaluate(lost);
+    assert.equal(lost.effect, "ask");
+    assert.equal(host.calls.generate, 0);
+  } finally { await host.cleanup(); }
+});
+
+it("marks a lost tool capture incomplete and uncorrelated for the reviewer", async () => {
+  const host = await setup();
+  try {
+    const lost = { ...event("ask", "shell", ["cat shadow"]),
+      source: { type: "tool", messageID: "message-fixture", id: "evicted-call" } };
+    await host.evaluate(lost);
+    assert.equal(host.calls.generate, 1);
+    const evidence = JSON.parse(host.prompts[0].split("\n")[2]);
+    assert.equal(evidence.operation.complete, false);
+    assert.equal(evidence.operation.correlated, false);
+    assert.match(host.prompts[0], /Operation evidence is incomplete/);
+  } finally { await host.cleanup(); }
+});
+
 it("does not ask the model to approve an opaque incomplete external scope", async () => {
   const host = await setup();
   try {

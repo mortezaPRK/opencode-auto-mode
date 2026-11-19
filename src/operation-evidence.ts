@@ -88,6 +88,9 @@ function usableTarget(value: unknown): value is string {
 }
 
 const SENSITIVE_KEY = /^(?:authorization|proxy[_-]?authorization|auth|cookie|cookies|set[_-]?cookie|header|headers|body|payload|content|contents|data|password|passwd|secret|secrets|token|access[_-]?token|refresh[_-]?token|id[_-]?token|api[_-]?key|apikey|private[_-]?key|client[_-]?secret|credential|credentials|env|environment|session[_-]?key)$/i;
+/** camelCase and PascalCase field names carry the same word boundaries as their
+ * snake_case spellings: `sessionToken` must match the fragment `token`. */
+const WORD_BOUNDARY = /([a-z0-9])([A-Z])/g;
 const SENSITIVE_FRAGMENT = /(?:^|[_-])(?:password|passwd|secret|token|api[_-]?key|private[_-]?key|credential)(?:$|[_-])/i;
 /** Arbitrary MCP payload keys: redact the value and mark the operation incomplete,
  * while common search/query fields remain legitimate literal evidence. */
@@ -135,7 +138,10 @@ interface SelectedArguments {
 const state = (): SanitizeState => ({ nodes: 0, chars: 0, incomplete: false, seen: new WeakSet() });
 
 function sensitiveKey(key: string): boolean {
-  return SENSITIVE_KEY.test(key) || SENSITIVE_FRAGMENT.test(key) || PAYLOAD_KEY.test(key);
+  // Opaque MCP credential fields arrive as `secretAccessKey` or `sessionToken`,
+  // not only as snake_case; normalize before the fragment check.
+  const words = key.replace(WORD_BOUNDARY, "$1_$2");
+  return SENSITIVE_KEY.test(key) || SENSITIVE_FRAGMENT.test(words) || PAYLOAD_KEY.test(key);
 }
 
 function takeCharacters(target: SanitizeState, length: number): boolean {
@@ -154,14 +160,18 @@ function redactRetained(value: string): string {
 }
 
 function boundedString(value: string, target: SanitizeState): string {
-  const length = Math.min(value.length, MAX_STRING_CHARS);
-  if (length < value.length) target.incomplete = true;
-  if (!takeCharacters(target, length)) return TRUNCATED;
-  const bounded = value.slice(0, length);
+  // Screen the whole value: slicing first can strand a credential prefix whose
+  // recognizing syntax (a URL `@host`) sits beyond the cutoff. Oversized values
+  // are replaced whole rather than retaining an unscreened prefix.
+  if (value.length > MAX_STRING_CHARS) {
+    target.incomplete = true;
+    return TRUNCATED;
+  }
+  if (!takeCharacters(target, value.length)) return TRUNCATED;
   // Every retained string is screened, not just a built-in shell `command`:
   // unknown/MCP arguments can carry the same inline HTTP body or credentials.
-  const redacted = redactRetained(bounded);
-  if (redacted !== bounded) target.incomplete = true;
+  const redacted = redactRetained(value);
+  if (redacted !== value) target.incomplete = true;
   return redacted;
 }
 
@@ -323,11 +333,15 @@ function limitTargets(values: readonly string[], transform: (value: string) => R
     if (HOME_PREFIX.test(value)) complete = false;
     const resolved = transform(value);
     if (!resolved.complete) complete = false;
-    if (resolved.target.length > MAX_TARGET_CHARS) complete = false;
     const redacted = redactRetained(resolved.target);
     if (redacted !== resolved.target) complete = false;
-    const target = redacted.slice(0, MAX_TARGET_CHARS);
-    if (!targets.includes(target)) targets.push(target);
+    // A sliced target invents a path prefix: `…/.env.example` cut at `.env`
+    // would become a protected store. Omit the entry and keep the loss explicit.
+    if (redacted.length > MAX_TARGET_CHARS) {
+      complete = false;
+      continue;
+    }
+    if (!targets.includes(redacted)) targets.push(redacted);
   }
   return { targets: targets.length === 0 ? undefined : targets, complete };
 }

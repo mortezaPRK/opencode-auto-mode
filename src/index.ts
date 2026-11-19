@@ -18,6 +18,7 @@ import { createStatusTracker, type StatusTracker } from "./status.js";
 import { withTimeout } from "./timeout.js";
 import { errorKindOf, EvidenceFailure, ReviewFailure } from "./errors.js";
 import { codeModePermission, codeModeReviewResources } from "./code-mode.js";
+import { isRecord } from "./guards.js";
 import { scanResultContent, withInjectionWarning } from "./probe.js";
 import { buildOperationEvidence, createToolInputStore, type ToolInputStore } from "./operation-evidence.js";
 
@@ -847,17 +848,27 @@ function unavailableAuthorization(error: unknown): never {
   throw new EvidenceFailure("User authorization evidence is unavailable", { cause: error });
 }
 
+/** A tool-sourced permission must carry that exact call's capture. The bounded
+ * store can evict it, and without the captured arguments a shell workdir or a
+ * file target silently disappears, making the request look like a direct
+ * permission event. Lost evidence must never clear a low static score. Outer
+ * Code Mode `execute` is intentionally never captured. */
+function lostToolCapture(event: { action: string; source?: unknown }, capture: unknown): boolean {
+  return capture === undefined && event.action !== "execute" &&
+    isRecord(event.source) && event.source.type === "tool";
+}
+
 function reviewRequestFor(
   event: { action: string; resources: readonly string[]; agent?: string; metadata?: Record<string, unknown>; source?: unknown; sessionID: string },
   resources: string[],
   facts: Pick<PermissionRequest, "projectDir" | "worktreeRoot" | "scopeResolution" | "gitState">,
   toolInputs: ReturnType<typeof createToolInputStore>,
 ): PermissionRequest {
+  const capture = toolInputs.get(event.source, event.sessionID);
+  const operation = buildOperationEvidence(event, { projectDir: facts.projectDir, capture });
   return {
     action: event.action, resources, agent: event.agent, ...facts,
-    operation: buildOperationEvidence(event, {
-      projectDir: facts.projectDir, capture: toolInputs.get(event.source, event.sessionID),
-    }),
+    operation: lostToolCapture(event, capture) ? { ...operation, complete: false, correlated: false } : operation,
   };
 }
 
