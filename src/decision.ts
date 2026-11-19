@@ -114,13 +114,17 @@ function limits(options: DecisionOptions): { timeoutMs: number; minConfidence: n
 }
 
 function decisionInput(options: DecisionOptions, evidence: DecisionEvidence): DecisionInput {
-  const input: DecisionInput = {
+  return {
     model: Model.Ref.parse(options.model),
     input: [{ type: "text", text: JSON.stringify(evidence) }],
     questions: decisionQuestions(),
   };
-  if (Buffer.byteLength(JSON.stringify(input)) > MAX_REQUEST_BYTES) throw new EvidenceFailure("Decision request too large");
-  return input;
+}
+
+/** A request over the native bound abstains non-terminally: the fallback prompt
+ * bounds findings and may still fit, so the predicate evidence is never truncated. */
+function requestTooLarge(input: DecisionInput): boolean {
+  return Buffer.byteLength(JSON.stringify(input)) > MAX_REQUEST_BYTES;
 }
 
 function boundedSignal(signal: AbortSignal | undefined, timeoutMs: number): AbortSignal {
@@ -147,6 +151,11 @@ export async function decisionStage(ctx: DecisionContext, options: DecisionOptio
     const early = incomplete(evidence, request);
     if (early) return early;
     const input = decisionInput(options, evidence);
+    if (requestTooLarge(input))
+      return {
+        decision: "abstain", stage: "decision", errorKind: "context",
+        reason: "Decision request exceeds the native size bound; abstained before generation",
+      };
     bounded = boundedSignal(signal, timeoutMs);
     const response = await withTimeout(ctx.experimental.generate.decisions(input, { signal: bounded }), timeoutMs, signal);
     return verdict(response, minConfidence);

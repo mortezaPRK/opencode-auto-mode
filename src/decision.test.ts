@@ -1,7 +1,8 @@
 import { it } from "node:test";
 import assert from "node:assert/strict";
-import { decisionStage, type DecisionContext } from "./decision.js";
+import { decisionStage, buildDecisionEvidence, type DecisionContext } from "./decision.js";
 import { ReviewFailure } from "./errors.js";
+import { MAX_REQUEST_BYTES } from "./guards.js";
 import { DECISION_AUTHORITY_POLICY, DECISION_AUTHORIZATION_INSTRUCTIONS, DECISION_SAFETY_INSTRUCTIONS } from "./decision-evidence.js";
 import { runClassifiers } from "./classifier.js";
 import { reviewRequest, type StageResult } from "./reviewer.js";
@@ -197,6 +198,37 @@ it("asks focused safety and authorization predicates with compact evidence", asy
     });
     assert.equal(final.decision, "allow");
     assert.equal(llmCalls, 1);
+  });
+
+  it("abstains non-terminally when the decision request exceeds its bound and lets fallback decide", async () => {
+    const findings = Array.from({ length: 200 }, (_, index) => `finding-${index}: ${"x".repeat(400)}`);
+    const oversized = { ...request, staticAnalysis: { band: "high", reason: "review", findings } };
+    const evidence = buildDecisionEvidence(oversized);
+    assert.ok(Buffer.byteLength(JSON.stringify(evidence)) > MAX_REQUEST_BYTES);
+    assert.equal(evidence.staticAnalysis?.findings?.length, findings.length);
+    let decisionCalls = 0;
+    let decisionOutcome: StageResult | undefined;
+    const final = await runClassifiers(
+      [{ type: "decision", ...options }, { type: "llm", model: "test-provider/fallback" }],
+      oversized, { band: "high", reason: "review", findings },
+      {
+        decision: (stage, req) => {
+          decisionCalls++;
+          return decisionStage(context(async () => { throw new Error("decision generation must not run"); }), stage, req);
+        },
+        llm: (stage, req) => reviewRequest(
+          { experimental: { generate: { text: async () => ({ text: "ALLOW: fallback reviewed bounded findings" }) } } },
+          req, stage.model, new AbortController().signal, 100,
+        ),
+        onResult: (stage, result) => { if (stage.type === "decision") decisionOutcome = result; },
+      },
+    );
+    assert.equal(decisionCalls, 1);
+    assert.equal(decisionOutcome?.decision, "abstain");
+    assert.equal(decisionOutcome?.errorKind, "context");
+    assert.equal(decisionOutcome?.terminal, undefined);
+    assert.doesNotMatch(decisionOutcome?.reason ?? "", /finding-0/);
+    assert.equal(final.decision, "allow");
   });
 
   it("abstains before generation when delegated HTTP context is redacted and lets fallback decide", async () => {
