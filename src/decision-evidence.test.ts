@@ -18,6 +18,7 @@ const request: DecisionEvidenceRequest = {
   agent: "reviewer-secret", metadata: { body: "PRIVATE_FILE" }, source: "ASSISTANT_PROSE",
   userMessages: ["Use old-name.", "Correction: use new-name."], transcript: "Use old-name.\nCorrection: use new-name.",
   staticAnalysis: { band: "high", reason: "Path role or resolution requires further review", findings: ["ordinary: resolved=/synthetic/outside"] },
+  shell: { platform: "linux", interpreter: "/bin/bash" },
   operation, gitState: { branch: "topic", defaultBranch: "trunk", upstream: "origin/topic", clean: true },
 };
 
@@ -27,6 +28,8 @@ it("keeps the whole action, relevant scope, operation and concrete findings only
     assert.deepEqual(evidence.resources, request.resources);
     assert.equal(evidence.projectDir, "/checkout/packages/app");
     assert.equal(evidence.worktreeRoot, "/checkout");
+    assert.equal(evidence.platform, process.platform);
+    assert.deepEqual(evidence.shell, { platform: "linux", interpreter: "/bin/bash" });
     assert.deepEqual(evidence.userMessages, request.userMessages);
     assert.deepEqual(evidence.operation, operation);
     assert.deepEqual(evidence.staticAnalysis, { findings: request.staticAnalysis?.findings });
@@ -35,6 +38,24 @@ it("keeps the whole action, relevant scope, operation and concrete findings only
     const serialized = JSON.stringify(evidence);
     assert.doesNotMatch(serialized, /reviewer-secret|PRIVATE_FILE|ASSISTANT_PROSE|"metadata"|"source"|"band"|"reason"/);
     assert.doesNotMatch(serialized, /transcript|userInstruction/);
+  });
+
+  it("retains the host platform and bounds the requested shell context", () => {
+    const plain = buildDecisionEvidence({ action: "shell", resources: ["pwd"] });
+    assert.equal(plain.platform, process.platform);
+    assert.equal(plain.shell, undefined);
+    assert.equal(plain.incompleteEvidence, undefined);
+    const oversized = buildDecisionEvidence({
+      action: "shell", resources: ["echo %TOKEN%"],
+      shell: { platform: "win32", interpreter: `C:\\${"d".repeat(600)}\\cmd.exe` },
+    });
+    assert.equal(oversized.platform, process.platform);
+    assert.deepEqual(oversized.shell, { platform: "win32", interpreter: `C:\\${"d".repeat(497)}` });
+    assert.equal(oversized.incompleteEvidenceKind, "shell");
+    assert.match(oversized.incompleteEvidence ?? "", /interpreter/);
+    const malformed = buildDecisionEvidence({ action: "shell", resources: ["pwd"], shell: { interpreter: 1 as unknown as string } });
+    assert.equal(malformed.shell?.interpreter, undefined);
+    assert.equal(malformed.incompleteEvidenceKind, "shell");
   });
 
   it("uses chronological user messages once and falls back to transcript only when empty", () => {

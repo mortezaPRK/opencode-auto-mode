@@ -154,9 +154,10 @@ Classifier stages:
 
 The decision stage receives compact evidence: action and resources, an optional
 selected operation (tool, access, targets and selected arguments) from host
-metadata and the captured tool call when available, one chronological
-user-message source, concrete static-analysis findings, and git state only for
-git-related actions. Raw metadata/source blobs and agent prose are not sent.
+metadata and the captured tool call when available, the host platform and
+requested shell interpreter (bounded), one chronological user-message source,
+concrete static-analysis findings, and git state only for git-related actions.
+Raw metadata/source blobs and agent prose are not sent.
 Operation evidence is marked incomplete when selection, privacy bounds, or
 correlation are lost; shared call identities or skipped outer execute snapshots
 can leave the capture unavailable or ambiguous, and it is not guessed. Network
@@ -213,12 +214,12 @@ still clear it. The plugin does not auto-tune thresholds, rewrite config, or
 treat replay agreement as calibration.
 
 Pre-generation abstention is distinct from model abstention. Ordinary incomplete
-operation evidence, an oversized request, or a Code Mode identity mismatch
-abstains before a model call. Terminal evidence loss is limited to resource-body
-redaction, an external directory without a verified target, or an explicitly
-incomplete operation whose only resources are `*`; these resolve to **ask**.
-Final terminal checks also use the normalized decision evidence, so normalization
-loss cannot be bypassed. A complete unknown MCP operation with sanitized
+operation or truncated shell evidence, an oversized request, or a Code Mode
+identity mismatch abstains before a model call. Terminal evidence loss is limited
+to resource-body redaction, an external directory without a verified target, or
+an explicitly incomplete operation whose only resources are `*`; these resolve to
+**ask**. Final terminal checks also use the normalized decision evidence, so
+normalization loss cannot be bypassed. A complete unknown MCP operation with sanitized
 arguments is not terminal: it remains model-reviewed. Unknown capability is not
 structurally safe; safety probability must account for it. The LLM may infer
 semantics from the exact tool and arguments, but there is no declared

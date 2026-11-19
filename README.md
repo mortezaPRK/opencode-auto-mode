@@ -68,9 +68,9 @@ verified target, or an explicitly incomplete operation whose only resources are
 floor, not a confidence in a chosen label; lower values are more permissive and
 probabilities are not a calibrated certainty guarantee. The decision stage
 receives compact evidence: the action and resources, selected operation details
-when available, and one chronological user-message source. Ordinary incomplete
-operation evidence abstains before generation; terminal evidence loss is scoped
-as above.
+when available, the host platform and requested shell interpreter (bounded), and
+one chronological user-message source. Ordinary incomplete operation evidence
+abstains before generation; terminal evidence loss is scoped as above.
 
 Keep the plugin registration in global config only. Do not add the full plugin to
 project config, `cli.json`, or `.opencode/plugins/` as well: the plugin reads its
@@ -206,7 +206,8 @@ flowchart TD
 
 The decision stage builds compact evidence once: action and resources, optional
 selected operation details from host metadata and the captured tool call when
-available, one chronological user-message source, concrete static-analysis
+available, the host platform and requested shell interpreter (bounded), one
+chronological user-message source, concrete static-analysis
 findings, and git state only for git-related actions. Raw metadata/source blobs
 and agent prose are not sent. If a shared call identity makes the capture
 unavailable or ambiguous, the operation is incomplete rather than guessed.

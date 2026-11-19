@@ -30,6 +30,7 @@ it("asks focused safety and authorization predicates with compact evidence", asy
       const evidence = JSON.parse(input.input[0].text);
       assert.equal(evidence.action, "shell");
       assert.deepEqual(evidence.resources, ["git status"]);
+      assert.equal(evidence.platform, process.platform);
       assert.deepEqual(evidence.userMessages, ["Inspect"]);
       assert.equal("agent" in evidence, false);
       assert.doesNotMatch(JSON.stringify(input), /PRIVATE_FILE|ASSISTANT_PROSE|metadata|"band"/);
@@ -42,6 +43,17 @@ it("asks focused safety and authorization predicates with compact evidence", asy
     const reversed = { answers: [answer(0.95, 0.96).answers[1], answer(0.95, 0.96).answers[0]] };
     assert.equal((await run(reversed)).decision, "allow");
 });
+
+  it("keeps platform and shell interpreter for non-POSIX command semantics", async () => {
+    let evidence: Record<string, unknown> | undefined;
+    const result = await decisionStage(context(async (input) => {
+      evidence = JSON.parse(input.input[0].text);
+      return answer(0.99, 0.98);
+    }), options, { ...request, resources: ["echo %TOKEN%"], shell: { platform: "win32", interpreter: "cmd.exe" } });
+    assert.equal(result.decision, "allow");
+    assert.equal(evidence?.platform, process.platform);
+    assert.deepEqual(evidence?.shell, { platform: "win32", interpreter: "cmd.exe" });
+  });
 
   it("delivers one chronological user source and the shared authority policy", async () => {
     const userMessages = ["Do not use tools for this session.", "Inspect the checkout."];
@@ -120,6 +132,10 @@ it("asks focused safety and authorization predicates with compact evidence", asy
     const longTool = await decisionStage(ctx, options, { ...request, operation: { tool: "t".repeat(600), access: "execute", complete: true } });
     assert.equal(longTool.decision, "abstain");
     assert.equal(longTool.errorKind, "context");
+    assert.equal(calls, 0);
+    const longInterpreter = await decisionStage(ctx, options, { ...request, shell: { interpreter: "i".repeat(600) } });
+    assert.equal(longInterpreter.decision, "abstain");
+    assert.equal(longInterpreter.errorKind, "context");
     assert.equal(calls, 0);
     const unknownAccess = await decisionStage(ctx, options, { ...request, operation: { tool: "shell", complete: true } });
     assert.equal(unknownAccess.decision, "allow");

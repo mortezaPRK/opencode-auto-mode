@@ -88,6 +88,11 @@ function opaqueOperation(evidence: DecisionEvidence, request: DecisionEvidenceRe
 function incomplete(evidence: DecisionEvidence, request: DecisionEvidenceRequest): StageResult | undefined {
   if (evidence.incompleteEvidenceKind === "resources") throw new EvidenceFailure("Incomplete decision evidence");
   if (opaqueOperation(evidence, request)) throw new EvidenceFailure("Opaque operation evidence");
+  if (evidence.incompleteEvidenceKind === "shell")
+    return {
+      decision: "abstain", stage: "decision", errorKind: "context",
+      reason: "Decision shell evidence incomplete; abstained before generation",
+    };
   if (evidence.incompleteEvidenceKind === "delegations")
     return {
       decision: "abstain", stage: "decision", errorKind: "context",

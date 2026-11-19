@@ -24,6 +24,10 @@ export interface DecisionEvidence {
   projectDir?: string;
   worktreeRoot?: string;
   scopeResolution?: "unknown";
+  /** Host platform: Windows commands can use cmd.exe expansion semantics. */
+  platform: string;
+  /** Requested shell interpretation; the dialect changes command semantics. */
+  shell?: { platform?: string; interpreter?: string };
   operation?: DecisionEvidenceOperation;
   /** Exactly one chronological user source: messages, or transcript fallback. */
   userMessages?: readonly string[];
@@ -33,8 +37,8 @@ export interface DecisionEvidence {
   gitState?: { branch?: string; defaultBranch?: string; clean?: boolean };
   /** Present whenever selected evidence was redacted or bounded. */
   incompleteEvidence?: string;
-  /** `resources` is terminal; `operation` and `delegations` are context losses. */
-  incompleteEvidenceKind?: "resources" | "operation" | "delegations";
+  /** `resources` is terminal; `shell`, `operation` and `delegations` are context losses. */
+  incompleteEvidenceKind?: "resources" | "shell" | "operation" | "delegations";
 }
 
 /** Authority policy for the `authorization` predicate. */
@@ -45,8 +49,10 @@ export const DECISION_SAFETY_INSTRUCTIONS = "The pending operation has no destru
 export const DECISION_AUTHORIZATION_INSTRUCTIONS = `Does the user's request authorize this action at this scope? ${DECISION_AUTHORITY_POLICY}`;
 
 const MAX_TOOL_CHARS = 500;
+const MAX_SHELL_CHARS = 500;
 const MAX_TARGETS = 64;
 const MAX_TARGET_CHARS = 2_000;
+const SHELL_LOSS = "Shell platform or interpreter evidence was truncated; command semantics are uncertain";
 const OPERATION_LOSS = "Selected operation evidence is incomplete; essential arguments or scope are unavailable";
 const RESOURCE_LOSS = "Inline HTTP body or remaining arguments omitted; do not approve from partial evidence";
 const DELEGATION_LOSS = "Delegated context was redacted";
@@ -178,6 +184,26 @@ function gitEvidence(request: DecisionEvidenceRequest): DecisionEvidence["gitSta
   };
 }
 
+function boundedShellField(value: unknown): { value?: string; loss: boolean } {
+  if (value === undefined) return { loss: false };
+  if (typeof value !== "string") return { loss: true };
+  if (value.length > MAX_SHELL_CHARS) return { value: value.slice(0, MAX_SHELL_CHARS), loss: true };
+  return { value, loss: false };
+}
+
+/** Execution context is safety evidence: `echo %TOKEN%` is literal in POSIX
+ * shells but expands an environment variable in cmd.exe. */
+function shellEvidence(request: DecisionEvidenceRequest): Pick<DecisionEvidence, "platform"> & { shell?: DecisionEvidence["shell"]; loss: boolean } {
+  const platform = boundedShellField(request.shell?.platform);
+  const interpreter = boundedShellField(request.shell?.interpreter);
+  const shell = request.shell === undefined ? undefined : defined({ platform: platform.value, interpreter: interpreter.value });
+  return {
+    platform: process.platform,
+    ...(shell === undefined ? {} : { shell }),
+    loss: platform.loss || interpreter.loss,
+  };
+}
+
 function resourceEvidence(resources: readonly string[]): { resources: string[]; incomplete?: string } {
   const redacted = resources.map((resource) => redactHttpBodies(resource));
   return {
@@ -186,8 +212,9 @@ function resourceEvidence(resources: readonly string[]): { resources: string[]; 
   };
 }
 
-function lossEvidence(resource: string | undefined, operation: boolean, delegation: boolean): Pick<DecisionEvidence, "incompleteEvidence" | "incompleteEvidenceKind"> {
+function lossEvidence(resource: string | undefined, shell: boolean, operation: boolean, delegation: boolean): Pick<DecisionEvidence, "incompleteEvidence" | "incompleteEvidenceKind"> {
   if (resource !== undefined) return { incompleteEvidence: resource, incompleteEvidenceKind: "resources" };
+  if (shell) return { incompleteEvidence: SHELL_LOSS, incompleteEvidenceKind: "shell" };
   if (operation) return { incompleteEvidence: OPERATION_LOSS, incompleteEvidenceKind: "operation" };
   if (delegation) return { incompleteEvidence: DELEGATION_LOSS, incompleteEvidenceKind: "delegations" };
   return {};
@@ -198,6 +225,7 @@ export function buildDecisionEvidence(request: DecisionEvidenceRequest): Decisio
   const resources = resourceEvidence(request.resources);
   const operation = operationEvidence(request.operation);
   const delegations = delegationEvidence(request);
+  const shell = shellEvidence(request);
   return {
     action: request.action,
     resources: resources.resources,
@@ -205,12 +233,14 @@ export function buildDecisionEvidence(request: DecisionEvidenceRequest): Decisio
       projectDir: request.projectDir,
       worktreeRoot: request.worktreeRoot,
       scopeResolution: request.scopeResolution,
+      platform: shell.platform,
+      shell: shell.shell,
       operation: operation.operation,
       userMessages: chronologyEvidence(request),
       delegations: delegations.value,
       staticAnalysis: staticEvidence(request),
       gitState: gitEvidence(request),
     }),
-    ...lossEvidence(resources.incomplete, operation.loss, delegations.loss),
+    ...lossEvidence(resources.incomplete, shell.loss, operation.loss, delegations.loss),
   };
 }
