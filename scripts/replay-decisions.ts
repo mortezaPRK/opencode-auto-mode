@@ -37,11 +37,15 @@ const MAX_RECORDED_TARGET_CHARS = 2_000;
 const MAX_PROBLEMS = 8;
 const CLI_MAX_BUFFER = 2 * 1024 * 1024;
 const DELEGATION_LOSS = "Delegated context was redacted or lost";
+/** Audit rows are untrusted; only supported verdict/error categories may reach output. */
+const VERDICTS: readonly string[] = ["allow", "deny", "ask", "abstain"];
+const ERROR_KINDS: readonly string[] = ["deadline", "timeout", "cancelled", "provider", "invalid-output", "context"];
+const UNKNOWN_VALUE = "unknown";
 
 type Counts = Record<string, number>;
 type Json = Record<string, unknown>;
 
-interface ModelFilter { providerID: string; id: string }
+interface ModelFilter { providerID: string; id: string; variant?: string }
 interface CliOptions {
   inputs: string[];
   rotations?: number;
@@ -113,6 +117,7 @@ interface BeforeEvent {
   model: string;
   providerID: string;
   id: string;
+  variant?: string;
   format: "predicate" | "legacy" | "unknown";
   questions: unknown[];
   evidenceText?: string;
@@ -442,6 +447,13 @@ function stageIndexValue(value: unknown): number | undefined {
   return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : undefined;
 }
 
+/** Verdict and error-category values are untrusted audit text; anything outside
+ * the supported enums collapses to one fixed category instead of being printed. */
+function enumText(value: unknown, allowed: readonly string[]): string | undefined {
+  if (value === undefined) return undefined;
+  return typeof value === "string" && allowed.includes(value) ? value : UNKNOWN_VALUE;
+}
+
 function stringArray(value: unknown): string[] | undefined {
   return Array.isArray(value) && value.every((item) => typeof item === "string") ? value as string[] : undefined;
 }
@@ -470,13 +482,14 @@ function hash32(value: string): number {
 }
 
 function modelFilter(value: string): ModelFilter {
-  const slash = value.indexOf("/");
-  if (slash <= 0 || slash === value.length - 1) throw new Error("--model must be <provider>/<model>");
-  return { providerID: value.slice(0, slash), id: value.slice(slash + 1) };
+  let ref: { providerID: string; id: string; variant?: string };
+  try { ref = Model.Ref.parse(value); }
+  catch { throw new Error("--model must be <provider>/<model>[#variant]"); }
+  return { providerID: ref.providerID, id: ref.id, ...(ref.variant === undefined ? {} : { variant: ref.variant }) };
 }
 
-function modelText(filter: ModelFilter): string {
-  return `${filter.providerID}/${filter.id}`;
+function modelText(ref: { providerID: string; id: string; variant?: string }): string {
+  return `${ref.providerID}/${ref.id}${ref.variant === undefined ? "" : `#${ref.variant}`}`;
 }
 
 function requireModel(options: CliOptions): ModelFilter {
@@ -485,7 +498,7 @@ function requireModel(options: CliOptions): ModelFilter {
 }
 
 function modelTextOf(before: BeforeEvent): string {
-  return `${before.providerID}/${before.id}`;
+  return modelText(before);
 }
 
 function parseInteger(name: string, value: string | undefined, minimum: number, maximum: number): number {
@@ -577,7 +590,7 @@ function usage(): string {
     "Options:",
     `  --input <path>            Audit file or directory; repeatable (default: local audit + rotations)`,
     `  --rotations <n>           Use only the newest n rotated files (default: all)`,
-    `  --model <provider>/<id>   Exact decision model filter (required)`,
+    `  --model <provider>/<id>[#variant]  Exact decision model filter (required)`,
     `  --threshold <0..1>        Fixed evaluation threshold (default: recorded minConfidence or ${DEFAULT_THRESHOLD})`,
     `  --holdout <0..1>          Deterministic session holdout share (default: ${DEFAULT_HOLDOUT})`,
     `  --seed <n>                Holdout/sample seed (default: 0)`,
@@ -855,8 +868,8 @@ function onStageEnd(state: State, env: Json): void {
   const key = `classifier.end|${reviewID}|${stageIndex}|${stringValue(env.ts) ?? "-"}`;
   if (seenBefore(state, key)) return;
   recordEnd(state, reviewID, stageIndex, {
-    decision: stringValue(payload.decision),
-    errorKind: stringValue(payload.errorKind),
+    decision: enumText(payload.decision, VERDICTS),
+    errorKind: enumText(payload.errorKind, ERROR_KINDS),
     stage: stringValue(payload.stage),
     hasError: payload.decision === undefined,
     ts: stringValue(env.ts),
@@ -872,11 +885,12 @@ function formatOf(questions: readonly unknown[]): BeforeEvent["format"] {
   return "unknown";
 }
 
-function beforeModel(payload: Json | undefined): { providerID: string; id: string } | undefined {
+function beforeModel(payload: Json | undefined): { providerID: string; id: string; variant?: string } | undefined {
   const model = isRecord(payload?.model) ? payload.model : undefined;
   const providerID = stringValue(model?.providerID);
   const id = stringValue(model?.id);
-  return providerID && id ? { providerID, id } : undefined;
+  const variant = optionalString(model?.variant);
+  return providerID && id ? { providerID, id, ...(variant === undefined || variant.length === 0 ? {} : { variant }) } : undefined;
 }
 
 function beforeEvidenceText(payload: Json): string | undefined {
@@ -892,9 +906,9 @@ function beforeFromEnvelope(env: Json): BeforeEvent | undefined {
   const questions = Array.isArray(payload.questions) ? payload.questions : [];
   const evidenceText = beforeEvidenceText(payload);
   return {
-    model: `${model.providerID}/${model.id}`, providerID: model.providerID, id: model.id,
+    model: modelText(model), providerID: model.providerID, id: model.id, variant: model.variant,
     format: formatOf(questions), questions, evidenceText,
-    malformedEvidence: evidenceText === undefined || evidenceText.length > MAX_EVIDENCE_TEXT_CHARS,
+    malformedEvidence: evidenceObject(evidenceText) === undefined,
   };
 }
 
@@ -913,7 +927,7 @@ function attachPendingHost(review: ReviewState, state: State): void {
 }
 
 function matchesFilter(before: BeforeEvent, filter: ModelFilter): boolean {
-  return before.providerID === filter.providerID && before.id === filter.id;
+  return before.providerID === filter.providerID && before.id === filter.id && before.variant === filter.variant;
 }
 
 function requestKeyOf(env: Json, stageIndex: number): string {
@@ -981,12 +995,12 @@ function decisionError(state: State, env: Json): void {
 
 function onFinal(state: State, env: Json): void {
   const reviewID = stringValue(env.reviewID);
-  const decision = stringValue(env.decision);
+  const decision = enumText(env.decision, VERDICTS);
   const stage = stringValue(env.stage);
-  if (!reviewID || !decision || !stage) return;
+  if (!reviewID || decision === undefined || !stage) return;
   const review = state.reviews.get(reviewID);
   if (!review) return;
-  review.final = { decision, stage, errorKind: stringValue(env.errorKind) };
+  review.final = { decision, stage, errorKind: enumText(env.errorKind, ERROR_KINDS) };
 }
 
 function decisionEvent(state: State, type: string | undefined, env: Json, filter: ModelFilter): boolean {
@@ -1155,12 +1169,18 @@ function recordedOperation(value: unknown): RecordedOperation | undefined {
   return { ...(targets.targets === undefined ? {} : { targets: targets.targets }), canonical: targets.canonical && object.complete === true };
 }
 
-function recordedEvidence(text: string | undefined): RecordedEvidence | undefined {
+/** Parsed evidence must be a bounded JSON object; text that fails either check
+ * is malformed source data, not merely absent chronology or host context. */
+function evidenceObject(text: string | undefined): Json | undefined {
   if (text === undefined || text.length > MAX_EVIDENCE_TEXT_CHARS) return undefined;
   let parsed: unknown;
   try { parsed = JSON.parse(text); }
   catch { return undefined; }
-  const object = jsonRecord(parsed);
+  return jsonRecord(parsed);
+}
+
+function recordedEvidence(text: string | undefined): RecordedEvidence | undefined {
+  const object = evidenceObject(text);
   if (!object) return undefined;
   const scope = object.scopeResolution === "unknown" ? "unknown" as const : undefined;
   const delegations = recordedDelegations(object.delegations);
@@ -1226,10 +1246,19 @@ interface HostOperation {
   targetLoss?: "platform" | "operation";
 }
 
+function canonicalOperationTargets(recorded: RecordedEvidence | undefined): readonly string[] | undefined {
+  const operation = recorded?.operation;
+  return operation?.canonical === true ? operation.targets : undefined;
+}
+
 function hostOperation(host: HostEvent, recorded: RecordedEvidence | undefined): HostOperation {
+  const canonical = canonicalOperationTargets(recorded);
   const operation = buildOperationEvidence(
     { action: host.action, resources: host.resources, metadata: host.metadata, sessionID: host.sessionID },
-    { projectDir: recorded?.projectDir ?? host.projectDir, capture: host.capture },
+    {
+      projectDir: recorded?.projectDir ?? host.projectDir, capture: host.capture,
+      ...(canonical === undefined ? {} : { targets: canonical }),
+    },
   );
   const repaired = host.metadataInvalid ? { ...operation, complete: false } : operation;
   const targets = historicalTargets(repaired, recorded);
@@ -1343,7 +1372,7 @@ function codeModeCandidate(host: HostEvent, fallback: DecisionEvidenceRequest | 
 }
 
 function candidateFor(review: ReviewState, request: DecisionRequestAudit): Candidate {
-  const recorded = request.before.malformedEvidence ? undefined : recordedEvidence(request.before.evidenceText);
+  const recorded = recordedEvidence(request.before.evidenceText);
   const fallback = requestFromRecorded(recorded);
   if (!review.host) return missingHostCandidate(recorded);
   const resources = hostResources(review.host);

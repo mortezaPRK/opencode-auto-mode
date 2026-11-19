@@ -24,15 +24,16 @@ function decisionStart(reviewID: string, stageIndex = 1, minConfidence = 0.9) {
   return event("classifier.start", reviewID, stageIndex, { type: "decision", model: `${MODEL.providerID}/${MODEL.id}`, minConfidence, timeoutMs: 3000 });
 }
 
-function decisionBefore(reviewID: string, evidence: Record<string, unknown>, format: "predicate" | "legacy", callID = "call_1", stageIndex = 1) {
+function decisionBefore(reviewID: string, evidence: Record<string, unknown>, format: "predicate" | "legacy", callID = "call_1", stageIndex = 1, variant?: string) {
   const questions = format === "predicate"
     ? [{ type: "predicate", name: "safety", instructions: "safety" }, { type: "predicate", name: "authorization", instructions: "authorization" }]
     : [{ type: "choice", name: "permission", instructions: "permission", choices: [{ value: "allow" }, { value: "deny" }, { value: "ask" }] }];
   // Real records always carry the recording host's platform; fixtures model that
   // unless a test deliberately drops or overrides it.
   const text = JSON.stringify({ platform: process.platform, ...evidence });
+  const model = variant === undefined ? MODEL : { ...MODEL, variant };
   return event("generate.decisions.before", reviewID, stageIndex, {
-    model: MODEL, input: [{ type: "text", text }], questions,
+    model, input: [{ type: "text", text }], questions,
   }, { callID });
 }
 
@@ -661,5 +662,127 @@ test("--details --json includes bounded normalized request rows without prompts 
     expect(result.stdout).not.toContain("TOY_SECRET");
     const plain = run(["--input", input, "--model", "fixture/judge", "--json"]);
     expect(JSON.parse(plain.stdout).details).toBeUndefined();
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("unsupported recorded verdict and error categories collapse to a fixed category", () => {
+  const root = mkdtempSync(join(tmpdir(), "auto-mode-enum-"));
+  try {
+    const reviewID = "review-enum";
+    const callID = "call_enum";
+    const rows = [
+      toolCall("msg_enum", callID, "read", { path: "/tmp/fixture-project/a.ts" }),
+      permission(reviewID, "read", ["/tmp/fixture-project/a.ts"], undefined, { type: "tool", messageID: "msg_enum", id: callID }),
+      decisionStart(reviewID),
+      decisionBefore(reviewID, { action: "read", resources: ["/tmp/fixture-project/a.ts"], userMessages: ["read a"] }, "predicate", callID),
+      decisionAfter(reviewID, PREDICATE_HIGH.answers, callID),
+      event("classifier.end", reviewID, 1, { decision: "ALLOW\u001b[2J", stage: "decision", errorKind: "EXPLOIT\u001b[31m" },
+        { ts: "2026-01-01T00:00:01.000Z" }),
+      { ts: "2026-01-01T00:00:02.000Z", reviewID, sessionID: "ses_fixture", decision: "deny\nFORGED", stage: "decision", errorKind: "FAKE" },
+    ];
+    const input = writeRows(root, rows);
+    const result = run(["--input", input, "--model", "fixture/judge", "--json"]);
+    expect(result.status).toBe(0);
+    const report = JSON.parse(result.stdout);
+    expect(report.recorded.decisions).toEqual({ unknown: 1 });
+    expect(report.recorded.errorKinds).toEqual({ unknown: 1 });
+    expect(report.final.decisions).toEqual({ unknown: 1 });
+    expect(report.predicate.vsRecorded).toEqual({ "allow>unknown": 1 });
+    expect(result.stdout).not.toContain("ALLOW");
+    expect(result.stdout).not.toContain("EXPLOIT");
+    expect(result.stdout).not.toContain("FORGED");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+function variantRows(reviewID: string, variant?: string): unknown[] {
+  const callID = `call_${reviewID}`;
+  return [
+    toolCall(`msg_${reviewID}`, callID, "read", { path: "/tmp/fixture-project/a.ts" }),
+    permission(reviewID, "read", ["/tmp/fixture-project/a.ts"], undefined, { type: "tool", messageID: `msg_${reviewID}`, id: callID }),
+    decisionStart(reviewID),
+    decisionBefore(reviewID, { action: "read", resources: ["/tmp/fixture-project/a.ts"], userMessages: ["read a"] }, "predicate", callID, 1, variant),
+    decisionAfter(reviewID, PREDICATE_HIGH.answers, callID),
+    stageEnd(reviewID, "allow"),
+  ];
+}
+
+test("recorded model variants filter exactly and survive live request construction", () => {
+  const root = mkdtempSync(join(tmpdir(), "auto-mode-variant-"));
+  try {
+    const input = writeRows(root, [...variantRows("review-plain"), ...variantRows("review-peek", "high")]);
+    const plain = run(["--input", input, "--model", "fixture/judge", "--json"]);
+    expect(plain.status).toBe(0);
+    const plainReport = JSON.parse(plain.stdout);
+    expect(plainReport.filter).toBe("fixture/judge");
+    expect(plainReport.reviews).toMatchObject({ requests: 1, filteredOut: 1 });
+    const exact = run(["--input", input, "--model", "fixture/judge#high", "--json"]);
+    expect(exact.status).toBe(0);
+    const exactReport = JSON.parse(exact.stdout);
+    expect(exactReport.filter).toBe("fixture/judge#high");
+    expect(exactReport.reviews).toMatchObject({ requests: 1, filteredOut: 1 });
+    const wrong = run(["--input", input, "--model", "fixture/judge#fast", "--json"]);
+    expect(wrong.status).toBe(0);
+    expect(JSON.parse(wrong.stdout).reviews).toMatchObject({ requests: 0, filteredOut: 2 });
+    const body = join(root, "body.json");
+    const live = run(["--input", input, "--model", "fixture/judge#high", "--live", "--limit", "1",
+      "--opencode-bin", fakeCli(root), "--json"], { FAKE_BODY: body });
+    expect(live.status).toBe(0);
+    expect(JSON.parse(live.stdout).live.selected).toBe(1);
+    const sent = JSON.parse(readFileSync(body, "utf8"));
+    expect(sent.model).toEqual({ providerID: "fixture", id: "judge", variant: "high" });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("evidence text that is not a JSON object is counted as malformed", () => {
+  const root = mkdtempSync(join(tmpdir(), "auto-mode-malformed-evidence-"));
+  try {
+    const rawBefore = (reviewID: string, text: string) => event("generate.decisions.before", reviewID, 1, {
+      model: MODEL, input: [{ type: "text", text }],
+      questions: [{ type: "predicate", name: "safety" }, { type: "predicate", name: "authorization" }],
+    }, { callID: `call_${reviewID}` });
+    const rows = ["review-not-json", "review-array"].flatMap((reviewID, index) => [
+      decisionStart(reviewID),
+      rawBefore(reviewID, index === 0 ? "{not-json}" : "[]"),
+      decisionAfter(reviewID, PREDICATE_HIGH.answers, `call_${reviewID}`),
+    ]);
+    const input = writeRows(root, rows);
+    const result = run(["--input", input, "--model", "fixture/judge", "--json"]);
+    expect(result.status).toBe(0);
+    const report = JSON.parse(result.stdout);
+    expect(report.pairing.malformedEvidence).toBe(2);
+    expect(report.evidence.missingHost).toBe(2);
+    expect(report.evidence.missingChronology).toBe(2);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("recorded canonical targets rebuild completeness without the replay filesystem", () => {
+  const root = mkdtempSync(join(tmpdir(), "auto-mode-canonical-targets-"));
+  try {
+    const evidence = {
+      action: "grep", resources: ["src"], userMessages: ["search src"],
+      operation: { tool: "grep", access: "read", targets: ["/tmp/fixture-project/src"], complete: true },
+    };
+    const rows = [
+      ...decisionRows("review-canonical", evidence, { tool: "grep", input: { path: "missing-dir/../src" } }),
+      ...decisionRows("review-canonical-invalid", evidence,
+        { tool: "grep", input: { path: "missing-dir/../src" }, metadata: "not-an-object" }),
+    ];
+    const input = writeRows(root, rows);
+    const dry = run(["--input", input, "--model", "fixture/judge", "--json"]);
+    expect(dry.status).toBe(0);
+    const report = JSON.parse(dry.stdout);
+    expect(report.evidence.preGeneration).toEqual({ operation: 1 });
+    expect(report.evidence).toMatchObject({ operationComplete: 1, operationIncomplete: 1 });
+    expect(report.eligibility.eligible).toBe(1);
+    const body = join(root, "body.json");
+    const live = run(["--input", input, "--model", "fixture/judge", "--live", "--limit", "1", "--holdout", "0",
+      "--opencode-bin", fakeCli(root), "--json"], { FAKE_BODY: body });
+    expect(live.status).toBe(0);
+    expect(JSON.parse(live.stdout).live.selected).toBe(1);
+    const sent = JSON.parse(readFileSync(body, "utf8"));
+    const rebuilt = JSON.parse(sent.input[0].text);
+    expect(rebuilt.operation.targets).toEqual(["/tmp/fixture-project/src"]);
+    expect(rebuilt.operation.complete).toBe(true);
+    expect(rebuilt.operation.arguments).toEqual({ path: "missing-dir/../src" });
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
