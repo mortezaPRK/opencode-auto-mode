@@ -31,10 +31,11 @@ Sources of truth checked for this guide:
 - The plugin reads safety options from its global registration only. It ignores
   project-merged `ctx.options` and rejects duplicate registrations or ambiguous
   global files.
-- **Data egress:** a configured `decision` or `llm` stage sends the action and
-  resources (including full Code Mode source), project/worktree, and up to 12 KB
-  of user text to that stage's model provider, even when audit is disabled. The
-  decision stage sends compact evidence plus selected operation details. The llm
+- **Data egress:** a configured `decision` or `llm` stage sends
+  the action and resources (including full Code Mode source), project/worktree,
+  and up to 12 KB of combined root and delegated user text to that stage's model
+  provider, even when audit is disabled. The decision stage sends compact
+  evidence plus selected operation details. The llm
   stage also receives the agent and broader bounded review evidence. The llm
   stage always includes Git state; the decision stage includes it only for
   git-related actions. The `static` stage makes no model call.
@@ -155,15 +156,31 @@ Classifier stages:
 The decision stage receives compact evidence: action and resources, an optional
 selected operation (tool, access, targets and selected arguments) from host
 metadata and the captured tool call when available, the host platform and
-requested shell interpreter (bounded), one chronological user-message source,
-concrete static-analysis findings, and git state only for git-related actions.
-Raw metadata/source blobs and agent prose are not sent.
+requested shell interpreter (bounded), one chronological root-session
+user-message source, concrete static-analysis findings, and git state only for
+git-related actions. Raw metadata/source blobs and agent prose are not sent.
 Operation evidence is marked incomplete when selection, privacy bounds, or
 correlation are lost; shared call identities or skipped outer execute snapshots
 can leave the capture unavailable or ambiguous, and it is not guessed. Network
 and query values remain literal arguments/resources, not filesystem targets.
 Arbitrary payload keys are redacted; common search/query fields remain literal
 evidence.
+
+Only root-session user messages are user authority. The plugin follows
+`parentID` to the root within 16 sessions, rejects cycles, and reads each
+session's metadata and context once. Descendant user prompts are preserved
+separately as delegation context in root-to-leaf order; they are nonauthority,
+may narrow the local task, and cannot grant authorization, broaden scope, or
+revoke a parent restriction. Root and delegation text share a 12,000-byte
+budget. Authority is taken at request start (`asOf`); user messages created
+after that cut are excluded from root authority and delegation. A non-finite cut
+or message timestamp fails closed to **ask**. Non-null `fork` metadata asks
+because forked authority provenance is unresolved; only live `fork: null` is not
+a fork, and forked user text is never reclassified as delegation. A `compaction`
+message in any active root or delegation context is degraded and asks. Missing
+root/parent/context evidence, cycles, depth overflow, or oversized text fails
+terminally to **ask**; text is not truncated and restrictions are not dropped.
+These are correctness rules, not an `80%` claim.
 
 The LLM stage receives bounded review evidence, selected static findings, and
 chronological user-message boundaries. It replies with one nonempty `ALLOW:`,
@@ -387,7 +404,7 @@ read-only before changing it.
       debugging.
 - [ ] The user knows a configured `decision`/`llm` stage sends action and
       resources (including full Code Mode source), agent, project/worktree, git
-      state, and up to 12 KB of user messages to that model's provider even with
-      audit off.
+      state, and up to 12 KB of combined root and delegated user text to that
+      model's provider even with audit off.
 - [ ] The user knows that native deny remains final, invalid config is
       passthrough, and client Auto/YOLO can suppress plugin asks.

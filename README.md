@@ -13,10 +13,11 @@ invalid configuration fail closed.
 - Model references only if you use `decision` or `llm` classifier stages. Models
   and provider credentials belong in your personal OpenCode provider config.
   This repository supplies no model, endpoint, credential, or allowlist.
-- **Data egress:** a configured `decision` or `llm` stage sends the action and
-  resources (including full Code Mode source), project/worktree, and up to 12 KB
-  of user text to that model's provider, even with audit off. The decision stage
-  sends compact evidence plus selected operation details. The llm stage also
+- **Data egress:** a configured `decision` or `llm` stage sends
+  the action and resources (including full Code Mode source), project/worktree,
+  and up to 12 KB of combined root and delegated user text to that model's
+  provider, even with audit off. The decision stage sends compact evidence plus
+  selected operation details. The llm stage also
   receives the agent, broader bounded evidence, and Git state. The decision
   stage includes Git state only for git-related actions. Choose a provider you
   trust.
@@ -207,10 +208,26 @@ flowchart TD
 The decision stage builds compact evidence once: action and resources, optional
 selected operation details from host metadata and the captured tool call when
 available, the host platform and requested shell interpreter (bounded), one
-chronological user-message source, concrete static-analysis
+chronological root-session user-message source, concrete static-analysis
 findings, and git state only for git-related actions. Raw metadata/source blobs
 and agent prose are not sent. If a shared call identity makes the capture
 unavailable or ambiguous, the operation is incomplete rather than guessed.
+
+User authority comes only from the root session. The plugin follows `parentID`
+to the root within 16 sessions, rejects cycles, and reads each session's metadata
+and context once. Descendant user prompts are preserved separately as delegation
+context in root-to-leaf order; they are nonauthority, may narrow the local task,
+and cannot grant authorization, broaden scope, or revoke a parent restriction.
+Root and delegation text share a 12,000-byte budget. Authority is taken at
+request start (`asOf`): user messages created later are excluded from root
+authority and delegation, and a non-finite cutoff or message timestamp fails
+closed to **ask**. Non-null `fork` metadata also asks because forked authority
+provenance is unresolved; only live `fork: null` is not a fork, and forked user
+text is never reclassified as delegation. A `compaction` message in active root
+or delegation context is degraded and asks. Missing root/parent/context
+evidence, cycles, depth overflow, or oversized text is terminal and resolves to
+**ask**; text is never truncated and restrictions are never dropped. These are
+correctness rules, not an `80%` claim.
 
 Ordinary incomplete operation evidence abstains before generation and continues.
 Terminal evidence loss is limited to resource-body redaction, an external

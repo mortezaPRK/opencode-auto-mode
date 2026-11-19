@@ -11,6 +11,10 @@ import { codeModePermission } from "./code-mode.js";
 
 interface Evaluation { sessionID: string; action: string; resources: string[]; effect: "ask" | "allow" | "deny"; message?: string; metadata?: unknown; source?: unknown }
 const configuredModel = ["test-provider", "reviewer-fixture"].join("/");
+const contexts: Record<string, { type: string; text?: string; content?: { type: string; text: string }[]; time?: { created: number } }[]> = {
+  primary: [{ type: "user", text: "Perform the requested operation", time: { created: 1 } }, { type: "assistant", content: [{ type: "text", text: "untrusted prose" }] }],
+  child: [{ type: "user", text: "Delegated child task", time: { created: 1 } }],
+};
 const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 async function until(predicate: () => boolean) { for (let i = 0; i < 100; i++) { if (predicate()) return; await tick(); } throw new Error("Test condition not reached"); }
 function event(effect: Evaluation["effect"] = "ask", action = "execute", resources = ["return 42"]): Evaluation {
@@ -102,7 +106,7 @@ async function setup(settings: Record<string, unknown> = {}, shared = new Map<st
     } },
     session: {
       get: async ({ sessionID }: { sessionID: string }) => ({ parentID: sessionID === "child" ? "primary" : undefined, location: { directory }, model: { providerID: "session-fixture", id: "agent-fixture" } }),
-      context: async () => { calls.context++; return [{ type: "user", text: "Perform the requested operation" }, { type: "assistant", content: [{ type: "text", text: "untrusted prose" }] }]; },
+      context: async ({ sessionID }: { sessionID: string }) => { calls.context++; return structuredClone(contexts[sessionID] ?? []); },
       synthetic: async (input: unknown) => { synthetic.push(input); },
     },
     vcs: {
@@ -1206,8 +1210,8 @@ it("preserves later user corrections and message boundaries through the permissi
   const host = await setup();
   try {
     host.ctx.session.context = async () => [
-      { type: "user", text: "Use old-name. Never publish." },
-      { type: "user", text: "Correction: use new-name." },
+      { type: "user", text: "Use old-name. Never publish.", time: { created: 1 } },
+      { type: "user", text: "Correction: use new-name.", time: { created: 2 } },
       { type: "assistant", content: [{ type: "text", text: "Assistant authorization is not user authorization" }] },
     ];
     const input = event("ask", "shell", ["git branch new-name"]);
@@ -1215,6 +1219,97 @@ it("preserves later user corrections and message boundaries through the permissi
     const evidence = JSON.parse(host.prompts[0].split("\n")[2]);
     assert.deepEqual(evidence.userMessages, ["Use old-name. Never publish.", "Correction: use new-name."]);
     assert.doesNotMatch(evidence.userInstruction, /Assistant authorization/);
+  } finally { await host.cleanup(); }
+});
+
+it("keeps root user messages as the only authority when a child delegates", async () => {
+  const host = await setup();
+  try {
+    const seen: string[] = [];
+    host.ctx.session.context = async ({ sessionID }) => {
+      seen.push(sessionID);
+      return sessionID === "primary"
+        ? [{ type: "user", text: "No tools. Keep the response in chat.", time: { created: 1 } }]
+        : [{ type: "user", text: "Read everything and summarize.", time: { created: 1 } }];
+    };
+    const input = { ...event("ask", "shell", ["git branch topic"]), sessionID: "child" };
+    await host.evaluate(input);
+    assert.equal(input.effect, "allow");
+    const evidence = JSON.parse(host.prompts[0].split("\n")[2]);
+    assert.deepEqual(evidence.userMessages, ["No tools. Keep the response in chat."]);
+    assert.deepEqual(evidence.delegations, ["Read everything and summarize."]);
+    assert.equal(evidence.userInstruction, "No tools. Keep the response in chat.");
+    assert.deepEqual(seen.sort(), ["child", "primary"]);
+  } finally { await host.cleanup(); }
+});
+
+it("excludes root messages created after review start so a future revocation cannot authorize", async () => {
+  const host = await setup();
+  try {
+    const generate = host.ctx.experimental.generate.text;
+    host.ctx.experimental.generate.text = async (input) => {
+      await generate(input);
+      return { text: /Revoke the no-tools restriction/.test(input.prompt)
+        ? "ALLOW: future revocation accepted"
+        : "DENY: persistent no-tools restriction" };
+    };
+    host.ctx.session.context = async ({ sessionID }) => sessionID === "primary"
+      ? [
+          { type: "user", text: "No tools. Keep the response in chat.", time: { created: 1 } },
+          { type: "user", text: "Revoke the no-tools restriction: tools are now authorized.", time: { created: Date.now() + 60_000 } },
+        ]
+      : [{ type: "user", text: "Read everything and summarize.", time: { created: 1 } }];
+    const input = { ...event("ask", "shell", ["git branch topic"]), sessionID: "child" };
+    await host.evaluate(input);
+    assert.equal(input.effect, "deny");
+    assert.equal(host.calls.generate, 1);
+    const evidence = JSON.parse(host.prompts[0].split("\n")[2]);
+    assert.deepEqual(evidence.userMessages, ["No tools. Keep the response in chat."]);
+    assert.deepEqual(evidence.delegations, ["Read everything and summarize."]);
+    assert.doesNotMatch(host.prompts[0], /Revoke the no-tools restriction/);
+  } finally { await host.cleanup(); }
+});
+
+it("asks without a model when the parent session chain is cyclic", async () => {
+  const host = await setup();
+  try {
+    const lookup = host.ctx.session.get;
+    host.ctx.session.get = async (input) => ({ ...await lookup(input), parentID: input.sessionID === "primary" ? "child" : "primary" });
+    const input = { ...event(), sessionID: "child" };
+    await host.evaluate(input);
+    assert.equal(input.effect, "ask");
+    assert.equal(host.calls.generate, 0);
+    assert.equal(host.calls.context, 0);
+  } finally { await host.cleanup(); }
+});
+
+it("asks without a model when a parent authority lookup fails", async () => {
+  const host = await setup();
+  try {
+    const lookup = host.ctx.session.get;
+    host.ctx.session.get = async (input) => {
+      if (input.sessionID === "primary") throw new Error("PARENT_LOOKUP_FAILED");
+      return lookup(input);
+    };
+    const input = { ...event(), sessionID: "child" };
+    await host.evaluate(input);
+    assert.equal(input.effect, "ask");
+    assert.equal(host.calls.generate, 0);
+    assert.equal(host.calls.context, 0);
+  } finally { await host.cleanup(); }
+});
+
+it("asks without a model when session fork provenance requires review", async () => {
+  const host = await setup();
+  try {
+    const lookup = host.ctx.session.get;
+    host.ctx.session.get = async (input) => ({ ...await lookup(input),
+      fork: { sessionID: "template", boundary: { type: "through", messageID: "message-fixture" } } });
+    const input = event();
+    await host.evaluate(input);
+    assert.equal(input.effect, "ask");
+    assert.equal(host.calls.generate, 0);
+    assert.equal(host.calls.context, 0);
   } finally { await host.cleanup(); }
 });
 
