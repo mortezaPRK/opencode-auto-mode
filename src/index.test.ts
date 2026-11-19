@@ -1249,3 +1249,61 @@ it("does not ask a model to approve skill loading or override native skill denie
     assert.equal(host.calls.context, 0);
   } finally { await host.cleanup(); }
 });
+
+it("applies the verdict and releases the review in the same turn at the commit boundary", async () => {
+  for (const hops of [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]) {
+    const host = await setup();
+    const RealAbortController = globalThis.AbortController;
+    try {
+      const input = { ...event(), message: "native ask message" };
+      const save = host.ctx.storage.set;
+      let armed = false;
+      let effectAtOff: Evaluation["effect"] | undefined;
+      let off: Promise<unknown> | undefined;
+      host.ctx.storage.set = async (key, state) => {
+        await save(key, state);
+        if (armed || state.counts.allow === 0) return;
+        armed = true;
+        let dispatch = () => { effectAtOff = input.effect; off = host.setMode("off"); };
+        for (let hop = 0; hop < hops; hop++) { const next = dispatch; dispatch = () => queueMicrotask(next); }
+        queueMicrotask(dispatch);
+      };
+      let aborts = 0;
+      globalThis.AbortController = class TrackedAbortController extends RealAbortController {
+        abort() { aborts++; super.abort(); }
+      } as typeof AbortController;
+      const evaluation = host.evaluate(input);
+      globalThis.AbortController = RealAbortController;
+      await evaluation;
+      await until(() => off !== undefined);
+      await off;
+      assert.ok(armed, `hops ${hops}: final commit observed`);
+      // An off that still sees the native effect wins and restores the counts.
+      if (effectAtOff === "ask") {
+        assert.equal(input.effect, "ask", `hops ${hops}: off wins`);
+        assert.deepEqual(statusOf(await host.status()).counts, { allow: 0, ask: 0, deny: 0 }, `hops ${hops}: counts restored`);
+      } else {
+        // An off that observes the applied verdict must find the review already released.
+        assert.equal(aborts, 1, `hops ${hops}: verdict applied before release`);
+      }
+    } finally {
+      globalThis.AbortController = RealAbortController;
+      await host.cleanup();
+    }
+  }
+});
+
+it("a blocked mode change with invalid config emits only the disabled message", async () => {
+  const host = await setup({ classifiers: [{ type: "unknown" }] });
+  try {
+    for (const command of ["on", ""]) {
+      const seen = host.synthetic.length;
+      await host.command(command);
+      const replies = host.synthetic.slice(seen) as { text: string }[];
+      assert.equal(replies.length, 1, command);
+      assert.match(replies[0].text, /Invalid|disabled/i);
+      assert.doesNotMatch(replies[0].text, /Auto mode: invalid/);
+    }
+    assert.equal(host.shared.size, 0);
+  } finally { await host.cleanup(); }
+});

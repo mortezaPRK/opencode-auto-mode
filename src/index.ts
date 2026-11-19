@@ -474,9 +474,7 @@ async function evaluatePermission(deps: Runtime, event: PermissionEvent, setting
     finishEarly(deps, event, proposed.early, progress, hostEffect, meta);
     return;
   }
-  let result = proposed.result;
-  try { result = await settleReview(deps, settings, event, handle, progress, result, hostEffect, original, meta, cancelledNow); }
-  finally { handle.release(); }
+  const result = await settleReview(deps, settings, event, handle, progress, proposed.result, hostEffect, original, meta, cancelledNow);
   recordReview(deps, event, progress, result, hostEffect, reviewsNativeAllow, meta);
 }
 
@@ -655,7 +653,16 @@ async function settleReview(
     // A signal that aborts while storage is committing settles the host
     // promptly as an ask; the durable repair still completes in order.
     const final = await withTimeout(finishPromise, deps.reviewTimeoutMs, nonAborted(handle.signal));
-    await applySettled(deps, event, progress, result, final, hostEffect, original, meta, cancelledNow);
+    const cancelled = cancelledNow();
+    const explicitOff = final.disposition === "off" || deps.suspended.has(event.sessionID);
+    // The durable commit may have won the race against a cancellation or off
+    // observed only after finish resolved. Repair that commit before exposing
+    // its counts; explicit off restores the exact pre-review state. The guard
+    // keeps the normal path in this turn, so off or interruption cannot slip
+    // between the cancellation check and the host update.
+    if (final.commit !== undefined && (explicitOff || (cancelled && final.disposition === "enforced")))
+      await repairLateCommit(deps, event, final, explicitOff, meta);
+    applySettled(deps, event, progress, result, final, hostEffect, original, cancelled, explicitOff);
     return result;
   } catch (error) {
     deps.debug("mode.finish.error", error, meta.correlation);
@@ -682,28 +689,25 @@ async function settleReview(
       catch (cause) { deps.debug("mode.revert.error", cause, meta.correlation); }
     }).catch(() => {});
     return failed;
+  } finally {
+    // The verdict is applied and the review released in one turn: an off or
+    // interruption cannot abort a review whose verdict is already applied.
+    handle.release();
   }
 }
 
-async function applySettled(
+function applySettled(
   deps: Runtime, event: PermissionEvent, progress: ReviewProgress, result: ReviewResult,
-  final: FinishOutcome, hostEffect: PermissionEvent["effect"], original: HostOriginal, meta: ReviewMeta, cancelledNow: () => boolean,
-): Promise<void> {
-  const cancelled = cancelledNow();
-  const explicitOff = final.disposition === "off" || deps.suspended.has(event.sessionID);
-  // The durable commit may have won the race against a cancellation or
-  // off observed only after finish resolved. Repair that commit before
-  // exposing its counts; explicit off restores the exact pre-review state.
-  await repairLateCommit(deps, event, final, cancelled, explicitOff, meta);
+  final: FinishOutcome, hostEffect: PermissionEvent["effect"], original: HostOriginal, cancelled: boolean, explicitOff: boolean,
+): void {
   progress.finalDisposition = explicitOff ? "off" : cancelled ? "cancelled" : final.disposition;
   progress.tripped = !cancelled && !explicitOff && final.tripped;
   applyHostEffect(deps, event, final, cancelled, explicitOff, progress.tripped, hostEffect, original, result);
 }
 
 async function repairLateCommit(
-  deps: Runtime, event: PermissionEvent, final: FinishOutcome, cancelled: boolean, explicitOff: boolean, meta: ReviewMeta,
+  deps: Runtime, event: PermissionEvent, final: FinishOutcome, explicitOff: boolean, meta: ReviewMeta,
 ): Promise<void> {
-  if (final.commit === undefined || (!explicitOff && !(cancelled && final.disposition === "enforced"))) return;
   try { await withTimeout(deps.modes.revertCancelled(event.sessionID, final, explicitOff ? "off" : "cancelled"), deps.reviewTimeoutMs); }
   catch (error) { deps.debug("mode.revert.error", error, meta.correlation); }
 }
@@ -804,7 +808,7 @@ function createAutoModeCommand(deps: CommandDeps) {
       return;
     }
     try {
-      if (argument !== "status") await changeMode(deps, sessionID, argument);
+      if (argument !== "status" && !(await changeMode(deps, sessionID, argument))) return;
       await reportStatus(deps, sessionID);
     } catch (error) {
       deps.debug("command.error", error, { sessionID });
@@ -813,15 +817,17 @@ function createAutoModeCommand(deps: CommandDeps) {
   };
 }
 
-async function changeMode(deps: CommandDeps, sessionID: string, argument: string): Promise<void> {
+/** Returns false when invalid configuration already answered the request. */
+async function changeMode(deps: CommandDeps, sessionID: string, argument: string): Promise<boolean> {
   const current = argument ? undefined : await deps.snapshot(sessionID);
   const target = argument || (current?.mode === "on" ? "off" : "on");
   if (!deps.valid && target === "on") {
     const detail = deps.configError ?? "invalid configuration";
     await deps.ctx.session.synthetic({ sessionID, text: `${INVALID_CONFIG_ACTION}: ${detail}` });
-    return;
+    return false;
   }
   await deps.setSessionMode(sessionID, target as "on" | "off", true);
+  return true;
 }
 
 async function reportStatus(deps: CommandDeps, sessionID: string): Promise<void> {
