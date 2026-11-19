@@ -1249,3 +1249,120 @@ it("does not ask a model to approve skill loading or override native skill denie
     assert.equal(host.calls.context, 0);
   } finally { await host.cleanup(); }
 });
+
+it("applies the verdict and releases the review in the same turn at the commit boundary", async () => {
+  for (const hops of [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]) {
+    const host = await setup();
+    const RealAbortController = globalThis.AbortController;
+    try {
+      const input = { ...event(), message: "native ask message" };
+      const save = host.ctx.storage.set;
+      let armed = false;
+      let effectAtOff: Evaluation["effect"] | undefined;
+      let off: Promise<unknown> | undefined;
+      host.ctx.storage.set = async (key, state) => {
+        await save(key, state);
+        if (armed || state.counts.allow === 0) return;
+        armed = true;
+        let dispatch = () => { effectAtOff = input.effect; off = host.setMode("off"); };
+        for (let hop = 0; hop < hops; hop++) { const next = dispatch; dispatch = () => queueMicrotask(next); }
+        queueMicrotask(dispatch);
+      };
+      let aborts = 0;
+      globalThis.AbortController = class TrackedAbortController extends RealAbortController {
+        abort() { aborts++; super.abort(); }
+      } as typeof AbortController;
+      const evaluation = host.evaluate(input);
+      globalThis.AbortController = RealAbortController;
+      await evaluation;
+      await until(() => off !== undefined);
+      await off;
+      assert.ok(armed, `hops ${hops}: final commit observed`);
+      // An off that still sees the native effect wins and restores the counts.
+      if (effectAtOff === "ask") {
+        assert.equal(input.effect, "ask", `hops ${hops}: off wins`);
+        assert.deepEqual(statusOf(await host.status()).counts, { allow: 0, ask: 0, deny: 0 }, `hops ${hops}: counts restored`);
+      } else {
+        // An off that observes the applied verdict must find the review already released.
+        assert.equal(aborts, 1, `hops ${hops}: verdict applied before release`);
+      }
+    } finally {
+      globalThis.AbortController = RealAbortController;
+      await host.cleanup();
+    }
+  }
+});
+
+it("records and publishes before teardown queued by the release abort can run", async () => {
+  const host = await setup({ audit: { enabled: true } });
+  const RealAbortController = globalThis.AbortController;
+  const controllers: AbortController[] = [];
+  const observed: { published: number; recorded: number }[] = [];
+  try {
+    globalThis.AbortController = class TrackedAbortController extends RealAbortController {
+      constructor() { super(); controllers.push(this); }
+    } as typeof AbortController;
+    const input = { ...event("allow"), message: "native allow message" };
+    const evaluation = host.evaluate(input);
+    globalThis.AbortController = RealAbortController;
+    assert.equal(controllers.length, 1);
+    // Teardown triggered by the review's own release abort runs a microtask later.
+    controllers[0]!.signal.addEventListener("abort", () => {
+      queueMicrotask(() => observed.push({
+        published: host.published.length,
+        recorded: host.records().filter((record) => record.proposedDecision !== undefined).length,
+      }));
+    });
+    await evaluation; await tick();
+    assert.deepEqual(observed, [{ published: 1, recorded: 1 }]);
+  } finally {
+    globalThis.AbortController = RealAbortController;
+    await host.cleanup();
+  }
+});
+
+it("rechecks cancellation after request preparation and before scoring starts", async () => {
+  const host = await setup({ audit: { enabled: true } });
+  const RealAbortController = globalThis.AbortController;
+  const controllers: AbortController[] = [];
+  const resources = ["return 42"];
+  try {
+    globalThis.AbortController = class TrackedAbortController extends RealAbortController {
+      constructor() { super(); controllers.push(this); }
+    } as typeof AbortController;
+    // The request's resource spread (second serialization: debug logs the
+    // event first) is the last step before the abort check; abort from a
+    // microtask so only a post-preparation recheck can see it.
+    let serialized = 0;
+    Object.defineProperty(resources, Symbol.iterator, { value: function* () {
+      yield "return 42";
+      if (++serialized === 2) queueMicrotask(() => controllers[0]!.abort());
+    } });
+    const input = { ...event("allow"), resources };
+    const evaluation = host.evaluate(input);
+    globalThis.AbortController = RealAbortController;
+    assert.equal(controllers.length, 1);
+    await evaluation;
+    assert.equal(input.effect, "ask");
+    assert.match(input.message!, /interrupted/);
+    assert.equal(host.records().some((record) => record.type === "score.before"), false);
+  } finally {
+    globalThis.AbortController = RealAbortController;
+    await host.cleanup();
+  }
+});
+
+it("a blocked mode change with invalid config emits only the disabled message", async () => {
+  const host = await setup({ classifiers: [{ type: "unknown" }] });
+  try {
+    for (const command of ["on", ""]) {
+      const seen = host.synthetic.length;
+      await host.command(command);
+      const replies = host.synthetic.slice(seen) as { text: string }[];
+      assert.equal(replies.length, 1, command);
+      assert.match(replies[0].text, /Invalid|disabled/i);
+      assert.doesNotMatch(replies[0].text, /Auto mode: invalid/);
+    }
+    assert.equal(host.shared.size, 0);
+  } finally { await host.cleanup(); }
+});
