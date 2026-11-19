@@ -16,7 +16,8 @@ import { codeModeIdentityRegression } from "./code-mode-identity.js";
 // Never patch global fetch or redirect a production provider to a fixture.
 type Verdict = "allow" | "deny" | "ask";
 type DecisionMode = Verdict | "low" | "invalid" | "timeout";
-type Profile = { reviewer?: string; sameModelReviewer?: boolean; timeout?: boolean; reviewerFailure?: boolean; decision?: DecisionMode; tool?: FixtureTool; issued?: boolean };
+type FactMode = "allow" | "low" | "malformed";
+type Profile = { reviewer?: string; sameModelReviewer?: boolean; timeout?: boolean; reviewerFailure?: boolean; decision?: DecisionMode; fact?: FactMode; tool?: FixtureTool; issued?: boolean };
 // Heavy first-request scoring can take over a second on a loaded machine. Keep
 // the scratch whole-review deadline above that startup cost; stage-local
 // timeout tests below still set their own short timeoutMs.
@@ -77,6 +78,58 @@ function openAiAnswers(mode: DecisionMode) {
   return [{ type: "predicate", name: "safety", probability: probabilities.safety },
     { type: "predicate", name: "authorization", probability: probabilities.authorization }];
 }
+const OPERATION_KIND_VALUES = ["test_run", "repository_read", "local_branch_create", "history_rewrite", "other"];
+const INSPECTION_VALUES = ["false", "true"];
+function sortedKeys(value: Record<string, unknown> | undefined): string[] {
+  return Object.keys(value ?? {}).sort();
+}
+/** System One encodes choice questions as a criteria map keyed by String(value). */
+function assertChoiceQuestion(question: SystemOneQuestion | undefined, values: readonly string[]) {
+  assert.equal(question?.type, "choice", "native SDK lowered a choice question into System One");
+  assert.deepEqual(sortedKeys(question?.criteria), [...values].sort());
+}
+function inspectionAnswer(mode: FactMode) {
+  // Binary choices stay typed booleans in the native SDK: the wire keys are the
+  // strings "true"/"false", mapped back to boolean values before plugin parsing.
+  return mode === "low"
+    ? { type: "choice", choice: "false", probabilities: { true: 0.3, false: 0.7 }, confidence: 0.7 }
+    : { type: "choice", choice: "true", probabilities: { true: 0.98, false: 0.02 }, confidence: 0.95 };
+}
+function operationKindAnswer() {
+  return { type: "choice", choice: "test_run",
+    probabilities: { test_run: 0.4, repository_read: 0.2, local_branch_create: 0.1, history_rewrite: 0.1, other: 0.2 },
+    confidence: 0.6 };
+}
+function factReviewAnswers(mode: FactMode) {
+  return {
+    safety: { type: "noul", noul: 0.98 },
+    // A malformed distribution is native-wire valid but fails the plugin's
+    // strict allow/review parse, so the configured LLM must decide.
+    authorization: { type: "choice", choice: "allow", confidence: 0.95,
+      probabilities: mode === "malformed" ? { allow: 0.98 } : { allow: 0.99, review: 0.01 } },
+  };
+}
+function handleFactInspection(res: ServerResponse, body: SystemOneBody) {
+  calls.push("fact-inspection");
+  assertChoiceQuestion(body.questions.inspection, INSPECTION_VALUES);
+  const mode = profile.fact;
+  assert.ok(mode, "fact fixture mode configured");
+  sendJson(res, { model: "decision", answers: { inspection: inspectionAnswer(mode) } });
+}
+function handleFactOperationKind(res: ServerResponse, body: SystemOneBody) {
+  calls.push("fact-operation-kind");
+  assertChoiceQuestion(body.questions.operation_kind, OPERATION_KIND_VALUES);
+  assert.equal(profile.fact, "low", "operation kind is the second stage of a low inspection fact");
+  sendJson(res, { model: "decision", answers: { operation_kind: operationKindAnswer() } });
+}
+function handleFactReview(res: ServerResponse, body: SystemOneBody) {
+  calls.push("fact-review");
+  assert.equal(body.questions.safety?.type, "noul");
+  assertChoiceQuestion(body.questions.authorization, ["allow", "review"]);
+  const mode = profile.fact;
+  assert.ok(mode, "fact fixture mode configured");
+  sendJson(res, { model: "decision", answers: factReviewAnswers(mode) });
+}
 function handleDecisionSystemOne(res: ServerResponse, body: SystemOneBody) {
   calls.push("decision");
   // System One keys answers by the exact predicate question names and uses
@@ -93,7 +146,14 @@ function handleSystemOne(res: ServerResponse, body: SystemOneBody) {
   assert.equal(body.model, "decision");
   assert.ok(body.state, "native SDK lowered input into decision state");
   const names = Object.keys(body.questions).sort().join(",");
+  if (names === "inspection") return handleFactInspection(res, body);
+  if (names === "operation_kind") return handleFactOperationKind(res, body);
   assert.equal(names, "authorization,safety");
+  // Fact review keeps the native predicate safety question and adds the
+  // inspection-specific authorization choice. The legacy invalid-decision
+  // fixture is the inverse (choice safety, noul authorization).
+  if (body.questions.safety?.type === "noul" && body.questions.authorization?.type === "choice")
+    return handleFactReview(res, body);
   return handleDecisionSystemOne(res, body);
 }
 function handleOpenAiDecisions(req: IncomingMessage, res: ServerResponse, body: OpenAiDecisionBody) {
@@ -470,8 +530,8 @@ async function sharedAuditRegression() {
   assert.notEqual(last.instanceID, owner.instanceID, "fresh session is captured by a successor, not the disposed owner");
   assert.deepEqual(calls, []);
 }
-async function expectPermission(f: Fixture, expected: Verdict, resources = ["scp sample.txt destination:sample.txt"], action = "shell") {
-  const response = await permission(f, resources, action);
+async function expectPermission(f: Fixture, expected: Verdict, resources = ["scp sample.txt destination:sample.txt"], action = "shell", metadata: Record<string, unknown> = { integration: true }) {
+  const response = await permission(f, resources, action, metadata);
   assert.equal(response.effect, expected, `${action}: ${resources.join(";")}`);
   const pending = (await api(`/api/session/${f.sessionID}/permission`)).data;
   assert.equal(pending.some((p: { id: string }) => p.id === response.id), expected === "ask");
@@ -504,6 +564,30 @@ async function setMode(f: Fixture, mode: "on" | "off" | "resume") {
 async function summary(f: Fixture) {
   return (await until(async () => auditRecords(f), records => records.some(record => record.reviewID && typeof record.decision === "string")))
     .findLast(record => record.reviewID && typeof record.decision === "string")!;
+}
+/** Explicitly opted-in fact review; static first keeps the ordinary pipeline shape. */
+function factClassifiers(staticStage = true) {
+  return { classifiers: [
+    ...(staticStage ? [{ type: "static" }] : []),
+    { type: "fact-review", model: "fixture-decision/decision", minConfidence: 0.9 },
+    { type: "llm", model: `${FIXTURE_PROVIDER}/${FIXTURE_REVIEWER_MODEL}` },
+  ] };
+}
+function nativeDecisionPayloads(f: Fixture, reviewID: unknown): Record<string, unknown>[] {
+  return auditRecords(f).filter(record => record.reviewID === reviewID && record.type === "generate.decisions.before")
+    .map(record => record.payload as Record<string, unknown>);
+}
+function nativeQuestionNames(payload: Record<string, unknown>): string[] {
+  const questions = payload.questions;
+  return Array.isArray(questions) ? questions.map(question => String((question as { name?: unknown }).name)) : [];
+}
+/** Raw local audit only: assert exact native call count and question names. */
+async function factStageAudit(f: Fixture, expectedNativeCalls: number) {
+  const record = await summary(f);
+  const payloads = expectedNativeCalls === 0 ? nativeDecisionPayloads(f, record.reviewID)
+    : await until(async () => nativeDecisionPayloads(f, record.reviewID), value => value.length >= expectedNativeCalls);
+  assert.equal(payloads.length, expectedNativeCalls, "one raw native request per fact-stage call");
+  return { record, payloads, questions: payloads.map(nativeQuestionNames) };
 }
 async function run(name: string, test: () => Promise<void>) {
   if (process.env.OPENCODE_INTEGRATION_FILTER && !name.includes(process.env.OPENCODE_INTEGRATION_FILTER)) return;
@@ -667,6 +751,58 @@ try {
       // from the decision stage; the LLM fallback, not the decision stage, decides.
       assert.equal((await summary(f)).stage, mode === "allow" ? "decision" : "reviewer");
     });
+  await run("native fact review allows a high-confidence inspection", async () => {
+    const f = await fixture(factClassifiers()); profile.fact = "allow"; calls.length = 0; reviewerInputs.length = 0;
+    // The invented marker must never reach native generation: fact evidence
+    // selects normalized operation fields only, never raw metadata secrets.
+    await expectPermission(f, "allow", ["git log"], "shell",
+      { integration: true, command: "git log", secret: "fixture-not-a-real-secret" });
+    assert.deepEqual(calls, ["fact-inspection", "fact-review"]);
+    const { record, payloads, questions } = await factStageAudit(f, 2);
+    assert.equal(record.stage, "fact-review"); assert.equal(record.decision, "allow");
+    assert.deepEqual(questions, [["inspection"], ["safety", "authorization"]],
+      "inspection first, then safety predicate plus the inspection authorization choice");
+    assert.equal(JSON.stringify(payloads).includes("fixture-not-a-real-secret"), false,
+      "raw metadata never reaches native generation");
+    assert.deepEqual(reviewerInputs, [], "confident native fact review does not call the LLM");
+    await status(f);
+  });
+  await run("fact review low fact falls back to the LLM reviewer", async () => {
+    const f = await fixture(factClassifiers()); profile.fact = "low";
+    profile.reviewer = "ALLOW: fixture low fact fallback authorized"; calls.length = 0;
+    await expectPermission(f, "allow", ["bun test"], "shell", { integration: true, command: "bun test" });
+    assert.deepEqual(calls, ["fact-inspection", "fact-operation-kind", "reviewer"]);
+    const { record, questions } = await factStageAudit(f, 2);
+    assert.equal(record.stage, "reviewer"); assert.equal(record.decision, "allow");
+    assert.deepEqual(questions, [["inspection"], ["operation_kind"]],
+      "a non-inspection shell operation gets only the five-label second stage, never a review");
+  });
+  await run("fact review malformed native review falls back to the LLM reviewer", async () => {
+    const f = await fixture(factClassifiers()); profile.fact = "malformed";
+    profile.reviewer = "ALLOW: fixture malformed review fallback authorized"; calls.length = 0;
+    await expectPermission(f, "allow", ["git log"], "shell", { integration: true, command: "git log" });
+    assert.deepEqual(calls, ["fact-inspection", "fact-review", "reviewer"]);
+    const { record, questions } = await factStageAudit(f, 2);
+    assert.equal(record.stage, "reviewer"); assert.equal(record.decision, "allow");
+    assert.deepEqual(questions, [["inspection"], ["safety", "authorization"]]);
+  });
+  await run("fact review protected path guard makes no fact call", async () => {
+    const f = await fixture(factClassifiers()); calls.length = 0;
+    await expectPermission(f, "deny", [".env"], "edit");
+    assert.deepEqual(calls, [], "protected path is denied before any fact classifier");
+    const { record, payloads } = await factStageAudit(f, 0);
+    assert.equal(record.stage, "score"); assert.equal(record.decision, "deny");
+    assert.deepEqual(payloads, []);
+  });
+  await run("fact review local edit without body capture falls back to the LLM reviewer", async () => {
+    const f = await fixture(factClassifiers(false)); profile.reviewer = "ALLOW: fixture local edit fallback authorized";
+    calls.length = 0;
+    await expectPermission(f, "allow", ["sample.txt"], "edit");
+    assert.deepEqual(calls, ["reviewer"], "disabled body capture makes no native fact call");
+    const { record, payloads } = await factStageAudit(f, 0);
+    assert.equal(record.stage, "reviewer"); assert.equal(record.decision, "allow");
+    assert.deepEqual(payloads, []);
+  });
   for (const mode of ["invalid", "timeout"] as const) await run(`native decision ${mode} has categorized summary audit`, async () => {
     // The OpenAI decisions array can carry a native-valid non-predicate answer,
     // so the plugin, not the SDK wire schema, rejects the invalid case.

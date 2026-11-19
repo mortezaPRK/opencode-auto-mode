@@ -2,11 +2,12 @@ import { randomUUID } from "node:crypto";
 import { Plugin } from "@opencode/plugin";
 import type { Agent } from "@opencode/schema/agent";
 import type { Session } from "@opencode/schema/session";
-import { DEFAULT_AUDIT_MAX_BYTES, DEFAULT_REVIEW_TIMEOUT_MS, parseOptions, type ClassifierOptions } from "./config.js";
+import { DEFAULT_AUDIT_MAX_BYTES, DEFAULT_FACT_REVIEW_CONFIDENCE, DEFAULT_REVIEW_TIMEOUT_MS, parseOptions, type ClassifierOptions } from "./config.js";
 import { collectAuthority, DEFAULT_AUTHORITY_MAX_BYTES, DEFAULT_AUTHORITY_MAX_DEPTH, type AuthorityLookups, type AuthoritySessionInfo } from "./authority.js";
-import { reviewRequest, type PermissionRequest, type ReviewResult } from "./reviewer.js";
-import { decisionStage } from "./decision.js";
+import { reviewRequest, type PermissionRequest, type ReviewResult, type StageResult } from "./reviewer.js";
+import { decisionStage, type DecisionContext } from "./decision.js";
 import { runClassifiers } from "./classifier.js";
+import { reviewWithOperationFact } from "./fact-review.js";
 import { permissionContext } from "./permission-context.js";
 import { scoreRequest } from "./score.js";
 import { loadGlobalOptions } from "./global-options.js";
@@ -636,6 +637,7 @@ async function runReviewStages(
     signal: handle.signal,
     decision: (stage) => stageCall(stage, (index) => decisionStage(native(index), stage, request, handle.signal, (error) => deps.debug("classifier.validation.error", error, { ...meta.correlation, stageIndex: index }))),
     llm: (stage) => stageCall(stage, (index) => reviewRequest(native(index), request, stage.model, handle.signal, stage.timeoutMs ?? deps.reviewTimeoutMs, (error) => deps.debug("classifier.validation.error", error, { ...meta.correlation, stageIndex: index }))),
+    factReview: (stage) => stageCall(stage, (index) => factReviewStage(native(index), stage, request, handle.signal, deps.reviewTimeoutMs)),
     onResult: (stage, outcome, stageIndex) => {
       if (stage.type === "static") { deps.debug("classifier.start", stage, { ...meta.correlation, stageIndex }); deps.debug("classifier.end", outcome, { ...meta.correlation, stageIndex }); }
       deps.debug("classifier", { stage, outcome }, { ...meta.correlation, stageIndex });
@@ -854,6 +856,38 @@ function unavailableAuthorization(error: unknown): never {
 function lostToolCapture(event: { action: string; source?: unknown }, capture: unknown): boolean {
   return capture === undefined && event.action !== "execute" &&
     isRecord(event.source) && event.source.type === "tool";
+}
+
+/** Opt-in native fact review. Body capture stays disabled: this plugin has no
+ * consent or host-minted payload, so edit facts abstain to the next stage. */
+function factReviewStage(
+  ctx: DecisionContext,
+  stage: Extract<ClassifierOptions, { type: "fact-review" }>,
+  request: PermissionRequest,
+  signal: AbortSignal,
+  timeoutMs: number,
+): Promise<StageResult> {
+  return reviewWithOperationFact(ctx, {
+    model: stage.model,
+    timeoutMs: stage.timeoutMs ?? timeoutMs,
+    minConfidence: stage.minConfidence ?? DEFAULT_FACT_REVIEW_CONFIDENCE,
+    includeEditPayload: false,
+  }, factReviewRequest(request), signal);
+}
+
+/** The fact snapshot rejects explicit undefined members; do not mutate the
+ * request shared with later stages. */
+function definedFields<T extends object>(value: T): T {
+  return Object.fromEntries(Object.entries(value).filter(([, item]) => item !== undefined)) as T;
+}
+
+function factReviewRequest(request: PermissionRequest): PermissionRequest {
+  const { staticAnalysis, gitState } = request;
+  return {
+    ...request,
+    ...(staticAnalysis === undefined ? {} : { staticAnalysis: definedFields({ ...staticAnalysis }) }),
+    ...(gitState === undefined ? {} : { gitState: definedFields({ ...gitState }) }),
+  };
 }
 
 /** Root user messages stay the only authority; delegated prompts are separate

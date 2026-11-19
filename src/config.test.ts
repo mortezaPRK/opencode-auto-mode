@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { parseOptions, DEFAULT_REVIEW_TIMEOUT_MS, DEFAULT_AUDIT_MAX_BYTES } from "./config.js";
+import { parseOptions, DEFAULT_REVIEW_TIMEOUT_MS, DEFAULT_AUDIT_MAX_BYTES, MIN_FACT_REVIEW_CONFIDENCE, DEFAULT_FACT_REVIEW_CONFIDENCE } from "./config.js";
 
 const model = "test-provider/test-model";
 const staticOnly = { classifiers: [{ type: "static" as const }] };
@@ -159,5 +159,48 @@ describe("auto-mode options", () => {
     assert.equal(options.tui, false);
     assert.deepEqual(options.audit, { enabled: true, maxBytes: 2048 });
     assert.equal(options.allowInProjectEdits, true);
+  });
+});
+
+describe("fact-review classifier options", () => {
+  const withModel = (extra: Record<string, unknown> = {}) => ({ type: "fact-review", model, ...extra });
+
+  it("requires a model and rejects keys outside the native stage", () => {
+    assert.deepEqual(parseOptions({ classifiers: [withModel()] }).classifiers, [{ type: "fact-review", model }]);
+    assert.equal(errorOf({ classifiers: [{ type: "fact-review" }] }), "Invalid auto-mode classifier model");
+    for (const stage of [{ type: "fact-review", model: "" }, { type: "fact-review", model: 42 },
+      { type: "fact-review", model: "not-a-model" }, { type: "fact-review", model, allowInProjectEdits: true }])
+      assert.throws(() => parseOptions({ classifiers: [stage] }));
+    for (const key of ["allowInProjectEdits", "includeEditPayload", "editPayload", "userBody", "body"])
+      assert.equal(errorOf({ classifiers: [withModel({ [key]: true })] }), `Unknown auto-mode option '${key}'`);
+  });
+
+  it("rejects confidence below the native 0.8 floor", () => {
+    assert.equal(MIN_FACT_REVIEW_CONFIDENCE, 0.8);
+    assert.equal(DEFAULT_FACT_REVIEW_CONFIDENCE, 0.9);
+    for (const minConfidence of [0, 0.5, 0.79, 0.799, -0.1, 1.01, NaN, Infinity, "0.9", null])
+      assert.equal(errorOf({ classifiers: [withModel({ minConfidence })] }), "Invalid auto-mode fact-review minConfidence");
+  });
+
+  it("accepts 0.8, higher confidence and existing timeout bounds", () => {
+    for (const minConfidence of [0.8, 0.9, 0.95, 1])
+      assert.deepEqual(parseOptions({ classifiers: [withModel({ minConfidence })] }).classifiers,
+        [{ type: "fact-review", model, minConfidence }]);
+    for (const timeoutMs of [1, 120_000])
+      assert.deepEqual(parseOptions({ classifiers: [withModel({ timeoutMs, minConfidence: 0.9 })] }).classifiers,
+        [{ type: "fact-review", model, timeoutMs, minConfidence: 0.9 }]);
+    for (const timeoutMs of [0, -1, 120_001, 1.5, NaN, "1000"])
+      assert.equal(errorOf({ classifiers: [withModel({ timeoutMs })] }), "Invalid auto-mode classifier timeoutMs");
+  });
+
+  it("preserves configured order with other stages", () => {
+    const classifiers = [
+      { type: "fact-review" as const, model, minConfidence: 0.9 },
+      { type: "decision" as const, model },
+      { type: "static" as const },
+      { type: "fact-review" as const, model },
+    ];
+    assert.deepEqual(parseOptions({ classifiers }).classifiers, classifiers);
+    assert.equal(parseOptions({ classifiers }).allowInProjectEdits, true);
   });
 });

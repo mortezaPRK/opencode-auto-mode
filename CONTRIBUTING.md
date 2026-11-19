@@ -22,6 +22,7 @@ review expectations.
 | `src/authority.ts` | Root user-authority collection: follows the parent chain to the root within 16 sessions, rejects cycles, keeps root user messages as authority and descendant prompts as separate nonauthority delegation context, and enforces the combined 12 KB text budget. Missing, cyclic, overdeep, or oversized evidence is terminal. |
 | `src/decision.ts`, `src/decision-evidence.ts` | Native typed decision stage using `ctx.experimental.generate.decisions`, plus the compact evidence builder shared with replay. |
 | `src/decision-facts.ts`, `src/edit-capture.ts`, `src/edit-fact.ts` | Opt-in operation-fact classification (`inspection`, shell `test_run`, bounded `local_edit`) and factory-minted edit capture identity; a splittable shell command asks `inspection` per segment with `segment_local` only below the floor and may fold one confined leading literal `cd`. Per-segment asks also carry the whole command as `fullCommand` context, and an unsplittable command whose `operation_kind` does not certify gets one `command_local` ask that can only certify its own `command_local` kind for the full review. A fact is evidence, never permission or consent. |
+| `src/fact-review.ts`, `src/fact-review-input.ts`, `src/fact-verdict.ts` | Experimental fact-review stage: frozen request snapshot and preflight, frozen `safety`/`authorization` review questions (a certified read-only `inspection` with zero static findings, and likewise a project-local `shell_segments` fact with zero findings, are allowed on the fact alone without review), certified-fact source hash and provider-reported model label, and strict floor in the `0.8`-`1` range (default `0.9`). Allows or abstains only; never denies. |
 | `src/reviewer.ts` | LLM reviewer prompt, evidence filtering, response parsing, and deny-gate behavior. |
 | `src/code-mode.ts` | Code Mode SHA-256 identity, save entry, identity validation, and reviewer source resource. |
 | `src/mode.ts` | Durable per-session mode, daily counts, breaker window, and cancellation repair. |
@@ -119,6 +120,7 @@ Focused checks while touching docs, scripts, or a narrow module:
 
 ```sh
 bun test src/score.test.ts src/score-security.test.ts src/shell.test.ts
+bun test src/fact-review.test.ts src/fact-verdict.test.ts
 bun test scripts/no-personal-defaults.test.ts scripts/replay.test.ts
 bunx eslint scripts/replay.ts scripts/replay.test.ts scripts/no-personal-defaults.test.ts
 git diff --check
@@ -176,6 +178,29 @@ Test files (`*.test.ts`, `*.test.tsx`) are exempt.
     project options;
   - hand-written guards belong in `scoreRequest`; classifiers must not override
     mandatory score deny/ask effects;
+  - fact review is evidence-only: a certified fact and edit-capture identity
+    never grant permission; fact-review
+    `minConfidence` accepts `0.8`-`1` (default `0.9`), a consented host-minted
+    bounded edit body that certifies `local_edit` at or above the floor is
+    included as `changeContent` and the edit is allowed only if the fact,
+    `safety`, and `allow` gates all clear, a certified read-only `inspection`
+    with zero static findings is allowed on the fact alone without a review call,
+    an `edit` action whose targets all canonicalize inside the worktree and
+    outside `.git`, `.jj`, `node_modules` and secret-like basenames is asked one
+    metadata-only `edit_in_project` question and `true` at or above the floor
+    certifies `project_edit` and allows without review (`external_directory`,
+    escaping targets, static findings and the `write` action keep the prior
+    abstain), a complete non-shell, non-file tool call asks one frozen
+    `tool_readonly` choice with its tool and arguments (the captured Code Mode
+    script for `execute`) and certifies `inspection` on `true` at or above the
+    floor while a complete `subagent`/`task` delegation with a non-empty prompt
+    certifies `delegation` with no fact call and only the frozen
+    `authorization` review (child actions are reviewed separately), every other
+    kind and any inspection
+    with findings or without static analysis keeps the full
+    `safety`/`authorization` review, and edit-body capture remains a host API
+    opt-in rather than a config option (`src/index.ts` keeps
+    `includeEditPayload` `false`);
   - Code Mode identity is the exact SHA-256 of the source, metadata must validate
     that identity, and the source is supplied to reviewers as a resource.
 - Do not reintroduce removed features: shadow mode, custom rules, unconfigured

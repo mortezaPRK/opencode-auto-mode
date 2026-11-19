@@ -8,6 +8,8 @@ export interface ClassifierCallbacks {
   signal?: AbortSignal;
   decision(stage: Extract<ClassifierOptions, { type: "decision" }>, request: PermissionRequest): Promise<StageResult>;
   llm(stage: Extract<ClassifierOptions, { type: "llm" }>, request: PermissionRequest): Promise<StageResult>;
+  /** Optional host binding; a configured stage without it abstains instead of failing the pipeline. */
+  factReview?(stage: Extract<ClassifierOptions, { type: "fact-review" }>, request: PermissionRequest): Promise<StageResult>;
   onResult?(stage: ClassifierOptions, result: StageResult, index: number): void;
 }
 
@@ -73,9 +75,11 @@ async function runStage(stage: ClassifierOptions, request: PermissionRequest, sc
 async function executeStage(stage: ClassifierOptions, request: PermissionRequest, score: RequestScore,
   callbacks: ClassifierCallbacks): Promise<StageResult> {
   if (stage.type === "static") return staticResult(stage, request, score);
-  // Decisions and LLMs see any unresolved band; never silently reorder or insert stages.
+  // Decisions, LLMs and fact review see any unresolved band; never silently reorder or insert stages.
   if (stage.type === "decision") return await callbacks.decision(stage, request);
-  return await callbacks.llm(stage, request);
+  if (stage.type === "llm") return await callbacks.llm(stage, request);
+  if (callbacks.factReview === undefined) return unavailableFactReview();
+  return await callbacks.factReview(stage, request);
 }
 
 function staticResult(stage: Extract<ClassifierOptions, { type: "static" }>, request: PermissionRequest,
@@ -84,6 +88,10 @@ function staticResult(stage: Extract<ClassifierOptions, { type: "static" }>, req
   return score.band === "low" && !editsDisabled
     ? { decision: "allow", reason: score.reason, stage: "static" }
     : { decision: "abstain", reason: "Static classifier requires further review", stage: "static" };
+}
+
+function unavailableFactReview(): StageResult {
+  return { decision: "abstain", stage: "fact-review", reason: "Fact review is unavailable", errorKind: "provider" };
 }
 
 function retainRationale(type: string, result: StageResult, previous?: StageResult): StageResult {

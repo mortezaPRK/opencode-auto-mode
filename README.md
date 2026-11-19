@@ -10,14 +10,17 @@ invalid configuration fail closed.
 ## Requirements
 
 - OpenCode V2. The checked-in plugin SDK and schema targets OpenCode `2.2.0`.
-- Model references only if you use `decision` or `llm` classifier stages. Models
-  and provider credentials belong in your personal OpenCode provider config.
-  This repository supplies no model, endpoint, credential, or allowlist.
-- **Data egress:** a configured `decision` or `llm` stage sends
+- Model references only if you use `decision`, `fact-review`, or `llm`
+  classifier stages. Models and provider credentials belong in your personal
+  OpenCode provider config. This repository supplies no model, endpoint,
+  credential, or allowlist.
+- **Data egress:** a configured `decision`, `fact-review`, or `llm` stage sends
   the action and resources (including full Code Mode source), project/worktree,
   and up to 12 KB of combined root and delegated user text to that model's
   provider, even with audit off. The decision stage sends compact evidence plus
-  selected operation details. The llm stage also
+  selected operation details. The fact-review stage first sends operation-only
+  classification evidence without user text, then, only for a certified fact,
+  the same compact review evidence as the decision stage. The llm stage also
   receives the agent, broader bounded evidence, and Git state. The decision
   stage includes Git state only for git-related actions. Choose a provider you
   trust.
@@ -117,7 +120,7 @@ ordered stages, with at most one `static` stage.
 
 | Option | Default | Contract |
 | --- | --- | --- |
-| `classifiers` | required | Ordered `static`, `decision`, and `llm` stages. No default list and no unconfigured mode. |
+| `classifiers` | required | Ordered `static`, `decision`, `fact-review`, and `llm` stages. No default list and no unconfigured mode. |
 | `reviewTimeoutMs` | `15000` | Whole-review deadline; integer 1–120000. |
 | `breaker` | `3 / 10 / 50` | `{consecutiveDenies, windowDenies, windowSize}`. All three keys are required when supplied. |
 | `tui` | `true` | Show or hide the TUI indicator. UI-only; review still runs server-side. |
@@ -129,6 +132,7 @@ Stage shapes:
 | --- | --- |
 | `static` | `{ "type": "static", "allowInProjectEdits"?: boolean }` |
 | `decision` | `{ "type": "decision", "model": "<provider>/<model>", "timeoutMs"?: number, "minConfidence"?: number }`. Allows only when both `safety` and `authorization` predicates meet `minConfidence` (default `0.9`); otherwise abstains. |
+| `fact-review` | `{ "type": "fact-review", "model": "<provider>/<model>", "timeoutMs"?: number, "minConfidence"?: number }`. Experimental and opt-in. `minConfidence` defaults to `0.9` and values below `0.8` are rejected. See [Fact review](#fact-review-experimental). |
 | `llm` | `{ "type": "llm", "model": "<provider>/<model>", "timeoutMs"?: number }` |
 
 ## How review works
@@ -151,8 +155,11 @@ Stage shapes:
    checked separately.
 4. Configured classifiers run in array order. A static stage may resolve low-risk
    work; a decision stage uses OpenCode's native decision API and allows only
-   when both predicate probabilities clear the threshold; an LLM stage uses its
-   explicit reviewer. The first decisive allow or deny stops the chain.
+   when both predicate probabilities clear the threshold; a fact-review stage
+   certifies an operation fact and either allows a certified read-only
+   inspection or runs a separate safety/authorization review; an
+   LLM stage uses its explicit reviewer. The first decisive allow or deny stops
+   the chain.
 5. Exhaustion, unusable context, interruption, failure, or timeout resolves to
    **ask**. A deny ends with `Continue with a safer alternative.`
 
@@ -239,6 +246,92 @@ infer semantics from the exact tool and arguments, but there is no declared
 verification. An ordinary abstain is not a deny: later stages may still allow,
 deny, or ask. LLM output is not ground truth. Malformed output, provider errors,
 timeouts, and exhaustion end in **ask** when no later stage decides.
+
+### Fact review (experimental)
+
+`fact-review` is an explicit opt-in stage. It is not in the default
+`[static, llm]` example, is never inserted automatically, and requires a provider
+that supports native decision questions of both `choice` and `predicate` types.
+The plugin never adds the stage or edits global config. The classifier list
+remains authoritative; omitting the stage leaves existing defaults and stage
+order unchanged.
+
+```jsonc
+{ "type": "fact-review", "model": "<provider>/<model>", "minConfidence": 0.9 }
+```
+
+For non-edit requests, the stage first classifies only what the operation is:
+one `inspection` choice. A complete non-shell, non-file tool call instead asks
+one `tool_readonly` choice with its tool name and captured arguments (for a Code
+Mode `execute` call, the captured script), and `true` at or above the floor
+certifies the same read-only `inspection`. If inspection does not clear the floor (including a
+confident `false`), a splittable shell command is classified per segment: each
+segment gets the same `inspection` choice first, and only a segment below the
+floor gets `segment_local`, with one leading literal `cd` folded into the
+confined segment cwd. Every segment read-only certifies read-only `inspection`;
+otherwise every segment must be local at or above the floor. A command that
+cannot be split gets one `operation_kind` choice, where `test_run` or
+`repository_read` certifies. Per-segment questions also receive the whole
+command as `fullCommand` context, and an unsplittable command whose
+`operation_kind` does not certify gets one `command_local` choice, whose `true`
+certifies `command_local` and still requires the full review. A model-derived
+fact is certified only when its reported probability clears the threshold and its exact
+source-input hash and provider-reported model label are present. A certified read-only `inspection`
+with zero static analysis findings is allowed on that fact alone: no review call
+is made. A certified `shell_segments` fact with zero static analysis findings is
+likewise allowed on that fact alone as project-local, and keeps that full review
+with any finding or without static analysis. A certified metadata-only
+`project_edit` from the in-project `edit_in_project` question is also allowed on
+that fact alone. Every other
+certified fact receives the frozen `safety` and
+`authorization` review questions, and allows only when the fact probability, the
+raw `allow` probability, and `safety` all meet `minConfidence`; otherwise it
+abstains. A complete `subagent` or `task` delegation with a non-empty captured
+`prompt` is certified as `delegation` without a fact call and gets one review
+call with only the frozen `authorization` question, allowing only when the
+selected choice is `allow` and the raw `allow` probability meets
+`minConfidence`; child actions are reviewed separately. A certified `inspection` with any static finding, or without static
+analysis, also keeps that full review. The stage never denies. Mandatory score
+deny/ask guards run first and are never overridden by this stage. Unknown facts,
+missing source-input hash or model label, malformed output, low probabilities,
+provider errors, timeouts, cancellation, and later LLM-stage fallback continue
+to the next stage; the pipeline still asks when no stage decides. Terminal
+preflight loss (a protected path, redacted resources or delegations, or missing
+root authority) also resolves to **ask**.
+
+`timeoutMs` defaults to `reviewTimeoutMs` (`15000`), and classification plus
+review share that one deadline. `minConfidence` defaults to `0.9` and accepts
+`0.8` through `1`; lower values are rejected. Unlike the general decision stage
+it does not accept the full 0-1 range. A reported probability is not a
+calibrated certainty guarantee. No accuracy target, `80%`
+claim, or dataset statistic is made; small local samples are brittle and are not
+documented here.
+
+Fact classification receives operation evidence only: action, resources,
+selected operation details, and project/worktree, but no user messages or
+delegations. When the fact is certified and a review call is made, that call
+receives the same compact evidence as the decision stage, including root
+authority and delegation context
+under the existing 12 KB budget and `asOf` cutoff described in
+[Decision evidence and fallback](#decision-evidence-and-fallback). Root messages
+remain the only authority; delegations only narrow.
+
+Edit bodies are not configurable, and no plugin-config key enables body egress.
+`includeEditPayload` is a host API option, not a plugin-config key; an unknown
+option is rejected. With the plugin's default `false`, an `edit` action whose
+targets all resolve inside the worktree and outside `.git`, `.jj`,
+`node_modules` and secret-like names, with zero static findings, is asked one
+metadata-only `edit_in_project` question carrying only the tool,
+project-relative targets and project name, and `true` at or above the floor
+certifies `project_edit` and
+allows with no review call; every other edit-like request abstains and continues
+to the next stage. When a host enables `includeEditPayload` and a consented,
+host-minted, bounded edit body certifies `local_edit` at or above the floor,
+that same body is included as
+`changeContent` in the `safety`/`authorization` review, and the edit is allowed
+only if the fact, `safety`, and `allow` gates all clear. Fact review never
+permits an edit whose body it did not review. Audit behavior is unchanged:
+opt-in, local, and unredacted as described in [Audit](#audit).
 
 ## Safety limits
 
