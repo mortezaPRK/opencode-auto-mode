@@ -39,6 +39,47 @@ function matchesRegistration(value: string, configFile: string, identity: Packag
   try { return realpathSync(local) === identity.directory; } catch { return false; }
 }
 
+/** Read one user-owned global configuration file, or undefined when it is absent. */
+function readGlobalConfig(file: string, projectDir?: string): Record<string, unknown> | undefined {
+  try { lstatSync(file); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+  const config = parseJSONC(readUserOwnedFile(file, projectDir));
+  if (!object(config)) throw new Error("Global OpenCode configuration must be an object");
+  return config;
+}
+
+function registrationName(entry: unknown): string | undefined {
+  if (typeof entry === "string") return entry;
+  return object(entry) && typeof entry.package === "string" ? entry.package : undefined;
+}
+
+function registrationOptions(entry: unknown, name: string, configFile: string, identity: PackageIdentity): unknown {
+  // We cannot establish package identity through substitution without
+  // implementing the SDK's expansion. Reject rather than silently skip it.
+  if (hasSubstitution(name)) rejectSubstitutions(name);
+  if (!matchesRegistration(name, configFile, identity)) return undefined;
+  rejectSubstitutions(entry);
+  if (typeof entry === "string") return {};
+  if (!object(entry) || Object.keys(entry).some((key) => !["package", "options"].includes(key)))
+    throw new Error("Unknown global auto-mode registration fields");
+  return entry.options ?? {};
+}
+
+function globalRegistrations(configFile: string, projectDir: string | undefined, identity: PackageIdentity): unknown[] {
+  const config = readGlobalConfig(configFile, projectDir);
+  if (config === undefined || config.plugins === undefined) return [];
+  if (!Array.isArray(config.plugins)) throw new Error("Global plugins must be an array");
+  return config.plugins.flatMap((entry) => {
+    const name = registrationName(entry);
+    if (name === undefined) return [];
+    const options = registrationOptions(entry, name, configFile, identity);
+    return options === undefined ? [] : [options];
+  });
+}
+
 /** Safety options are read from user-owned global files, never merged SDK data.
  * No registration, duplicate registrations or ambiguous global files fail closed.
  * This function has no configurable path override: XDG_CONFIG_HOME is process
@@ -51,33 +92,7 @@ export function loadGlobalOptions(projectDir?: string): unknown {
   const base = process.env.XDG_CONFIG_HOME || join(homedir(), ".config");
   if (!isAbsolute(base)) throw new Error("XDG_CONFIG_HOME must be absolute");
   const files = [join(base, "opencode", "opencode.json"), join(base, "opencode", "opencode.jsonc")];
-  const registrations: unknown[] = [];
-  for (const file of files) {
-    try { lstatSync(file); }
-    catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
-      throw error;
-    }
-    const config = parseJSONC(readUserOwnedFile(file, projectDir));
-    if (!object(config)) throw new Error("Global OpenCode configuration must be an object");
-    if (config.plugins === undefined) continue;
-    if (!Array.isArray(config.plugins)) throw new Error("Global plugins must be an array");
-    for (const entry of config.plugins) {
-      const name = typeof entry === "string" ? entry : object(entry) ? entry.package : undefined;
-      if (typeof name !== "string") continue;
-      // We cannot establish package identity through substitution without
-      // implementing the SDK's expansion. Reject rather than silently skip it.
-      if (hasSubstitution(name)) rejectSubstitutions(name);
-      if (!matchesRegistration(name, file, identity)) continue;
-      rejectSubstitutions(entry);
-      if (typeof entry === "string") registrations.push({});
-      else {
-        if (!object(entry) || Object.keys(entry).some((key) => !["package", "options"].includes(key)))
-          throw new Error("Unknown global auto-mode registration fields");
-        registrations.push(entry.options ?? {});
-      }
-    }
-  }
+  const registrations = files.flatMap((file) => globalRegistrations(file, projectDir, identity));
   if (registrations.length !== 1)
     throw new Error(registrations.length === 0 ? "Auto-mode is not registered in user-owned global configuration" :
       "Ambiguous auto-mode global registrations");

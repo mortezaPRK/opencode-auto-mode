@@ -30,14 +30,22 @@ function explicitKind(error: unknown): ReviewErrorKind | undefined {
   return undefined;
 }
 
+function errorName(error: unknown): string {
+  return error instanceof Error ? error.name : "";
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : "";
+}
+
 /** Maps arbitrary thrown values to a bounded category without exposing provider text. */
 export function errorKindOf(error: unknown): ReviewErrorKind {
   // Only ReviewFailure marks malformed reviewer output. Provider text such as
   // "Invalid API key" stays a provider failure even when a wrapper reuses it.
   const explicit = explicitKind(error);
   if (explicit !== undefined) return explicit;
-  const name = error instanceof Error ? error.name : "";
-  const message = error instanceof Error ? error.message : "";
+  const name = errorName(error);
+  const message = errorMessage(error);
   // AbortSignal.timeout() aborts with a TimeoutError whose message also says
   // "aborted"; a provider's own timeout is not a user interruption.
   if (name === "TimeoutError" ||
