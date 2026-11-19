@@ -406,11 +406,32 @@ function cdpathSensitive(target: string): boolean {
   return !isAbsolute(target) && first !== "." && first !== "..";
 }
 
+const parentStep = (target: string): boolean => target.split(sep).includes("..");
+
+/** The explicit workdir spelling resolves through a symlink (or a parent step
+ * across one) when its physical path differs from its lexical form. Bash keeps
+ * the logical spelling, so a folded parent step from it deletes a path component
+ * of the spelling and lands elsewhere. */
+function logicalCwdDiverges(evidence: DecisionEvidence): boolean {
+  const args = evidence.operation?.arguments;
+  for (const key of WORKDIR_KEYS) {
+    const value = args?.[key];
+    if (typeof value !== "string") continue;
+    const target = absoluteTarget(value, evidence.projectDir);
+    const physical = target === undefined ? undefined : physicalPath(target);
+    return target === undefined || physical === undefined || physical !== resolve(target);
+  }
+  return false;
+}
+
 /** Folded leading `cd` resolved against the effective shell cwd with the same
  * containment as an explicit workdir; a `..` after a symlink has no usable cwd
- * because Bash's logical `cd` lands where the physical walk does not. */
+ * because Bash's logical `cd` lands where the physical walk does not. A parent
+ * step folded from a symlink-spelled explicit workdir is refused for the same
+ * reason: the canonical cwd already lost the spelling Bash folds logically. */
 function foldedCwd(target: string, cwd: string | undefined, evidence: DecisionEvidence): string | undefined {
   if (cdpathSensitive(target)) return undefined;
+  if (parentStep(target) && logicalCwdDiverges(evidence)) return undefined;
   const root = evidence.worktreeRoot ?? evidence.projectDir;
   if (root === undefined || !isAbsolute(root)) return undefined;
   const value = absoluteTarget(target, cwd);

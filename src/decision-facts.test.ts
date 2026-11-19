@@ -176,9 +176,13 @@ mkdirSync(join(SHELL_OUTSIDE, "deep"), { recursive: true });
 symlinkSync(SHELL_OUTSIDE, join(SHELL_ROOT, "link"));
 symlinkSync(join(SHELL_ROOT, "pkg", "sub"), join(SHELL_ROOT, "inner"));
 const SHELL_SUB = realpathSync(join(SHELL_ROOT, "sub"));
+const SHELL_ALIAS_PARENT = realpathSync(mkdtempSync(join(tmpdir(), "opencode-shell-alias-")));
+const SHELL_ALIAS = join(SHELL_ALIAS_PARENT, "alias");
+symlinkSync(SHELL_SUB, SHELL_ALIAS);
 after(() => {
   rmSync(SHELL_ROOT, { recursive: true, force: true });
   rmSync(SHELL_OUTSIDE, { recursive: true, force: true });
+  rmSync(SHELL_ALIAS_PARENT, { recursive: true, force: true });
 });
 
 /** A shell request whose evaluated root and cwd physically exist. */
@@ -770,6 +774,50 @@ it("abstains after inspection when a folded cd climbs past an internal symlink",
   assert.equal(result.errorKind, "context");
   assert.match(result.reason, /leading cd/);
   assert.equal(fake.calls(), 1);
+});
+
+it("abstains after inspection for a folded parent step from a symlinked workdir", async () => {
+  // /tmp/alias -> <root>/sub with inherited PWD=/tmp/alias: Bash folds `cd ..`
+  // logically and lands in /tmp, while the canonical workdir names <root>/sub
+  // whose parent is inside the root. The fold must not certify that cwd.
+  const fake = responder([inspectionReply(false, 0.02), inspectionReply(true, 0.99)]);
+  const request: OperationFactRequest = {
+    action: "shell", resources: [SHELL_ROOT], projectDir: SHELL_ROOT, worktreeRoot: SHELL_ROOT,
+    operation: {
+      tool: "shell", access: "execute", targets: [SHELL_ROOT],
+      arguments: { command: "cd .. && touch marker", workdir: SHELL_ALIAS, PWD: SHELL_ALIAS }, complete: true,
+    },
+    shell: BASH,
+  };
+  const result = await classifyOperationFacts(fake.ctx, options(), request);
+  assert.equal(result.kind, "unknown");
+  assert.equal(result.errorKind, "context");
+  assert.match(result.reason, /leading cd/);
+  assert.equal(fake.calls(), 1);
+});
+
+it("still folds a symlinked workdir when the cd target has no parent step", async () => {
+  const texts: string[] = [];
+  const replies: Reply[] = [inspectionReply(false, 0.02), inspectionReply(true, 0.96)];
+  const ctx = context(async (input) => {
+    texts.push(input.input[0]?.type === "text" ? input.input[0].text : "");
+    const reply = replies[texts.length - 1];
+    return reply === undefined ? undefined : reply();
+  });
+  const request: OperationFactRequest = {
+    action: "shell", resources: [SHELL_ROOT], projectDir: SHELL_ROOT, worktreeRoot: SHELL_ROOT,
+    operation: {
+      tool: "shell", access: "execute", targets: [SHELL_ROOT],
+      arguments: { command: "cd . && git status", workdir: SHELL_ALIAS, PWD: SHELL_ALIAS }, complete: true,
+    },
+    shell: BASH,
+  };
+  const result = await classifyOperationFacts(ctx, options(), request);
+  assert.equal(result.kind, "inspection");
+  assert.equal(texts[1], JSON.stringify({
+    command: "git status", fullCommand: "cd . && git status", segmentIndex: 0, cwd: SHELL_SUB,
+    platform: process.platform, shell: { interpreter: "/bin/bash" },
+  }));
 });
 
 it("still folds a parent step with no symlink component", async () => {
