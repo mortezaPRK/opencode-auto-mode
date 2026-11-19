@@ -2310,19 +2310,23 @@ export function isReadOnlyInvocation(words: readonly string[], globs: readonly b
   return specialReadOnlyPolicy(command, args);
 }
 
-type GitOutputEffect = "patch" | "no-patch" | "non-patch" | "non-patch-keep" |
+type GitOutputEffect = "patch" | "merge" | "no-merge" | "no-patch" | "non-patch" | "exclusive" |
   "quiet" | "unquiet" | "exit" | "no-exit" | "pickaxe";
 type GitScanValue = "flag" | "value" | "optional";
 
 interface GitScanState {
   patch: boolean;
+  mergePatch: boolean;
   noOutput: boolean;
   nonPatchFormat: boolean;
+  exclusiveFormat: boolean;
   quiet: boolean;
   exitStatus: boolean;
   pickaxe: boolean;
   textconvOff: boolean;
   extDiffOff: boolean;
+  submoduleNonRecursive: boolean;
+  ignoreAllSubmodules: boolean;
   revisions: string[];
   paths: string[];
   certain: boolean;
@@ -2330,13 +2334,16 @@ interface GitScanState {
 
 /** Output formats a git diff family command can select. Patch output is the only
  * format that runs textconv or external diff helpers, and `--quiet` may still run
- * a trusted external helper. `--name-only`, `--name-status` and `--check` set
- * their format bit without clearing `DIFF_FORMAT_NO_OUTPUT`. */
+ * a trusted external helper. `--name-only`, `--name-status` and `--check` are
+ * exclusive formats: they override patch output in either order. Merge options
+ * are different again: `-c`, `--cc`, `--dd`, `--remerge-diff` and
+ * `--diff-merges=<mode>` supply an implicit patch only when no format was
+ * selected, so `--stat` keeps them out of patch output. */
 const GIT_OUTPUT_EFFECTS = new Map<string, GitOutputEffect>([
   ["--patch", "patch"], ["--patch-with-raw", "patch"], ["--patch-with-stat", "patch"],
-  ["--binary", "patch"], ["--remerge-diff", "patch"], ["--cc", "patch"], ["--dense-combined", "patch"],
-  ["--dd", "patch"], ["--diff-merges", "patch"], ["--unified", "patch"], ["--function-context", "patch"],
-  ["--word-diff", "patch"], ["--word-diff-regex", "patch"], ["--color-words", "patch"],
+  ["--binary", "patch"], ["--unified", "patch"],
+  ["--remerge-diff", "merge"], ["--cc", "merge"], ["--dense-combined", "merge"], ["--dd", "merge"],
+  ["--no-diff-merges", "no-merge"],
   ["--pickaxe-all", "pickaxe"], ["--pickaxe-regex", "pickaxe"],
   ["--no-patch", "no-patch"],
   ["--stat", "non-patch"], ["--stat-width", "non-patch"], ["--stat-name-width", "non-patch"],
@@ -2344,7 +2351,7 @@ const GIT_OUTPUT_EFFECTS = new Map<string, GitOutputEffect>([
   ["--numstat", "non-patch"], ["--shortstat", "non-patch"], ["--dirstat", "non-patch"],
   ["--dirstat-by-file", "non-patch"], ["--cumulative", "non-patch"], ["--summary", "non-patch"],
   ["--raw", "non-patch"],
-  ["--name-only", "non-patch-keep"], ["--name-status", "non-patch-keep"], ["--check", "non-patch-keep"],
+  ["--name-only", "exclusive"], ["--name-status", "exclusive"], ["--check", "exclusive"],
   ["--quiet", "quiet"], ["--no-quiet", "unquiet"],
   ["--exit-code", "exit"], ["--no-exit-code", "no-exit"],
 ]);
@@ -2357,7 +2364,7 @@ const GIT_SCAN_VALUES = new Set(["--date", "--encoding", "--grep", "--author", "
   "--output-indicator-old", "--output-indicator-context", "--inter-hunk-context",
   "--ws-error-highlight", "--word-diff-regex", "--diff-algorithm", "--anchored", "--stat-width",
   "--stat-name-width", "--stat-graph-width", "--stat-count", "--rename-limit", "--decorate-refs",
-  "--decorate-refs-exclude", "--grep-reflog"]);
+  "--decorate-refs-exclude", "--grep-reflog", "--diff-merges"]);
 
 /** Long options with an optional value; git only consumes an attached `=value`. */
 const GIT_SCAN_OPTIONAL = new Set(["--stat", "--dirstat", "--dirstat-by-file", "--unified",
@@ -2365,7 +2372,7 @@ const GIT_SCAN_OPTIONAL = new Set(["--stat", "--dirstat", "--dirstat-by-file", "
   "--break-rewrites", "--find-renames", "--find-copies", "--no-walk", "--ancestry-path",
   "--branches", "--tags", "--remotes", "--exclude-hidden", "--notes", "--show-notes",
   "--expand-tabs", "--relative", "--submodule", "--ignore-submodules", "--color-moved",
-  "--diff-merges", "--objects", "--objects-edge", "--objects-edge-aggressive"]);
+  "--objects", "--objects-edge", "--objects-edge-aggressive"]);
 
 /** Long options that consume no value and do not affect patch output. */
 const GIT_SCAN_FLAGS = new Set(["--no-textconv", "--no-ext-diff", "--oneline", "--graph",
@@ -2379,9 +2386,9 @@ const GIT_SCAN_FLAGS = new Set(["--no-textconv", "--no-ext-diff", "--oneline", "
   "--find-copies-harder", "--irreversible-delete", "--rename-empty", "--pickaxe-all",
   "--pickaxe-regex", "--full-index", "--no-prefix", "--default-prefix", "--ignore-cr-at-eol",
   "--ignore-space-at-eol", "--ignore-all-space", "--ignore-space-change", "--ignore-blank-lines",
-  "--minimal", "--patience", "--histogram", "--full-diff", "--follow",
+  "--minimal", "--patience", "--histogram", "--full-diff", "--follow", "--function-context",
   "--cached", "--staged", "--merge-base", "--no-index", "--clear-decorations", "--no-expand-tabs",
-  "--no-diff-merges", "--no-remerge-diff", "--combined-all-paths", "--reflog", "--walk-reflogs"]);
+  "--no-remerge-diff", "--combined-all-paths", "--reflog", "--walk-reflogs"]);
 
 const GIT_SHORT_SCAN_VALUES: Record<string, ValueRole> = {
   n: "data", l: "data", O: "data", S: "data", G: "data", L: "data", I: "data",
@@ -2391,8 +2398,10 @@ const GIT_SHORT_SCAN_OPTIONAL = new Set(["M", "C", "B", "U"]);
 const GIT_SHORT_SCAN_FLAGS = new Set(["p", "u", "s", "m", "c", "a", "v", "z", "R", "D", "W", "w", "b"]);
 
 function newGitScanState(): GitScanState {
-  return { patch: false, noOutput: false, nonPatchFormat: false, quiet: false, exitStatus: false,
-    pickaxe: false, textconvOff: false, extDiffOff: false, revisions: [], paths: [], certain: true };
+  return { patch: false, mergePatch: false, noOutput: false, nonPatchFormat: false,
+    exclusiveFormat: false, quiet: false, exitStatus: false, pickaxe: false, textconvOff: false,
+    extDiffOff: false, submoduleNonRecursive: false, ignoreAllSubmodules: false,
+    revisions: [], paths: [], certain: true };
 }
 
 function gitLongKind(option: string): GitScanValue | undefined {
@@ -2404,33 +2413,68 @@ function gitLongKind(option: string): GitScanValue | undefined {
 
 function applyGitEffect(state: GitScanState, option: string): void {
   const effect = GIT_OUTPUT_EFFECTS.get(option);
+  if (effect === undefined) return;
   if (effect === "patch") { state.patch = true; state.noOutput = false; }
   else if (effect === "no-patch") { state.patch = false; state.noOutput = true; state.nonPatchFormat = false; }
   else if (effect === "non-patch") { state.nonPatchFormat = true; state.noOutput = false; }
-  else if (effect === "non-patch-keep") state.nonPatchFormat = true;
-  else if (effect === "quiet") state.quiet = true;
+  else if (effect === "exclusive") state.exclusiveFormat = true;
+  else if (effect === "merge") state.mergePatch = true;
+  else if (effect === "no-merge") state.mergePatch = false;
+  else applyGitToggle(state, effect);
+}
+
+/** The remaining effects only toggle exit-status and pickaxe bookkeeping. */
+function applyGitToggle(state: GitScanState, effect: GitOutputEffect): void {
+  if (effect === "quiet") state.quiet = true;
   else if (effect === "unquiet") state.quiet = false;
   else if (effect === "exit") state.exitStatus = true;
   else if (effect === "no-exit") state.exitStatus = false;
   else if (effect === "pickaxe") state.pickaxe = true;
 }
 
-function applyGitLongOption(state: GitScanState, part: { option: string; attached?: string }): GitScanValue | undefined {
-  const kind = gitLongKind(part.option);
-  if (kind === undefined || (kind === "flag" && part.attached !== undefined)) return undefined;
+/** `<mode>` decides whether the child diff recurses. A bare `--submodule` means
+ * `log`, and only `short`, `log` and `--ignore-submodules=all` suppress the
+ * child diff that can run helpers of its own. */
+function applyGitSubmoduleOption(state: GitScanState, value: string): void {
+  state.submoduleNonRecursive = value === "short" || value === "log";
+}
+
+function applyGitIgnoreSubmodules(state: GitScanState, value: string): void {
+  state.ignoreAllSubmodules = value === "all";
+}
+
+/** Merge options imply a patch only while no output format has been selected. */
+function applyGitDiffMerges(state: GitScanState, value: string | undefined): void {
+  state.mergePatch = value !== "off" && value !== "none";
+}
+
+function applyGitScanLongOption(state: GitScanState, part: { option: string; attached?: string }, next?: string): void {
   if (part.option === "--no-textconv") state.textconvOff = true;
   else if (part.option === "--no-ext-diff") state.extDiffOff = true;
+  else if (part.option === "--submodule") applyGitSubmoduleOption(state, part.attached ?? "log");
+  else if (part.option === "--ignore-submodules") applyGitIgnoreSubmodules(state, part.attached ?? "all");
+  else if (part.option === "--diff-merges") applyGitDiffMerges(state, part.attached ?? next);
   else applyGitEffect(state, part.option);
+}
+
+function applyGitLongOption(state: GitScanState, part: { option: string; attached?: string }, next?: string): GitScanValue | undefined {
+  const kind = gitLongKind(part.option);
+  if (kind === undefined || (kind === "flag" && part.attached !== undefined)) return undefined;
+  applyGitScanLongOption(state, part, next);
   return kind;
 }
 
 function applyGitShortFlag(state: GitScanState, letter: string): void {
   // `-W` is the short form of `--function-context`, which only affects patch
-  // rendering. Treat it like `-p` so a patch that follows is still reviewed.
-  if (letter === "p" || letter === "u" || letter === "c" || letter === "W") {
+  // rendering, so it does not select patch output by itself.
+  if (letter === "p" || letter === "u") {
     state.patch = true;
     state.noOutput = false;
   }
+  else if (letter === "c") state.mergePatch = true;
+  // `-m` selects the default merge mode without implying a patch, so it also
+  // clears an earlier merge implication.
+  else if (letter === "m") state.mergePatch = false;
   else if (letter === "s") { state.patch = false; state.noOutput = true; state.nonPatchFormat = false; }
 }
 
@@ -2460,7 +2504,7 @@ function applyGitShortOption(state: GitScanState, word: string, args: readonly s
 function scanGitLongOption(state: GitScanState, args: readonly string[], index: number): number | undefined {
   const part = longOptionPart(args[index]);
   if (part === undefined) return undefined;
-  const kind = applyGitLongOption(state, part);
+  const kind = applyGitLongOption(state, part, args[index + 1]);
   if (kind === undefined) return undefined;
   return index + (kind === "value" && part.attached === undefined ? 2 : 1);
 }
@@ -2490,8 +2534,10 @@ function scanGitOptions(args: readonly string[]): GitScanState {
 }
 
 function gitPatchPossible(scan: GitScanState, defaultPatch: boolean): boolean {
-  if (scan.quiet) return false;
-  return scan.patch || (defaultPatch && !scan.noOutput && !scan.nonPatchFormat);
+  if (scan.quiet || scan.exclusiveFormat) return false;
+  if (scan.patch) return true;
+  if (scan.noOutput || scan.nonPatchFormat) return false;
+  return defaultPatch || scan.mergePatch;
 }
 
 /** True when a git read may run textconv or an external diff helper. */
@@ -2500,22 +2546,37 @@ function gitDiffRisk(scan: GitScanState, defaultPatch: boolean): boolean {
     (scan.noOutput && scan.exitStatus);
 }
 
+/** A patch that touches a gitlink makes git spawn a child diff in the
+ * submodule. That child does not inherit `--no-textconv` or `--no-ext-diff`,
+ * and `diff.submodule=diff` can enable it invisibly, so only an explicit
+ * non-recursive mode keeps patch output free of configured diff helpers. */
+function gitSubmoduleRecursionRisk(scan: GitScanState, defaultPatch: boolean): boolean {
+  return gitPatchPossible(scan, defaultPatch) &&
+    !scan.ignoreAllSubmodules && !scan.submoduleNonRecursive;
+}
+
 function hasGitGlobalOverride(args: readonly string[]): boolean {
+  // A global `-c`/`--git-dir`/... can only precede the subcommand, and
+  // `isReadOnlyGit` only recognises `args[0]` as that subcommand, so prefix
+  // globals already fail closed. Checking them here would misread the
+  // subcommand-level merge option `git log -c`.
   return args.some((arg) =>
-    /^(?:-c|--git-dir|--work-tree|--exec-path|--config-env)(?:=|$)/.test(arg) ||
+    /^(?:--git-dir|--work-tree|--exec-path|--config-env)(?:=|$)/.test(arg) ||
     hasLongOption([arg], ["--ext-diff", "--textconv", "--exec"]) || arg.startsWith("--output"));
 }
 
 function isReadOnlyGitDiff(args: readonly string[]): boolean {
   const scan = scanGitOptions(args);
   if (!scan.certain) return false;
-  return !gitDiffRisk(scan, true) || (scan.textconvOff && scan.extDiffOff);
+  if (!gitDiffRisk(scan, true)) return true;
+  return scan.textconvOff && scan.extDiffOff && !gitSubmoduleRecursionRisk(scan, true);
 }
 
 function isReadOnlyGitLog(args: readonly string[]): boolean {
   const scan = scanGitOptions(args);
   if (!scan.certain) return false;
-  return !gitDiffRisk(scan, false) || scan.textconvOff;
+  if (!gitDiffRisk(scan, false)) return true;
+  return scan.textconvOff && !gitSubmoduleRecursionRisk(scan, false);
 }
 
 /** No static blob exemption: `<rev>:<path>` may name a gitlink commit, so only
@@ -2523,7 +2584,8 @@ function isReadOnlyGitLog(args: readonly string[]): boolean {
 function isReadOnlyGitShow(args: readonly string[]): boolean {
   const scan = scanGitOptions(args);
   if (!scan.certain) return false;
-  return !gitDiffRisk(scan, true) || scan.textconvOff;
+  if (!gitDiffRisk(scan, true)) return true;
+  return scan.textconvOff && !gitSubmoduleRecursionRisk(scan, true);
 }
 
 function isReadOnlyGitBranch(args: readonly string[]): boolean {
