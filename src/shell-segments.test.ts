@@ -63,6 +63,35 @@ it("rejects assignment prefixes and quoted stateful words", () => {
   unresolved(`\\cd /tmp`);
 });
 
+it("rejects append and subscript assignments", () => {
+  for (const command of [
+    "PATH+=:/tmp; git status",
+    "PATH[0]=/tmp; git status",
+    "PATH[10]=/tmp; git status",
+    "PATH[i]=/tmp; git status",
+    "arr[0]+=x; git status",
+    "FOO+=bar; git status",
+  ]) unresolved(command);
+});
+
+it("rejects a first word whose expansion or glob hides the command", () => {
+  for (const command of [
+    "$SEGMENT_PROBE_UNSET cd /; pwd",
+    "$CMD; pwd",
+    "`echo cd` /; pwd",
+    "*.sh; pwd",
+    "?.sh; pwd",
+    "[ab]; pwd",
+    "'cd' /; pwd",
+    "c'd' /; pwd",
+    "\\cd /; pwd",
+    "~; pwd",
+  ]) unresolved(command);
+  // Arguments may still expand; only the command word must be literal.
+  splits("echo $HOME", ["echo $HOME"]);
+  splits("ls *.ts", ["ls *.ts"]);
+});
+
 it("still splits ordinary segments that merely mention stateful words", () => {
   splits("git commit -m 'cd /tmp'", ["git commit -m 'cd /tmp'"]);
   splits("grep -n export src/a.ts", ["grep -n export src/a.ts"]);
@@ -188,6 +217,40 @@ it("rejects persistent builtins that change later segments", () => {
     "local x=1; git status",
     "function f { pwd; }",
   ]) unresolved(command);
+});
+
+it("rejects stateful builtins whatever their arguments", () => {
+  for (const command of [
+    "hash -p /tmp/git git; git status",
+    "read PATH; git status",
+    "read -r PATH; git status",
+    "mapfile -t lines; git status",
+    "readarray -t lines; git status",
+    "getopts ab OPT; git status",
+    "printf -v PATH /tmp; git status",
+    "printf -- -vPATH; git status",
+    "printf '%s' hi; git status",
+    "let PATH=/tmp; git status",
+    "shift; git status",
+    "ulimit -n 10; git status",
+    "enable -n echo; echo hi",
+    "bind 'x:y'; git status",
+    "complete -W x y; git status",
+    "compopt -o nospace; git status",
+    "fc -s; git status",
+  ]) unresolved(command);
+});
+
+it("rejects an escaped blank that is not a word boundary before 2>&1", () => {
+  for (const command of [
+    "echo x\\ 2>&1",
+    "echo x\\ 2>&1; git status",
+    "echo x \\ 2>&1",
+    "echo x\\ 2>&1 && git status",
+  ]) unresolved(command);
+  // An even backslash run leaves the blank unescaped, so the token still stands alone.
+  splits("echo x\\\\ 2>&1", ["echo x\\\\ 2>&1"]);
+  splits("echo x 2>&1", ["echo x 2>&1"]);
 });
 
 it("rejects redirections that only resemble 2>&1", () => {

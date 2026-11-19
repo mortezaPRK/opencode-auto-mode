@@ -24,6 +24,14 @@ const UNSPLITTABLE = ["$(", "${", "$[", "$'", '$"', "`", "<<", "<(", ">("] as co
 const STATEFUL_COMMANDS = new Set([
   ...STATEFUL, ...DYNAMIC,
   "cd", "pushd", "popd", "builtin", "command", "env", "sh", "bash", "zsh", "sudo",
+  // Mutate state a later segment reads: command lookup (`hash`, `enable`, PATH
+  // assignment), variables (`read`, `mapfile`, `readarray`, `getopts`,
+  // `printf -v`, `let`, `shift`), limits and shell/readline configuration
+  // (`ulimit`, `bind`, `complete`, `compopt`), and history replay (`fc`).
+  // Rejected by name, whatever the arguments, because an option can carry the
+  // mutation.
+  "hash", "read", "mapfile", "readarray", "getopts", "printf", "let", "shift",
+  "ulimit", "enable", "bind", "complete", "compopt", "fc",
 ]);
 
 /** Words that open or continue a compound command, so the rest is not top-level. */
@@ -33,8 +41,13 @@ const RESERVED_WORDS = new Set(["if", "then", "else", "elif", "fi", "for", "whil
 /** Parentheses and braces group commands; the separators inside are not top-level. */
 const GROUPING = new Set(["(", ")", "{", "}"]);
 
-/** A leading `NAME=value` prefix assigns shell state, including `IFS=`. */
-const ASSIGNMENT_PREFIX = /^[A-Za-z_][A-Za-z0-9_]*=/;
+/**
+ * The only first-word shape this scanner reads exactly: a literal command name
+ * with no quote, escape, expansion, glob or assignment syntax. `NAME=value`,
+ * `NAME+=value`, `NAME[i]=value`, `$CMD`, `*` and `'cd'` all fail it, so the
+ * effective command word is never guessed.
+ */
+const PLAIN_COMMAND = /^[A-Za-z0-9_./+:@%-]+$/;
 
 /** Shell blanks only: `trim()` would also strip whitespace and blank argument data a shell keeps. */
 const TRIM_BLANKS = /^[ \t]+|[ \t]+$/g;
@@ -65,12 +78,29 @@ function atWordStart(char: string | undefined): boolean {
     char === ";" || char === "&" || char === "|";
 }
 
+/** True when the character at `index` sits after an odd backslash run. */
+function escapedChar(command: string, index: number): boolean {
+  let cursor = index - 1;
+  let backslashes = 0;
+  while (cursor >= 0 && command[cursor] === "\\") {
+    backslashes += 1;
+    cursor -= 1;
+  }
+  return backslashes % 2 === 1;
+}
+
+/** True at the start of a word: command start or an unescaped word boundary. An
+ * escaped blank joins the previous word, so it is not a boundary. */
+function wordBoundary(command: string, index: number): boolean {
+  return index < 0 || (atWordStart(command[index]) && !escapedChar(command, index));
+}
+
 /** Only the exact standalone unquoted `2>&1` token is allowed; every other
- * redirection form (`2>&10`, `2>&1-`, `2>&1''`, `12>&1`) is unresolved. */
+ * redirection form (`2>&10`, `2>&1-`, `2>&1''`, `12>&1`, `x\ 2>&1`) is unresolved. */
 function fdRedirectToken(command: string, index: number): Token | undefined {
   const start = index - 1;
   if (start < 0 || command.slice(start, index + 3) !== ALLOWED_REDIRECT) return undefined;
-  return atWordStart(command[start - 1]) && atWordStart(command[index + 3]) ? SKIP_THREE : undefined;
+  return wordBoundary(command, start - 1) && atWordStart(command[index + 3]) ? SKIP_THREE : undefined;
 }
 
 /** The separator a `;`, newline, `|` or `&` starts; a lone `&` is unresolved. */
@@ -166,34 +196,18 @@ function withoutLeadingRedirects(segment: string): string {
   return rest;
 }
 
-/** First word with quoting and escapes removed, so a quoted `'cd'` is the same
- * stateful word as `cd`; leading allowed `2>&1` redirections are skipped. */
-function firstWord(segment: string): string {
+/** The literal first word of a segment, after any leading allowed redirections. */
+function commandWord(segment: string): string {
   const rest = withoutLeadingRedirects(segment);
-  let word = "";
-  let index = 0;
-  while (index < rest.length) {
-    const char = rest[index];
-    if (char === " " || char === "\t") break;
-    if (char === "'" || char === '"') {
-      const end = quotedEnd(rest, index, char);
-      word += rest.slice(index + 1, end);
-      index = end + 1;
-    } else if (char === "\\") {
-      word += rest[index + 1] ?? "";
-      index += 2;
-    } else {
-      word += char;
-      index += 1;
-    }
-  }
-  return word.replace(/\\/g, "");
+  const end = rest.search(/[ \t]/);
+  return end === -1 ? rest : rest.slice(0, end);
 }
 
-/** A stateful, reserved or assigning first word makes the segment unreadable in isolation. */
+/** A non-literal, stateful or reserved command word makes the segment unreadable
+ * in isolation: its effect on the next segment cannot be bounded. */
 const unreadableSegment = (segment: string): boolean => {
-  const word = firstWord(segment);
-  return STATEFUL_COMMANDS.has(word) || RESERVED_WORDS.has(word) || ASSIGNMENT_PREFIX.test(word);
+  const word = commandWord(segment);
+  return !PLAIN_COMMAND.test(word) || STATEFUL_COMMANDS.has(word) || RESERVED_WORDS.has(word);
 };
 
 /** A split command plus the literal target of one folded leading `cd`. */
