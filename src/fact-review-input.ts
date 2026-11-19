@@ -35,6 +35,8 @@ interface ParsedOperation {
   readonly targets?: readonly string[];
   readonly args?: Record<string, unknown>;
   readonly complete: boolean;
+  /** Capture correlation is separate from payload completion and must survive. */
+  readonly correlated?: boolean;
 }
 
 const MAX_DEPTH = 12;
@@ -157,9 +159,11 @@ function operationFields(raw: Record<string, unknown>, budget: Budget): ParsedOp
   const access = accessValue(raw.access);
   const targets = optionalStrings(raw.targets);
   const args = recordSnapshot(raw.arguments, budget);
-  if (tool === INVALID || access === INVALID || targets === INVALID || args === INVALID) return INVALID;
+  const correlated = optionalBoolean(raw.correlated);
+  if (tool === INVALID || access === INVALID || targets === INVALID || args === INVALID || correlated === INVALID)
+    return INVALID;
   if (typeof raw.complete !== "boolean") return INVALID;
-  return { complete: raw.complete, tool, access, targets, args };
+  return { complete: raw.complete, correlated, tool, access, targets, args };
 }
 
 function freezeOperation(fields: ParsedOperation): SnapshotOperation {
@@ -168,6 +172,7 @@ function freezeOperation(fields: ParsedOperation): SnapshotOperation {
     : Object.freeze(fields.targets) as readonly string[];
   return Object.freeze(definedFields({
     complete: fields.complete,
+    correlated: fields.correlated,
     tool: fields.tool,
     access: fields.access,
     targets,

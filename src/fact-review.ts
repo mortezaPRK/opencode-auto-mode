@@ -9,11 +9,14 @@
  * `edit_in_project` cover the edit paths, and a structural `delegation` makes no
  * fact call and asks `authorization` alone. Every other certified kind gets one
  * `safety`/`authorization` review. Zero-finding read-only inspections,
- * project-local `shell_segments`, metadata-only `project_edit` and a hash-bound
- * `local_edit` change candidate allow on their facts; callers still apply the
- * mandatory score guards first. A captured command that conflicts with the
- * evaluated resources, or an unresolved shell scope, is carried by the score as
- * a blocking finding, so those fact-only paths fall through to the full review.
+ * project-local `shell_segments` and metadata-only `project_edit` allow on their
+ * facts; a hash-bound `local_edit` change candidate and every other certified
+ * kind — including a Code Mode `script_readonly` — get the full review. Callers
+ * still apply the mandatory score guards first: a captured command or file target
+ * that conflicts with the evaluated resources, an unresolved shell scope, or an
+ * uncorrelated capture is carried by the score or the snapshot, so no fact-only
+ * path allows on it. `bash` shares shell fact classification, but the score's
+ * shell guards evaluate only `shell`, so a `bash` fact always gets the review.
  */
 import { createHash } from "node:crypto";
 import { Model } from "@opencode/schema/model";
@@ -316,17 +319,22 @@ function factCallFlowMatches(kind: CertifiedOperationKind, calls: readonly FactC
 /** Zero static findings is enough only because the certified provenance already
  * proves every fact-stage call was read-only. Conflict or scope findings from
  * the score remain blocking, so a command that the shell guards never evaluated
- * cannot ride this shortcut. */
+ * cannot ride this shortcut. `bash` shares shell classification, but the score's
+ * shell guards evaluate only the exact `shell` action, so an alias fact never
+ * skips the review. */
+const SHELL_ACTIONS: ReadonlySet<string> = new Set(["shell", "bash"]);
+const shellGuardsEvaluated = (action: string): boolean => action === "shell" || !SHELL_ACTIONS.has(action);
+
 function readOnlyInspection(fact: CertifiedOperationFact, snapshot: FactReviewSnapshot): boolean {
-  return fact.kind === "inspection" && snapshot.staticAnalysis !== undefined &&
-    (snapshot.staticAnalysis.findings?.length ?? 0) === 0;
+  return fact.kind === "inspection" && shellGuardsEvaluated(snapshot.action) &&
+    snapshot.staticAnalysis !== undefined && (snapshot.staticAnalysis.findings?.length ?? 0) === 0;
 }
 
 /** Every segment stayed inside the working directory. The `command_local`
  * fallback may write to tempDir outside the project and is never allowed here. */
 function projectLocalShellSegments(fact: CertifiedOperationFact, snapshot: FactReviewSnapshot): boolean {
-  return fact.kind === "shell_segments" && snapshot.staticAnalysis !== undefined &&
-    (snapshot.staticAnalysis.findings?.length ?? 0) === 0;
+  return fact.kind === "shell_segments" && shellGuardsEvaluated(snapshot.action) &&
+    snapshot.staticAnalysis !== undefined && (snapshot.staticAnalysis.findings?.length ?? 0) === 0;
 }
 
 function inspectionAllow(fact: CertifiedOperationFact): StageResult {
@@ -353,6 +361,28 @@ function projectEditAllow(fact: CertifiedOperationFact): StageResult {
     stage: STAGE,
     reason: `Certified metadata-only project edit fact (project_edit) at native probability ${formatProbability(fact.probability)} (review skipped: in-project edit)`,
   };
+}
+
+/** Fact-only allow is a closed set: read-only `inspection`, project-local
+ * `shell_segments` and metadata-only `project_edit`. Any other certified kind,
+ * such as the Code Mode `script_readonly` kind from the lower stage, always
+ * takes the full safety and authorization review. Exported so wiring tests can
+ * pin the closed set. */
+const FACT_ONLY_KINDS: ReadonlySet<string> = new Set(["inspection", "shell_segments", "project_edit"]);
+
+export function isFactOnlyKind(kind: string): boolean {
+  return FACT_ONLY_KINDS.has(kind);
+}
+
+/** An uncorrelated capture cannot prove which operation the score evaluated, so
+ * no fact-only path may allow; the abstain keeps configured later stages. */
+function factOnlyAllow(fact: CertifiedOperationFact, snapshot: FactReviewSnapshot): StageResult | undefined {
+  if (!isFactOnlyKind(fact.kind)) return undefined;
+  if (snapshot.operation?.correlated === false)
+    return abstain("Captured operation evidence does not match the permission request", "context");
+  if (readOnlyInspection(fact, snapshot)) return inspectionAllow(fact);
+  if (projectLocalShellSegments(fact, snapshot)) return shellSegmentsAllow(fact);
+  return fact.kind === "project_edit" ? projectEditAllow(fact) : undefined;
 }
 
 /** Fact call(s), then exactly one review call; any other question rejects the shape. */
@@ -591,9 +621,8 @@ export async function reviewWithOperationFact(
     const stage = observedStage(ctx);
     const fact = await factForReview(stage, options, snapshot, limits, signal);
     if (!fact.ok) return fact.result;
-    if (readOnlyInspection(fact.certified, snapshot)) return inspectionAllow(fact.certified);
-    if (projectLocalShellSegments(fact.certified, snapshot)) return shellSegmentsAllow(fact.certified);
-    if (fact.certified.kind === "project_edit") return projectEditAllow(fact.certified);
+    const allowed = factOnlyAllow(fact.certified, snapshot);
+    if (allowed !== undefined) return allowed;
     return await reviewedFactByKind(stage, fact, limits, signal);
   } catch (error) {
     return failureResult(error, signal, undefined);

@@ -10,6 +10,7 @@ import type { OperationEvidence } from "./decision-evidence.js";
 import {
   FACT_REVIEW_AUTHORIZATION_QUESTION,
   FACT_REVIEW_SAFETY_QUESTION,
+  isFactOnlyKind,
   reviewWithOperationFact,
   type FactReviewOptions,
   type FactReviewRequest,
@@ -1196,6 +1197,73 @@ it("keeps the full review when the captured command conflicts with the scored re
   ]);
   assert.doesNotMatch(segmentResult.reason, /review skipped/);
   assert.ok((score.findings?.length ?? 0) > 0, "the command conflict is a blocking finding");
+});
+
+it("keeps the fact-only allow set closed to inspection, shell_segments and project_edit", () => {
+  for (const kind of ["inspection", "shell_segments", "project_edit"])
+    assert.equal(isFactOnlyKind(kind), true, kind);
+  // A Code Mode script kind must never inherit a shell/file fact-only shortcut.
+  for (const kind of ["test_run", "command_local", "local_edit", "delegation", "script_readonly"])
+    assert.equal(isFactOnlyKind(kind), false, kind);
+});
+
+it("abstains on a metadata-only edit whose capture cannot be correlated", async () => {
+  const request: FactReviewRequest = {
+    ...metadataOnlyEditRequest(),
+    operation: {
+      tool: "edit", access: "write", targets: [EDIT_TARGET],
+      arguments: { path: EDIT_TARGET }, complete: false, correlated: false,
+    },
+  };
+  const fake = pipeline({ project: projectEditReply(true, 0.95), review: reply(reviewAnswer(0.99, 0.99)) });
+  const result = await reviewWithOperationFact(fake.ctx, options, request);
+  assert.equal(result.decision, "abstain");
+  assert.notEqual(result.decision, "allow");
+  assert.equal(result.errorKind, "context");
+  assert.equal(result.terminal, undefined);
+  assert.match(result.reason, /does not match the permission request/);
+  assert.deepEqual(fake.calls, [["edit_in_project"]]);
+});
+
+it("keeps the full review when a captured file target differs from the permission scope", async () => {
+  const operation: OperationEvidence = {
+    tool: "read", access: "read", targets: ["safe.txt"],
+    arguments: { filePath: "private.key" }, complete: true,
+  };
+  const score = scoreRequest({
+    action: "read", resources: ["safe.txt"], projectDir: EDIT_ROOT, worktreeRoot: EDIT_ROOT, operation,
+  }, scoreOptions);
+  assert.equal(score.band, "high");
+  assert.ok((score.findings?.length ?? 0) > 0, "file-scope conflict is a blocking finding");
+  const request: FactReviewRequest = {
+    action: "read", resources: ["safe.txt"], projectDir: EDIT_ROOT, worktreeRoot: EDIT_ROOT,
+    userMessages: ["Inspect the safe file."], operation,
+    staticAnalysis: { band: score.band, reason: score.reason, findings: score.findings ?? [] },
+  };
+  const fake = pipeline({ inspection: inspectionReply(true, 0.95), review: reply(reviewAnswer(0.99, 0.99)) });
+  const result = await reviewWithOperationFact(fake.ctx, options, request);
+  assert.equal(result.decision, "allow");
+  assert.deepEqual(fake.calls, [["inspection"], ["safety", "authorization"]]);
+  assert.doesNotMatch(result.reason, /review skipped/);
+});
+
+it("never skips the review for a bash fact outside the shell guards", async () => {
+  const operation: OperationEvidence = {
+    tool: "bash", access: "execute", targets: ["/repo"],
+    arguments: { command: "cat .env", workdir: "/repo" }, complete: true,
+  };
+  const score = scoreRequest({ action: "bash", resources: ["cat .env"], projectDir: "/repo", operation }, scoreOptions);
+  assert.equal(score.band, "high");
+  const request: FactReviewRequest = {
+    action: "bash", resources: ["cat .env"], projectDir: "/repo", worktreeRoot: "/repo",
+    userMessages: ["Inspect the environment file."], operation,
+    staticAnalysis: { band: score.band, reason: score.reason, findings: score.findings ?? [] },
+  };
+  const fake = pipeline({ inspection: inspectionReply(true, 0.95), review: reply(reviewAnswer(0.99, 0.99)) });
+  const result = await reviewWithOperationFact(fake.ctx, options, request);
+  assert.equal(result.decision, "allow");
+  assert.deepEqual(fake.calls, [["inspection"], ["safety", "authorization"]]);
+  assert.doesNotMatch(result.reason, /review skipped/);
 });
 
 it("carries lost or unresolved shell scope evidence as blocking findings", () => {

@@ -163,7 +163,7 @@ Classifier stages:
 | --- | --- | --- |
 | `static` | `{type:"static", allowInProjectEdits?: boolean}` | Allows low-risk reads and verified in-project edits. `allowInProjectEdits: false` keeps edit/write actions out of static allows. |
 | `decision` | `{type:"decision", model, timeoutMs?, minConfidence?}` | Native `ctx.experimental.generate.decisions` only. Asks `safety` and `authorization` predicates; allows only when **both** probabilities meet `minConfidence`. Defaults: timeout 3000, per-predicate floor 0.9. Never denies; ordinary abstentions continue; terminal loss is incomplete wildcard-only evidence or external directory with no verified target. |
-| `fact-review` | `{type:"fact-review", model, timeoutMs?, minConfidence?}` | Experimental and opt-in. Native `choice` fact classification (`inspection`; when it does not clear the floor, including a confident `false`, a splittable shell command is asked `inspection` per segment and `segment_local` only for a segment below the floor, with one leading literal `cd` folded into the confined cwd; all-read-only segments certify `inspection`, otherwise every segment must be local at or above the floor, and an unsplittable command uses `operation_kind`, where `test_run` or `repository_read` certifies). A certified read-only `inspection` or project-local `shell_segments` fact with zero static findings is allowed on the fact alone with no review call. A certified metadata-only `project_edit` from the in-project `edit_in_project` question is also allowed on the fact alone. Every other certified fact gets native `safety` and `authorization` review, including an inspection with any finding or without static analysis, while a complete `subagent`/`task` delegation with a non-empty prompt certifies `delegation` with no fact call and only the frozen `authorization` review (child actions are reviewed separately). Allows only when the certified fact probability, `safety`, and raw `allow` probability all meet `minConfidence` for the full shape, and the fact probability plus raw `allow` for `delegation`; never denies. Defaults: timeout from `reviewTimeoutMs`, floor 0.9; accepts 0.8-1 and rejects lower values. See [Fact review](#fact-review-experimental). |
+| `fact-review` | `{type:"fact-review", model, timeoutMs?, minConfidence?}` | Experimental and opt-in. Native `choice` fact classification (`inspection`; when it does not clear the floor, including a confident `false`, a shell command is split per segment only when the host identifies the interpreter as `bash` or `sh` — the plugin does not, so it uses whole-command checks — and then each segment is asked `inspection` and `segment_local` only for a segment below the floor, with one leading literal `cd` folded into the confined cwd; all-read-only segments certify `inspection`, otherwise every segment must be local at or above the floor, and an unsplittable command uses `operation_kind`, where `test_run` or `repository_read` certifies). A Code Mode `execute` script certifies a separate script fact kind that always gets the full review. Only `inspection`, `shell_segments` and `project_edit` can skip review: a certified read-only `inspection` or project-local `shell_segments` fact with zero static findings, and a certified metadata-only `project_edit` from the in-project `edit_in_project` question, are allowed on the fact alone. Every other certified fact gets native `safety` and `authorization` review, including an inspection with any finding or without static analysis, a `bash` fact (the score's shell guards evaluate only `shell`), and an uncorrelated capture (which abstains), while a complete `subagent`/`task` delegation with a non-empty prompt certifies `delegation` with no fact call and only the frozen `authorization` review (child actions are reviewed separately). Allows only when the certified fact probability, `safety`, and raw `allow` probability all meet `minConfidence` for the full shape, and the fact probability plus raw `allow` for `delegation`; never denies. Defaults: timeout from `reviewTimeoutMs`, floor 0.9; accepts 0.8-1 and rejects lower values. See [Fact review](#fact-review-experimental). |
 | `llm` | `{type:"llm", model, timeoutMs?}` | Native `ctx.experimental.generate.text` reviewer. `model` is explicit and required. |
 
 The decision stage receives compact evidence: action and resources, an optional
@@ -280,19 +280,22 @@ calibration, and no accuracy target or dataset statistic is claimed.
 
 Classification is operation-only and runs before review. A non-edit request asks
 one `inspection` choice. A complete non-shell, non-file tool call instead asks
-one `tool_readonly` choice with its tool name and captured arguments (the
-captured script for a Code Mode `execute` call), and `true` at or above the
-floor certifies the same read-only `inspection`. If inspection does not clear the floor (including a
-confident `false`), a splittable shell command is classified per segment: each
-segment asks the same `inspection` choice first, and only a segment below the
-floor asks `segment_local`, with one leading literal `cd` folded into the
-confined segment cwd; all-read-only segments certify read-only `inspection`,
-otherwise every segment must be local at or above the floor. A command that
-cannot be split gets one `operation_kind` choice, where `test_run` or
-`repository_read` can become a fact. Per-segment questions also receive the
-whole command as `fullCommand` context, and an unsplittable command whose
-`operation_kind` does not certify gets one `command_local` choice, whose `true`
-certifies `command_local` for the full review. A model-derived fact must meet the threshold
+one `tool_readonly` choice with its tool name and captured arguments. A Code
+Mode `execute` call is classified under its own script fact kind and always
+gets the full review; dynamic execution never takes a fact-only shortcut. If
+inspection does not clear the floor (including a confident `false`), a shell
+command is classified per segment only when the host identifies the interpreter
+as `bash` or `sh`; the plugin does not provide that interpreter evidence, so it
+uses whole-command checks. When splitting applies, each segment asks the same
+`inspection` choice first, and only a segment below the floor asks
+`segment_local`, with one leading literal `cd` folded into the confined segment
+cwd; all-read-only segments certify read-only `inspection`, otherwise every
+segment must be local at or above the floor. A command that cannot be split gets
+one `operation_kind` choice, where `test_run` or `repository_read` can become a
+fact. Per-segment questions also receive the whole command as `fullCommand`
+context, and an unsplittable command whose `operation_kind` does not certify
+gets one `command_local` choice, whose `true` certifies `command_local` for the
+full review. A model-derived fact must meet the threshold
 and carry its exact source-input hash and a nonempty model label: the
 provider-reported served model when the response includes one, otherwise the
 configured model reference; unknown, malformed, or unproven facts abstain. User messages, delegations, transcripts,
@@ -303,7 +306,13 @@ fact alone: no review call is made. A certified `shell_segments` fact with zero
 static findings is likewise project-local and allowed on the fact alone, and
 keeps that full review with any finding or without static analysis. A certified
 metadata-only `project_edit` from the in-project `edit_in_project` question is
-also allowed on the fact alone. Every other certified fact gets the frozen
+also allowed on the fact alone. Only those three certified kinds can skip
+review; every other kind, including a Code Mode script fact, is reviewed. A
+`bash` fact is reviewed because the mandatory score's shell guards evaluate only
+`shell`, and an uncorrelated operation capture abstains instead of allowing.
+Captured shell or file targets that conflict with the scored resources are
+carried as blocking findings, so those paths also take the full review. Every
+other certified fact gets the frozen
 `safety` and `authorization` review questions, and allow requires the fact
 probability, the raw `allow` probability, and `safety` to meet the floor, with
 the selected choice `allow`; anything else abstains. A complete `subagent` or

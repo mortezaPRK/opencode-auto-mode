@@ -71,12 +71,20 @@ function verifiedTarget(target: string, write: boolean, projectDir?: string, wor
  * mismatched, duplicate or dropped capture cannot clear statically. */
 export function operationScopeApproval(operation: OperationEvidence | undefined, action: string,
   resources: readonly string[], projectDir?: string, worktreeRoot?: string): RequestScore | undefined {
+  // Correlation failures and target mismatches are blocking findings: a fact-only
+  // allow must not certify a capture that the file guards never verified.
   if (operation?.correlated === false)
-    return high("Captured operation evidence does not match the permission request");
+    return {
+      ...high("Captured operation evidence does not match the permission request"),
+      findings: ["Captured call does not correlate with the permission request; file guards did not verify it"],
+    };
   const targets = operationTargets(operation, action);
   if (targets.length === 0) return undefined;
   const write = WRITE_ACTIONS.has(action);
   const verified = targets.every((target) => namesPermissionResource(resources, target, projectDir) &&
     verifiedTarget(target, write, projectDir, worktreeRoot));
-  return verified ? undefined : high("Operation target differs from the verified permission scope");
+  return verified ? undefined : {
+    ...high("Operation target differs from the verified permission scope"),
+    findings: ["Captured operation target differs from the verified permission scope; file guards did not verify it"],
+  };
 }

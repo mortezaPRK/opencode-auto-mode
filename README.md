@@ -262,19 +262,23 @@ order unchanged.
 
 For non-edit requests, the stage first classifies only what the operation is:
 one `inspection` choice. A complete non-shell, non-file tool call instead asks
-one `tool_readonly` choice with its tool name and captured arguments (for a Code
-Mode `execute` call, the captured script), and `true` at or above the floor
-certifies the same read-only `inspection`. If inspection does not clear the floor (including a
-confident `false`), a splittable shell command is classified per segment: each
-segment gets the same `inspection` choice first, and only a segment below the
-floor gets `segment_local`, with one leading literal `cd` folded into the
-confined segment cwd. Every segment read-only certifies read-only `inspection`;
-otherwise every segment must be local at or above the floor. A command that
-cannot be split gets one `operation_kind` choice, where `test_run` or
-`repository_read` certifies. Per-segment questions also receive the whole
-command as `fullCommand` context, and an unsplittable command whose
-`operation_kind` does not certify gets one `command_local` choice, whose `true`
-certifies `command_local` and still requires the full review. A model-derived
+one `tool_readonly` choice with its tool name and captured arguments. A Code
+Mode `execute` call is classified under its own script kind, which always gets
+the full `safety` and `authorization` review; Code Mode is dynamic execution, so
+no fact-only shortcut applies. If inspection does not clear the floor (including
+a confident `false`), a shell command is classified per segment only when the
+host identifies the interpreter as `bash` or `sh`. The plugin does not supply
+that interpreter evidence, so with the plugin a command uses whole-command
+checks. When per-segment classification applies, each segment gets the same
+`inspection` choice first, and only a segment below the floor gets
+`segment_local`, with one leading literal `cd` folded into the confined segment
+cwd. Every segment read-only certifies read-only `inspection`; otherwise every
+segment must be local at or above the floor. A command that cannot be split gets
+one `operation_kind` choice, where `test_run` or `repository_read` certifies.
+Per-segment questions also receive the whole command as `fullCommand` context,
+and an unsplittable command whose `operation_kind` does not certify gets one
+`command_local` choice, whose `true` certifies `command_local` and still
+requires the full review. A model-derived
 fact is certified only when its reported probability clears the threshold, its exact
 source-input hash is present, and it carries a model label: the provider-reported
 served model when the response includes one, otherwise the configured model reference.
@@ -284,7 +288,12 @@ is made. A certified `shell_segments` fact with zero static analysis findings is
 likewise allowed on that fact alone as project-local, and keeps that full review
 with any finding or without static analysis. A certified metadata-only
 `project_edit` from the in-project `edit_in_project` question is also allowed on
-that fact alone. Every other
+that fact alone. Only those three certified kinds can skip review; every other
+kind, including a Code Mode script fact, is reviewed. A `bash` fact is reviewed
+because the mandatory score's shell guards evaluate only `shell`, and an
+uncorrelated operation capture abstains instead of allowing. Captured shell or
+file targets that conflict with the scored resources are carried as blocking
+findings, so those paths also take the full review. Every other
 certified fact receives the frozen `safety` and
 `authorization` review questions, and allows only when the fact probability, the
 raw `allow` probability, and `safety` all meet `minConfidence`; otherwise it

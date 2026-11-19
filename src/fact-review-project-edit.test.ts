@@ -144,18 +144,19 @@ it("refuses VCS internals, dependency trees and credential targets without a cal
 it("refuses hardlinked, FIFO, directory and symlinked targets without a call", async () => {
   const outside = realpathSync(mkdtempSync(join(tmpdir(), "opencode-project-edit-outside-")));
   const linked = join(ROOT, "src", "linked.ts");
-  const fifo = join(ROOT, "src", "pipe.ts");
+  // `mkfifo` is POSIX-only, so the FIFO case is skipped on Windows.
+  const fifo = process.platform === "win32" ? undefined : join(ROOT, "src", "pipe.ts");
   const directory = join(ROOT, "src", "folder");
   const symlinkFile = join(ROOT, "src", "alias.ts");
   const symlinkDirectory = join(ROOT, "src", "alias-dir");
   try {
     writeFileSync(join(outside, "secret.ts"), "outside\n");
     linkSync(join(outside, "secret.ts"), linked);
-    execFileSync("mkfifo", [fifo]);
+    if (fifo !== undefined) execFileSync("mkfifo", [fifo]);
     mkdirSync(directory);
     symlinkSync(TARGET, symlinkFile);
     symlinkSync(join(ROOT, "src"), symlinkDirectory);
-    for (const target of [linked, fifo, directory, symlinkFile, join(symlinkDirectory, "parser.ts")]) {
+    for (const target of [linked, ...(fifo === undefined ? [] : [fifo]), directory, symlinkFile, join(symlinkDirectory, "parser.ts")]) {
       const fake = pipeline([projectReply(true, 0.95)]);
       const result = await reviewWithOperationFact(fake.ctx, options, targetRequest(target));
       assert.equal(result.decision, "abstain", target);
@@ -165,7 +166,7 @@ it("refuses hardlinked, FIFO, directory and symlinked targets without a call", a
   } finally {
     rmSync(outside, { recursive: true, force: true });
     rmSync(linked, { force: true });
-    rmSync(fifo, { force: true });
+    if (fifo !== undefined) rmSync(fifo, { force: true });
     rmSync(directory, { recursive: true, force: true });
     rmSync(symlinkFile, { force: true });
     rmSync(symlinkDirectory, { recursive: true, force: true });
