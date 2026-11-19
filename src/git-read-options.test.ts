@@ -31,6 +31,7 @@ it("keeps guaranteed non-patch output read-only", () => {
     ["git", "diff", "--stat"], ["git", "diff", "--name-only"],
     ["git", "diff", "--name-status"], ["git", "diff", "--no-patch"], ["git", "diff", "-s"],
     ["git", "diff", "--patch", "--no-patch"], ["git", "diff", "--stat", "--no-patch"],
+    ["git", "diff", "--name-only", "--no-patch"], ["git", "diff", "--name-status", "-s"],
     ["git", "log"], ["git", "log", "--stat"], ["git", "log", "-s"],
     ["git", "log", "-p", "--no-patch"], ["git", "show", "--stat"],
     ["git", "show", "--stat", "HEAD"], ["git", "show", "--name-only", "HEAD"],
@@ -281,6 +282,10 @@ it("applies last-option semantics to patch suppression", () => {
   ]) allows(words);
   for (const words of [
     ["git", "diff", "--no-patch", "--patch"],
+    // `--no-patch` and `-s` clear an earlier exclusive format, so the later
+    // patch really produces patch output and can run configured diff helpers.
+    ["git", "diff", "--name-only", "--no-patch", "--patch"],
+    ["git", "diff", "--name-only", "-s", "-p"],
     ["git", "diff", "--stat", "--no-patch", "--patch"],
     ["git", "log", "--no-patch", "-p"],
     ["git", "show", "--no-patch", "--patch", "HEAD"],

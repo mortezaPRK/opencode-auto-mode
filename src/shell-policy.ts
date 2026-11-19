@@ -2415,7 +2415,9 @@ function applyGitEffect(state: GitScanState, option: string): void {
   const effect = GIT_OUTPUT_EFFECTS.get(option);
   if (effect === undefined) return;
   if (effect === "patch") { state.patch = true; state.noOutput = false; }
-  else if (effect === "no-patch") { state.patch = false; state.noOutput = true; state.nonPatchFormat = false; }
+  // `--no-patch`/`-s` reset every selected output format, including the
+  // exclusive ones, so a later `--patch` produces a real patch.
+  else if (effect === "no-patch") { state.patch = false; state.noOutput = true; state.nonPatchFormat = false; state.exclusiveFormat = false; }
   else if (effect === "non-patch") { state.nonPatchFormat = true; state.noOutput = false; }
   else if (effect === "exclusive") state.exclusiveFormat = true;
   else if (effect === "merge") state.mergePatch = true;
@@ -2475,7 +2477,7 @@ function applyGitShortFlag(state: GitScanState, letter: string): void {
   // `-m` selects the default merge mode without implying a patch, so it also
   // clears an earlier merge implication.
   else if (letter === "m") state.mergePatch = false;
-  else if (letter === "s") { state.patch = false; state.noOutput = true; state.nonPatchFormat = false; }
+  else if (letter === "s") { state.patch = false; state.noOutput = true; state.nonPatchFormat = false; state.exclusiveFormat = false; }
 }
 
 function applyGitShortFlags(state: GitScanState, flags: string): boolean {
