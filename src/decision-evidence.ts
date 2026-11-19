@@ -235,6 +235,24 @@ function resourceEvidence(resources: readonly string[]): { resources: string[]; 
   };
 }
 
+/** Every loss category independently, because `incompleteEvidenceKind` names
+ * only the highest-priority one. */
+export interface EvidenceLoss {
+  readonly resources: boolean;
+  readonly shell: boolean;
+  readonly operation: boolean;
+  readonly delegations: boolean;
+}
+
+export function evidenceLoss(request: DecisionEvidenceRequest): EvidenceLoss {
+  return {
+    resources: resourceEvidence(request.resources).incomplete !== undefined,
+    shell: shellEvidence(request).loss,
+    operation: operationEvidence(request.operation).loss,
+    delegations: delegationEvidence(request).loss,
+  };
+}
+
 function lossEvidence(resource: string | undefined, shell: boolean, operation: boolean, delegation: boolean): Pick<DecisionEvidence, "incompleteEvidence" | "incompleteEvidenceKind"> {
   if (resource !== undefined) return { incompleteEvidence: resource, incompleteEvidenceKind: "resources" };
   if (shell) return { incompleteEvidence: SHELL_LOSS, incompleteEvidenceKind: "shell" };

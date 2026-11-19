@@ -757,11 +757,12 @@ try {
     // selects normalized operation fields only, never raw metadata secrets.
     await expectPermission(f, "allow", ["git log"], "shell",
       { integration: true, command: "git log", secret: "fixture-not-a-real-secret" });
-    assert.deepEqual(calls, ["fact-inspection", "fact-review"]);
-    const { record, payloads, questions } = await factStageAudit(f, 2);
+    // A certified zero-finding inspection is fact-only: the high static band
+    // never forces the review call.
+    assert.deepEqual(calls, ["fact-inspection"]);
+    const { record, payloads, questions } = await factStageAudit(f, 1);
     assert.equal(record.stage, "fact-review"); assert.equal(record.decision, "allow");
-    assert.deepEqual(questions, [["inspection"], ["safety", "authorization"]],
-      "inspection first, then safety predicate plus the inspection authorization choice");
+    assert.deepEqual(questions, [["inspection"]], "a certified read-only inspection needs no review");
     assert.equal(JSON.stringify(payloads).includes("fixture-not-a-real-secret"), false,
       "raw metadata never reaches native generation");
     assert.deepEqual(reviewerInputs, [], "confident native fact review does not call the LLM");
@@ -770,17 +771,21 @@ try {
   await run("fact review low fact falls back to the LLM reviewer", async () => {
     const f = await fixture(factClassifiers()); profile.fact = "low";
     profile.reviewer = "ALLOW: fixture low fact fallback authorized"; calls.length = 0;
-    await expectPermission(f, "allow", ["bun test"], "shell", { integration: true, command: "bun test" });
-    assert.deepEqual(calls, ["fact-inspection", "fact-operation-kind", "reviewer"]);
-    const { record, questions } = await factStageAudit(f, 2);
+    // A non-shell read keeps the fact stage to one whole-operation inspection;
+    // a splittable shell command would descend into per-segment questions.
+    await expectPermission(f, "allow", [".editorconfig"], "read");
+    assert.deepEqual(calls, ["fact-inspection", "reviewer"]);
+    const { record, questions } = await factStageAudit(f, 1);
     assert.equal(record.stage, "reviewer"); assert.equal(record.decision, "allow");
-    assert.deepEqual(questions, [["inspection"], ["operation_kind"]],
-      "a non-inspection shell operation gets only the five-label second stage, never a review");
+    assert.deepEqual(questions, [["inspection"]],
+      "a low inspection fact abstains without a second-stage question");
   });
   await run("fact review malformed native review falls back to the LLM reviewer", async () => {
     const f = await fixture(factClassifiers()); profile.fact = "malformed";
     profile.reviewer = "ALLOW: fixture malformed review fallback authorized"; calls.length = 0;
-    await expectPermission(f, "allow", ["git log"], "shell", { integration: true, command: "git log" });
+    // A static finding on a non-shell read keeps the certified inspection from
+    // allowing on its facts, so the malformed review answer is actually parsed.
+    await expectPermission(f, "allow", [".editorconfig"], "read");
     assert.deepEqual(calls, ["fact-inspection", "fact-review", "reviewer"]);
     const { record, questions } = await factStageAudit(f, 2);
     assert.equal(record.stage, "reviewer"); assert.equal(record.decision, "allow");

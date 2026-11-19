@@ -24,7 +24,7 @@ import {
   type OperationFactResult,
 } from "./decision-facts.js";
 import type { DecisionContext, DecisionInput } from "./decision.js";
-import { buildDecisionEvidence, type DecisionEvidence } from "./decision-evidence.js";
+import { buildDecisionEvidence, evidenceLoss, type DecisionEvidence } from "./decision-evidence.js";
 import { isEditLike, prepareEditCandidate, type EditCandidate, type EditCaptureIdentity, type EditPayload } from "./edit-fact.js";
 import { errorKindOf, ReviewFailure, type ReviewErrorKind } from "./errors.js";
 import { snapshotFactReviewRequest, type FactReviewSnapshot } from "./fact-review-input.js";
@@ -167,10 +167,14 @@ type EvidenceSnapshot =
   | { readonly ok: false; readonly result: StageResult };
 
 /** Resource or delegation redaction is terminal evidence loss; operation loss
- * stays context because a complete edit payload can still prove the effect. */
+ * stays context because a complete edit payload can still prove the effect.
+ * The single `incompleteEvidenceKind` names only the highest-priority loss, so
+ * check delegation loss independently: metadata-only edits usually carry a
+ * `complete:false` operation, which would otherwise mask a redacted delegation. */
 function evidenceSnapshot(snapshot: FactReviewSnapshot): EvidenceSnapshot {
   const evidence = buildDecisionEvidence(snapshot);
-  if (evidence.incompleteEvidenceKind === "resources" || evidence.incompleteEvidenceKind === "delegations")
+  const loss = evidenceLoss(snapshot);
+  if (loss.resources || loss.delegations)
     return { ok: false, result: terminalAbstain("Fact review evidence is redacted or incomplete") };
   const text = JSON.stringify(evidence);
   if (Buffer.byteLength(text) > MAX_REQUEST_BYTES)
