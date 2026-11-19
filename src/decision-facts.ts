@@ -1,5 +1,5 @@
 /** Fact classification only: never a permission, approval or safety verdict. */
-import { lstatSync, realpathSync, statSync } from "node:fs";
+import { accessSync, constants, lstatSync, realpathSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, parse, resolve, sep } from "node:path";
 import { Model } from "@opencode/schema/model";
@@ -320,12 +320,17 @@ type ExplicitCwd = { value?: string; unusable: boolean };
 
 type PhysicalWalk = { readonly path: string; readonly parentAfterSymlink: boolean };
 
-/** Resolves one non-parent component; undefined when it does not resolve to a directory. */
+/** Resolves one non-parent component; undefined when it does not resolve to a
+ * searchable directory. `stat`/`realpath` can accept a directory without search
+ * permission while `cd` into it fails and leaves the shell elsewhere, so the
+ * execute bit is part of resolving a cwd. */
 function resolvedComponent(current: string, part: string): { path: string; symlink: boolean } | undefined {
   const candidate = current.endsWith(sep) ? `${current}${part}` : `${current}${sep}${part}`;
   try {
     const symlink = lstatSync(candidate).isSymbolicLink();
-    return statSync(candidate).isDirectory() ? { path: realpathSync(candidate), symlink } : undefined;
+    if (!statSync(candidate).isDirectory()) return undefined;
+    accessSync(candidate, constants.X_OK);
+    return { path: realpathSync(candidate), symlink };
   } catch {
     return undefined;
   }
@@ -333,9 +338,10 @@ function resolvedComponent(current: string, part: string): { path: string; symli
 
 /** Physical path, resolved component by component so a captured `..` follows the
  * link target's parent instead of lexically erasing the link (as macOS realpath
- * normalizes `link/..`); undefined when any component does not resolve or is not
- * a directory, since a `cd` through a regular file fails and leaves the shell
- * elsewhere. Also reports a `..` after a symlink: Bash folds a folded `cd`
+ * normalizes `link/..`); undefined when any component does not resolve to a
+ * searchable directory, since a `cd` through a regular file or into an
+ * unsearchable directory fails and leaves the shell elsewhere. Also reports a
+ * `..` after a symlink: Bash folds a folded `cd`
  * logically (`link/..` deletes the name), so such a walk names a directory Bash
  * never enters. */
 function physicalWalk(value: string): PhysicalWalk | undefined {
