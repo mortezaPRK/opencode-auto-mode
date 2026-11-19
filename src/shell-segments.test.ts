@@ -167,3 +167,115 @@ it("never splits an unterminated quote", () => {
   unresolved("cd 'a && rm x");
 });
 
+it("rejects parameter expansion that can hold unquoted operators", () => {
+  for (const command of [
+    "echo ${MISSING:-a;b}",
+    "echo ${x:-a;b} && git status",
+    "echo ${#x}",
+    "echo ${x/;/}",
+    "echo $[1;2]",
+    `echo $"x"`,
+  ]) unresolved(command);
+});
+
+it("rejects persistent builtins that change later segments", () => {
+  for (const command of [
+    "declare PATH=/tmp; git status",
+    "declare -x FOO=bar && git status",
+    "typeset -i n=1; git status",
+    "readonly FOO=x; git status",
+    "readonly PATH",
+    "local x=1; git status",
+    "function f { pwd; }",
+  ]) unresolved(command);
+});
+
+it("rejects redirections that only resemble 2>&1", () => {
+  for (const command of [
+    "echo ok 2>&10",
+    "echo ok 2>&1-",
+    "echo ok 2>&1''",
+    `echo ok 2>&1"x"`,
+    "echo ok 2>&1x",
+    "echo ok2>&1",
+    "echo ok 32>&1",
+    "2>&1'' cd /tmp; pwd",
+    "2>&1x cd /tmp; pwd",
+  ]) unresolved(command);
+  splits("bun test 2>&1; git status", ["bun test 2>&1", "git status"]);
+  splits("bun test 2>&1&&git status", ["bun test 2>&1", "git status"]);
+});
+
+it("rejects grouping and compound-command reserved words", () => {
+  for (const command of [
+    "{ cd /tmp; pwd; }",
+    "{ git status; }",
+    "(cd /tmp && pwd)",
+    "( pwd )",
+    "if true; then pwd; fi",
+    "then pwd",
+    "else pwd",
+    "elif true; then pwd; fi",
+    "for f in a b; do pwd; done",
+    "while true; do pwd; done",
+    "until false; do pwd; done",
+    "case x in a) pwd;; esac",
+    "select x in a b; do pwd; done",
+    "! git status",
+    "[[ -f x ]] && git status",
+    "]] ; git status",
+    "time git status",
+    "do pwd",
+    "done",
+    "esac",
+  ]) unresolved(command);
+  splits("grep -n '{ cd; }' f", ["grep -n '{ cd; }' f"]);
+  splits(`grep -n "( pwd )" f`, [`grep -n "( pwd )" f`]);
+});
+
+it("rejects unquoted comments that hide quoting from the scanner", () => {
+  for (const command of [
+    "echo FIRST # '\necho SECOND",
+    "echo hi # trailing",
+    "# just a comment",
+    "git status # done && rm -rf /tmp/x",
+    "echo a;#b",
+    "echo a&&#b",
+  ]) unresolved(command);
+  splits("echo a#b", ["echo a#b"]);
+  splits("grep -n '#x' f", ["grep -n '#x' f"]);
+});
+
+it("never folds a cd argument containing shell syntax", () => {
+  for (const command of [
+    "cd 2>&1 && pwd",
+    "cd /repo/{a..a} && pwd",
+    "cd /repo/*.ts && pwd",
+    "cd a&b && pwd",
+    "cd a<b && pwd",
+    "cd a>b && pwd",
+    "cd (x) && pwd",
+  ]) unresolved(command);
+  // Quoted versions are literal paths, not shell syntax.
+  assert.deepEqual(splitShellSegmentsWithLeadingCd(`cd '/repo/{a..a}' && pwd`),
+    { segments: ["pwd"], leadingCd: "/repo/{a..a}" });
+  assert.deepEqual(splitShellSegmentsWithLeadingCd(`cd '2>&1' && pwd`),
+    { segments: ["pwd"], leadingCd: "2>&1" });
+});
+
+it("rejects backslash-newline continuations", () => {
+  unresolved("echo $\\\n(pwd)");
+  unresolved("c\\\nd /tmp; pwd");
+  unresolved("ls \\\n&& git status");
+  unresolved("echo a\\\r\n; pwd");
+});
+
+it("trims only shell blanks and rejects ambiguous whitespace", () => {
+  unresolved("printf '%s' name\\ ; pwd");
+  unresolved("echo a\u00a0b; pwd");
+  unresolved("cd /repo/sub\u00a0 && pwd");
+  unresolved("git status; echo a\rb");
+  splits("\techo hi\t", ["echo hi"]);
+  splits("echo 'a '", ["echo 'a '"]);
+});
+
