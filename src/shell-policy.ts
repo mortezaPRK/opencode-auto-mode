@@ -2335,7 +2335,7 @@ interface GitScanState {
 const GIT_OUTPUT_EFFECTS = new Map<string, GitOutputEffect>([
   ["--patch", "patch"], ["--patch-with-raw", "patch"], ["--patch-with-stat", "patch"],
   ["--binary", "patch"], ["--remerge-diff", "patch"], ["--cc", "patch"], ["--dense-combined", "patch"],
-  ["--dd", "patch"], ["--diff-merges", "patch"], ["--unified", "patch"],
+  ["--dd", "patch"], ["--diff-merges", "patch"], ["--unified", "patch"], ["--function-context", "patch"],
   ["--word-diff", "patch"], ["--word-diff-regex", "patch"], ["--color-words", "patch"],
   ["--pickaxe-all", "pickaxe"], ["--pickaxe-regex", "pickaxe"],
   ["--no-patch", "no-patch"],
@@ -2379,7 +2379,7 @@ const GIT_SCAN_FLAGS = new Set(["--no-textconv", "--no-ext-diff", "--oneline", "
   "--find-copies-harder", "--irreversible-delete", "--rename-empty", "--pickaxe-all",
   "--pickaxe-regex", "--full-index", "--no-prefix", "--default-prefix", "--ignore-cr-at-eol",
   "--ignore-space-at-eol", "--ignore-all-space", "--ignore-space-change", "--ignore-blank-lines",
-  "--function-context", "--minimal", "--patience", "--histogram", "--full-diff", "--follow",
+  "--minimal", "--patience", "--histogram", "--full-diff", "--follow",
   "--cached", "--staged", "--merge-base", "--no-index", "--clear-decorations", "--no-expand-tabs",
   "--no-diff-merges", "--no-remerge-diff", "--combined-all-paths", "--reflog", "--walk-reflogs"]);
 
@@ -2425,7 +2425,12 @@ function applyGitLongOption(state: GitScanState, part: { option: string; attache
 }
 
 function applyGitShortFlag(state: GitScanState, letter: string): void {
-  if (letter === "p" || letter === "u" || letter === "c") { state.patch = true; state.noOutput = false; }
+  // `-W` is the short form of `--function-context`, which only affects patch
+  // rendering. Treat it like `-p` so a patch that follows is still reviewed.
+  if (letter === "p" || letter === "u" || letter === "c" || letter === "W") {
+    state.patch = true;
+    state.noOutput = false;
+  }
   else if (letter === "s") { state.patch = false; state.noOutput = true; state.nonPatchFormat = false; }
 }
 

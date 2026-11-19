@@ -86,6 +86,49 @@ it("treats word-diff options as patch-producing", () => {
   ]) allows(words);
 });
 
+it("treats function-context as patch-producing", () => {
+  for (const words of [
+    ["git", "log", "--function-context"], ["git", "log", "-W"],
+    ["git", "log", "--no-patch", "-W"],
+    ["git", "log", "--no-patch", "--function-context"],
+    ["git", "diff", "--stat", "-W"],
+    ["git", "diff", "--stat", "--function-context", "--no-ext-diff"],
+    ["git", "show", "--stat", "-W", "HEAD"],
+  ]) reviews(words);
+  for (const words of [
+    ["git", "log", "-W", "--no-patch"],
+    ["git", "log", "-W", "--no-textconv"],
+    ["git", "log", "--function-context", "--no-patch"],
+    ["git", "diff", "--stat", "-W", "--no-textconv", "--no-ext-diff"],
+    ["git", "show", "--function-context", "HEAD", "--no-textconv"],
+  ]) allows(words);
+});
+
+it("reviews patch aliases and combined-diff shortcuts", () => {
+  for (const words of [
+    ["git", "log", "--stat", "--patch-with-stat"],
+    ["git", "log", "--stat", "--patch-with-raw"],
+    ["git", "log", "--stat", "-u"], ["git", "log", "--stat", "--unified=5"],
+    ["git", "log", "--stat", "-U5"],
+    ["git", "log", "--stat", "--diff-merges=first-parent"],
+    ["git", "log", "--stat", "--remerge-diff"],
+    ["git", "diff", "--stat", "--binary"],
+  ]) reviews(words);
+});
+
+it("keeps patch-formatting-only options inert without patch output", () => {
+  for (const words of [
+    ["git", "log", "--stat", "--inter-hunk-context=3"],
+    ["git", "log", "--stat", "--minimal"], ["git", "log", "--stat", "--patience"],
+    ["git", "log", "--stat", "--histogram"], ["git", "log", "--stat", "--anchored=fix"],
+    ["git", "log", "--stat", "--diff-algorithm=histogram"],
+    ["git", "log", "--stat", "--combined-all-paths"],
+    ["git", "log", "--stat", "-m"], ["git", "log", "--stat", "--full-index"],
+    ["git", "diff", "--stat", "--inter-hunk-context=3"],
+    ["git", "diff", "--stat", "--minimal", "--full-index"],
+  ]) allows(words);
+});
+
 it("reviews pickaxe filters that can run textconv without patch output", () => {
   for (const words of [
     ["git", "log", "-Sneedle"], ["git", "log", "-Gneedle"], ["git", "log", "-S", "needle"],
