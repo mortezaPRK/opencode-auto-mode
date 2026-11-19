@@ -474,8 +474,10 @@ async function evaluatePermission(deps: Runtime, event: PermissionEvent, setting
     finishEarly(deps, event, proposed.early, progress, hostEffect, meta);
     return;
   }
-  const result = await settleReview(deps, settings, event, handle, progress, proposed.result, hostEffect, original, meta, cancelledNow);
-  recordReview(deps, event, progress, result, hostEffect, reviewsNativeAllow, meta);
+  // Settling releases the review, records the audit and publishes the final
+  // decision in one synchronous continuation: teardown queued by an abort
+  // listener cannot dispose the sink in between.
+  await settleReview(deps, settings, event, handle, progress, proposed.result, hostEffect, original, meta, cancelledNow);
 }
 
 function recordNativeDeny(deps: Runtime, event: PermissionEvent, meta: ReviewMeta, message: string | undefined): void {
@@ -540,6 +542,9 @@ async function reviewWork(
     return { kind: "reviewed", result: { decision: "ask", reason: "Request too large for automatic review", stage: "context" } };
   const prepared = await prepareRequest(deps, event, handle, meta);
   if (prepared.kind === "cancelled") return prepared;
+  // A signal can abort after the request is ready but before scoring starts;
+  // scoring does synchronous filesystem lookups for file requests.
+  if (cancelledNow()) return { kind: "cancelled" };
   const scored = await deps.observe("score", prepared.request, async () => scoreRequest(prepared.request, settings), meta.correlation);
   progress.score = scored.band;
   const scoreVerdict = scoreOutcome(scored);
@@ -641,8 +646,9 @@ async function runReviewStages(
 
 async function settleReview(
   deps: Runtime, settings: PluginOptions, event: PermissionEvent, handle: ReviewHandle, progress: ReviewProgress,
-  result: ReviewResult, hostEffect: PermissionEvent["effect"], original: HostOriginal, meta: ReviewMeta, cancelledNow: () => boolean,
-): Promise<ReviewResult> {
+  proposed: ReviewResult, hostEffect: PermissionEvent["effect"], original: HostOriginal, meta: ReviewMeta, cancelledNow: () => boolean,
+): Promise<void> {
+  let result = proposed;
   let finishPromise: Promise<FinishOutcome> | undefined;
   try {
     // Mode/breaker checks and counters commit atomically. Explicit off wins
@@ -663,10 +669,9 @@ async function settleReview(
     if (final.commit !== undefined && (explicitOff || (cancelled && final.disposition === "enforced")))
       await repairLateCommit(deps, event, final, explicitOff, meta);
     applySettled(deps, event, progress, result, final, hostEffect, original, cancelled, explicitOff);
-    return result;
   } catch (error) {
     deps.debug("mode.finish.error", error, meta.correlation);
-    const failed: ReviewResult = { ...result, errorKind: errorKindOf(error) };
+    result = { ...result, errorKind: errorKindOf(error) };
     if (deps.suspended.has(event.sessionID)) {
       progress.finalDisposition = "off";
       event.effect = hostEffect;
@@ -688,11 +693,11 @@ async function settleReview(
       try { await deps.modes.revertCancelled(event.sessionID, outcome, off ? "off" : "cancelled"); }
       catch (cause) { deps.debug("mode.revert.error", cause, meta.correlation); }
     }).catch(() => {});
-    return failed;
   } finally {
-    // The verdict is applied and the review released in one turn: an off or
-    // interruption cannot abort a review whose verdict is already applied.
+    // Recording and publication follow release in the same synchronous turn:
+    // teardown queued by an abort listener cannot dispose the sinks in between.
     handle.release();
+    recordReview(deps, event, progress, result, hostEffect, meta);
   }
 }
 
@@ -767,12 +772,12 @@ type ReviewRecord = Omit<AutoModeDecision, "at" | "errorKind"> & {
   errorKind?: ReviewResult["errorKind"];
 };
 
-function buildRecord(event: PermissionEvent, progress: ReviewProgress, result: ReviewResult, hostEffect: PermissionEvent["effect"], reviewsNativeAllow: boolean, meta: ReviewMeta): ReviewRecord {
+function buildRecord(event: PermissionEvent, progress: ReviewProgress, result: ReviewResult, hostEffect: PermissionEvent["effect"], meta: ReviewMeta): ReviewRecord {
   return {
     ts: new Date().toISOString(), reviewID: meta.reviewID, sessionID: event.sessionID,
     ...(event.agent === undefined ? {} : { agent: event.agent }),
     action: event.action, resources: [...event.resources], hostEffect, decision: event.effect,
-    proposedDecision: result.decision, reviewedNativeAllow: reviewsNativeAllow, disposition: progress.finalDisposition,
+    proposedDecision: result.decision, reviewedNativeAllow: hostEffect === "allow", disposition: progress.finalDisposition,
     breaker: progress.tripped,
     stage: progress.tripped ? "breaker" : result.stage ?? "unknown",
     ...(progress.score === undefined ? {} : { score: progress.score }),
@@ -782,8 +787,8 @@ function buildRecord(event: PermissionEvent, progress: ReviewProgress, result: R
   };
 }
 
-function recordReview(deps: Runtime, event: PermissionEvent, progress: ReviewProgress, result: ReviewResult, hostEffect: PermissionEvent["effect"], reviewsNativeAllow: boolean, meta: ReviewMeta): void {
-  const record = buildRecord(event, progress, result, hostEffect, reviewsNativeAllow, meta);
+function recordReview(deps: Runtime, event: PermissionEvent, progress: ReviewProgress, result: ReviewResult, hostEffect: PermissionEvent["effect"], meta: ReviewMeta): void {
+  const record = buildRecord(event, progress, result, hostEffect, meta);
   try { deps.audit?.write(record); } catch { /* local auditing is best effort */ }
   if (!progress.tracked) return;
   const entry = deps.status.finish({ ...record, at: Date.now() });

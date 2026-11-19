@@ -1293,6 +1293,65 @@ it("applies the verdict and releases the review in the same turn at the commit b
   }
 });
 
+it("records and publishes before teardown queued by the release abort can run", async () => {
+  const host = await setup({ audit: { enabled: true } });
+  const RealAbortController = globalThis.AbortController;
+  const controllers: AbortController[] = [];
+  const observed: { published: number; recorded: number }[] = [];
+  try {
+    globalThis.AbortController = class TrackedAbortController extends RealAbortController {
+      constructor() { super(); controllers.push(this); }
+    } as typeof AbortController;
+    const input = { ...event("allow"), message: "native allow message" };
+    const evaluation = host.evaluate(input);
+    globalThis.AbortController = RealAbortController;
+    assert.equal(controllers.length, 1);
+    // Teardown triggered by the review's own release abort runs a microtask later.
+    controllers[0]!.signal.addEventListener("abort", () => {
+      queueMicrotask(() => observed.push({
+        published: host.published.length,
+        recorded: host.records().filter((record) => record.proposedDecision !== undefined).length,
+      }));
+    });
+    await evaluation; await tick();
+    assert.deepEqual(observed, [{ published: 1, recorded: 1 }]);
+  } finally {
+    globalThis.AbortController = RealAbortController;
+    await host.cleanup();
+  }
+});
+
+it("rechecks cancellation after request preparation and before scoring starts", async () => {
+  const host = await setup({ audit: { enabled: true } });
+  const RealAbortController = globalThis.AbortController;
+  const controllers: AbortController[] = [];
+  const resources = ["return 42"];
+  try {
+    globalThis.AbortController = class TrackedAbortController extends RealAbortController {
+      constructor() { super(); controllers.push(this); }
+    } as typeof AbortController;
+    // The request's resource spread (second serialization: debug logs the
+    // event first) is the last step before the abort check; abort from a
+    // microtask so only a post-preparation recheck can see it.
+    let serialized = 0;
+    Object.defineProperty(resources, Symbol.iterator, { value: function* () {
+      yield "return 42";
+      if (++serialized === 2) queueMicrotask(() => controllers[0]!.abort());
+    } });
+    const input = { ...event("allow"), resources };
+    const evaluation = host.evaluate(input);
+    globalThis.AbortController = RealAbortController;
+    assert.equal(controllers.length, 1);
+    await evaluation;
+    assert.equal(input.effect, "ask");
+    assert.match(input.message!, /interrupted/);
+    assert.equal(host.records().some((record) => record.type === "score.before"), false);
+  } finally {
+    globalThis.AbortController = RealAbortController;
+    await host.cleanup();
+  }
+});
+
 it("a blocked mode change with invalid config emits only the disabled message", async () => {
   const host = await setup({ classifiers: [{ type: "unknown" }] });
   try {
