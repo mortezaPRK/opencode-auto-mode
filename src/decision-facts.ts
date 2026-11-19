@@ -1,5 +1,5 @@
 /** Fact classification only: never a permission, approval or safety verdict. */
-import { lstatSync, realpathSync } from "node:fs";
+import { lstatSync, realpathSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, parse, resolve, sep } from "node:path";
 import { Model } from "@opencode/schema/model";
@@ -37,6 +37,7 @@ import {
 } from "./guards.js";
 import { classifyPath, envName, isInside, PROTECTED_NAME, PROTECTED_SUFFIX } from "./path-policy.js";
 import type { PermissionRequest } from "./reviewer.js";
+import { supportsPosixReview } from "./shell-policy.js";
 import { splitShellSegmentsWithLeadingCd, type ShellSegmentSplit } from "./shell-segments.js";
 import { withTimeout } from "./timeout.js";
 
@@ -44,7 +45,7 @@ export type { EditCaptureIdentity, EditPayload } from "./edit-fact.js";
 
 /** Operation facts only; user messages and transcripts are outside this stage.
  * Static analysis is only an eligibility flag, never a classification input. */
-export type OperationFactRequest = Pick<PermissionRequest, "action" | "resources" | "operation" | "projectDir" | "worktreeRoot" | "staticAnalysis"> & {
+export type OperationFactRequest = Pick<PermissionRequest, "action" | "resources" | "operation" | "projectDir" | "worktreeRoot" | "staticAnalysis" | "shell"> & {
   /** Host-minted binding of the captured body; never agent assertions. */
   editPayload?: EditPayload;
   /** Host-owned identity of the same capture; edit classification requires both
@@ -240,7 +241,7 @@ function stageLimits(options: OperationFactOptions): StageLimits {
   return { model: modelRef(options.model), minConfidence, deadline: Date.now() + timeoutMs };
 }
 
-/** Copies exactly the five allowed evidence fields; raw metadata/source and user authority are never selected. */
+/** Copies exactly the six allowed evidence fields; raw metadata/source and user authority are never selected. */
 function restrictedRequest(request: OperationFactRequest): OperationFactRequest {
   return {
     action: request.action,
@@ -248,6 +249,7 @@ function restrictedRequest(request: OperationFactRequest): OperationFactRequest 
     ...(request.operation === undefined ? {} : { operation: request.operation }),
     ...(request.projectDir === undefined ? {} : { projectDir: request.projectDir }),
     ...(request.worktreeRoot === undefined ? {} : { worktreeRoot: request.worktreeRoot }),
+    ...(request.shell === undefined ? {} : { shell: request.shell }),
   };
 }
 
@@ -255,14 +257,16 @@ const evidenceFor = (request: OperationFactRequest): DecisionEvidence =>
   buildDecisionEvidence(restrictedRequest(request));
 
 /**
- * Stable factual input contract, version v2. Inputs are built only from
+ * Stable factual input contract, version v3. Inputs are built only from
  * `buildDecisionEvidence` output, never the raw request: `{action, resources,
- * operation, projectDir, worktreeRoot}` in that order with absent fields
- * omitted, the nested operation in the producer's exact key order, and shell
- * inputs as `{command, cwd}`. Changing these keys, their order or their
- * derivation requires a new contract version.
+ * operation, projectDir, worktreeRoot, platform, shell}` in that order with
+ * absent fields omitted, the nested operation in the producer's exact key order,
+ * and shell inputs as `{command, cwd, platform, shell}`. v3 adds the bounded host
+ * platform and requested shell so Bash and cmd.exe commands are distinguishable.
+ * Changing these keys, their order or their derivation requires a new contract
+ * version.
  */
-export const OPERATION_FACT_INPUT_CONTRACT_VERSION = "v2";
+export const OPERATION_FACT_INPUT_CONTRACT_VERSION = "v3";
 
 const withoutUndefined = <T extends object>(value: T): T =>
   Object.fromEntries(Object.entries(value).filter(([, item]) => item !== undefined)) as T;
@@ -273,6 +277,8 @@ type OperationFactInput = {
   operation?: DecisionEvidenceOperation;
   projectDir?: string;
   worktreeRoot?: string;
+  platform: string;
+  shell?: DecisionEvidence["shell"];
 };
 
 function operationFactOperation(operation: DecisionEvidenceOperation): DecisionEvidenceOperation {
@@ -292,10 +298,17 @@ function buildOperationFactInput(evidence: DecisionEvidence): OperationFactInput
     operation: evidence.operation === undefined ? undefined : operationFactOperation(evidence.operation),
     projectDir: evidence.projectDir,
     worktreeRoot: evidence.worktreeRoot,
+    platform: evidence.platform,
+    shell: evidence.shell,
   });
 }
 
-type ShellFactInput = { command: string; cwd?: string };
+type ShellFactInput = {
+  command: string;
+  cwd?: string;
+  platform: string;
+  shell?: DecisionEvidence["shell"];
+};
 
 /** Complete original captured command; never rebuilt from resources or targets,
  * and never synthesized when the capture lost it. */
@@ -308,11 +321,24 @@ type ExplicitCwd = { value?: string; unusable: boolean };
 
 type PhysicalWalk = { readonly path: string; readonly parentAfterSymlink: boolean };
 
+/** Resolves one non-parent component; undefined when it does not resolve to a directory. */
+function resolvedComponent(current: string, part: string): { path: string; symlink: boolean } | undefined {
+  const candidate = current.endsWith(sep) ? `${current}${part}` : `${current}${sep}${part}`;
+  try {
+    const symlink = lstatSync(candidate).isSymbolicLink();
+    return statSync(candidate).isDirectory() ? { path: realpathSync(candidate), symlink } : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** Physical path, resolved component by component so a captured `..` follows the
  * link target's parent instead of lexically erasing the link (as macOS realpath
- * normalizes `link/..`); undefined when any component does not resolve. Also
- * reports a `..` after a symlink: Bash folds a folded `cd` logically (`link/..`
- * deletes the name), so such a walk names a directory Bash never enters. */
+ * normalizes `link/..`); undefined when any component does not resolve or is not
+ * a directory, since a `cd` through a regular file fails and leaves the shell
+ * elsewhere. Also reports a `..` after a symlink: Bash folds a folded `cd`
+ * logically (`link/..` deletes the name), so such a walk names a directory Bash
+ * never enters. */
 function physicalWalk(value: string): PhysicalWalk | undefined {
   if (!isAbsolute(value)) return undefined;
   const root = parse(value).root;
@@ -326,13 +352,10 @@ function physicalWalk(value: string): PhysicalWalk | undefined {
       current = dirname(current);
       continue;
     }
-    const candidate = current.endsWith(sep) ? `${current}${part}` : `${current}${sep}${part}`;
-    try {
-      symlinked = symlinked || lstatSync(candidate).isSymbolicLink();
-      current = realpathSync(candidate);
-    } catch {
-      return undefined;
-    }
+    const component = resolvedComponent(current, part);
+    if (component === undefined) return undefined;
+    symlinked = symlinked || component.symlink;
+    current = component.path;
   }
   return { path: current, parentAfterSymlink };
 }
@@ -369,10 +392,18 @@ function confinedWorkdir(value: string, projectDir: string | undefined,
   return target === undefined ? undefined : confinedPath(target, root);
 }
 
+/** CDPATH can redirect a relative operand whose first component is neither `.`
+ * nor `..`, so only absolute and explicitly relative targets name an exact cwd. */
+function cdpathSensitive(target: string): boolean {
+  const first = target.split(sep)[0];
+  return !isAbsolute(target) && first !== "." && first !== "..";
+}
+
 /** Folded leading `cd` resolved against the effective shell cwd with the same
  * containment as an explicit workdir; a `..` after a symlink has no usable cwd
  * because Bash's logical `cd` lands where the physical walk does not. */
 function foldedCwd(target: string, cwd: string | undefined, evidence: DecisionEvidence): string | undefined {
+  if (cdpathSensitive(target)) return undefined;
   const root = evidence.worktreeRoot ?? evidence.projectDir;
   if (root === undefined || !isAbsolute(root)) return undefined;
   const value = absoluteTarget(target, cwd);
@@ -396,9 +427,11 @@ function explicitCwd(evidence: DecisionEvidence): ExplicitCwd {
   return { unusable: false };
 }
 
-/** Command first, cwd only when established. */
-const shellInput = (command: string, cwd: string | undefined): ShellFactInput =>
-  cwd === undefined ? { command } : { command, cwd };
+/** Command first, cwd only when established, then the bounded execution context. */
+const shellInput = (command: string, cwd: string | undefined,
+  evidence: DecisionEvidence): ShellFactInput => withoutUndefined({
+  command, cwd, platform: evidence.platform, shell: evidence.shell,
+});
 
 /** Secondary shell input; undefined when no original command was captured or the
  * cwd is unusable, since that operation cannot be classified at all. */
@@ -407,21 +440,37 @@ function buildShellFactInput(evidence: DecisionEvidence): ShellFactInput | undef
   if (command === undefined) return undefined;
   const explicit = explicitCwd(evidence);
   if (explicit.unusable) return undefined;
-  return shellInput(command, explicit.value ?? evidence.projectDir);
+  return shellInput(command, explicit.value ?? evidence.projectDir, evidence);
 }
 
-/** Segment first, then the whole captured command as context, its index and the established segment cwd. */
-type SegmentFactInput = { command: string; fullCommand: string; segmentIndex: number; cwd?: string };
+/** Segment first, then the whole captured command as context, its index, the established segment cwd and the execution context. */
+type SegmentFactInput = {
+  command: string;
+  fullCommand: string;
+  segmentIndex: number;
+  cwd?: string;
+  platform: string;
+  shell?: DecisionEvidence["shell"];
+};
 
 const segmentInput = (command: string, fullCommand: string, segmentIndex: number,
-  cwd: string | undefined): SegmentFactInput =>
-  withoutUndefined({ command, fullCommand, segmentIndex, cwd });
+  cwd: string | undefined, evidence: DecisionEvidence): SegmentFactInput => withoutUndefined({
+  command, fullCommand, segmentIndex, cwd, platform: evidence.platform, shell: evidence.shell,
+});
 
-/** Exact captured command, the established cwd, and the host temp directory the command may write inside. */
-type CommandLocalInput = { command: string; cwd?: string; tempDir: string };
+/** Exact captured command, the established cwd, the host temp directory the command may write inside, and the execution context. */
+type CommandLocalInput = {
+  command: string;
+  cwd?: string;
+  tempDir: string;
+  platform: string;
+  shell?: DecisionEvidence["shell"];
+};
 
 const commandLocalInput = (shell: ShellFactInput, tempDir: string): CommandLocalInput =>
-  withoutUndefined({ command: shell.command, cwd: shell.cwd, tempDir });
+  withoutUndefined({
+    command: shell.command, cwd: shell.cwd, tempDir, platform: shell.platform, shell: shell.shell,
+  });
 
 const concreteScope = (value: unknown): boolean =>
   typeof value === "string" && value.trim().length > 0 && value !== "*";
@@ -706,11 +755,12 @@ function operationKindFact(parsed: ParsedChoice, threshold: number): OperationFa
  * segment below the floor. All read-only certifies `inspection`, else all local
  * certifies `shell_segments`; the fact reports the weakest probability. */
 async function segmentFacts(ctx: DecisionContext, limits: StageLimits, segments: readonly string[],
-  fullCommand: string, cwd: string | undefined, signal: AbortSignal | undefined): Promise<OperationFactResult> {
+  fullCommand: string, cwd: string | undefined, evidence: DecisionEvidence,
+  signal: AbortSignal | undefined): Promise<OperationFactResult> {
   let probability = 1;
   let allReadOnly = true;
   for (const [segmentIndex, segment] of segments.entries()) {
-    const input = JSON.stringify(segmentInput(segment, fullCommand, segmentIndex, cwd));
+    const input = JSON.stringify(segmentInput(segment, fullCommand, segmentIndex, cwd, evidence));
     const inspection = parseChoice(await ask(ctx, limits, SEGMENT_INSPECTION_QUESTION, input, signal), INSPECTION_EXPECTED);
     if (inspection.selected === true && inspection.probability >= limits.minConfidence) {
       probability = Math.min(probability, inspection.probability);
@@ -789,15 +839,21 @@ async function classifyEditFacts(ctx: DecisionContext, limits: StageLimits, requ
   return projectEditFact(parsed, limits.minConfidence);
 }
 
+/** POSIX segmentation and cd folding apply only when the host and the requested
+ * interpreter are POSIX-reviewable; other dialects use the whole-command path. */
+const posixReviewable = (evidence: DecisionEvidence): boolean =>
+  evidence.platform !== "win32" && supportsPosixReview(evidence.shell);
+
 /** Classifies split segments under the effective cwd; a folded leading `cd` must
  * stay inside the same containment root as an explicit workdir. */
 async function splitFacts(ctx: DecisionContext, limits: StageLimits, shellCwd: string | undefined,
   shellCommand: string, split: ShellSegmentSplit, evidence: DecisionEvidence,
   signal: AbortSignal | undefined): Promise<OperationFactResult> {
-  if (split.leadingCd === undefined) return segmentFacts(ctx, limits, split.segments, shellCommand, shellCwd, signal);
+  if (split.leadingCd === undefined)
+    return segmentFacts(ctx, limits, split.segments, shellCommand, shellCwd, evidence, signal);
   const cwd = foldedCwd(split.leadingCd, shellCwd, evidence);
   if (cwd === undefined) return { kind: "unknown", reason: UNCONFINED_CD_REASON, errorKind: "context" };
-  return segmentFacts(ctx, limits, split.segments, shellCommand, cwd, signal);
+  return segmentFacts(ctx, limits, split.segments, shellCommand, cwd, evidence, signal);
 }
 
 /** Second stage only after `inspection` missed the floor: a splittable command is
@@ -811,7 +867,7 @@ async function afterInspection(ctx: DecisionContext, limits: StageLimits,
   if (!isShellAction(evidence.action)) return unresolved("Operation does not establish inspection-only", inspection);
   const shell = buildShellFactInput(evidence);
   if (shell === undefined) return { kind: "unknown", reason: NO_COMMAND_REASON, errorKind: "context" };
-  const split = splitShellSegmentsWithLeadingCd(shell.command);
+  const split = posixReviewable(evidence) ? splitShellSegmentsWithLeadingCd(shell.command) : undefined;
   if (split !== undefined) return splitFacts(ctx, limits, shell.cwd, shell.command, split, evidence, signal);
   const kind = parseChoice(await ask(ctx, limits, OPERATION_KIND_QUESTION, JSON.stringify(shell), signal), OPERATION_KIND_EXPECTED);
   const operation = operationKindFact(kind, limits.minConfidence);

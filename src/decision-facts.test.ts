@@ -156,6 +156,7 @@ const SHELL_ROOT = realpathSync(mkdtempSync(join(tmpdir(), "opencode-shell-facts
 const SHELL_OUTSIDE = realpathSync(mkdtempSync(join(tmpdir(), "opencode-shell-outside-")));
 mkdirSync(join(SHELL_ROOT, "sub"), { recursive: true });
 mkdirSync(join(SHELL_ROOT, "pkg", "sub"), { recursive: true });
+writeFileSync(join(SHELL_ROOT, "sub", "plainfile"), "not a directory");
 mkdirSync(join(SHELL_OUTSIDE, "deep"), { recursive: true });
 symlinkSync(SHELL_OUTSIDE, join(SHELL_ROOT, "link"));
 symlinkSync(join(SHELL_ROOT, "pkg", "sub"), join(SHELL_ROOT, "inner"));
@@ -389,7 +390,7 @@ it("deep-freezes exported questions and sends fresh question objects", async () 
   assert.equal(INSPECTION_QUESTION.name, "inspection");
 });
 
-it("sends only the five operation fields in the v2 producer order and retains the exact command", async () => {
+it("sends only the projected operation fields in the v3 producer order and retains the exact command", async () => {
   let text = "";
   const ctx = context(async (input) => {
     text = input.input[0]?.type === "text" ? input.input[0].text : "";
@@ -403,16 +404,16 @@ it("sends only the five operation fields in the v2 producer order and retains th
   };
   const result = await classifyOperationFacts(ctx, options(), request);
   assert.equal(text,
-    `{"action":"shell","resources":["/repo"],"operation":{"tool":"shell","access":"execute","targets":["/repo"],"arguments":{"command":"bun test --filter decision","workdir":"/repo"},"complete":true},"projectDir":"/repo","worktreeRoot":"/repo"}`);
+    `{"action":"shell","resources":["/repo"],"operation":{"tool":"shell","access":"execute","targets":["/repo"],"arguments":{"command":"bun test --filter decision","workdir":"/repo"},"complete":true},"projectDir":"/repo","worktreeRoot":"/repo","platform":"${process.platform}"}`);
   assert.deepEqual(Object.keys(JSON.parse(text) as Record<string, unknown>),
-    ["action", "resources", "operation", "projectDir", "worktreeRoot"]);
+    ["action", "resources", "operation", "projectDir", "worktreeRoot", "platform"]);
   const parsed = JSON.parse(text) as { operation: Record<string, unknown> };
   assert.deepEqual(Object.keys(parsed.operation), ["tool", "access", "targets", "arguments", "complete"]);
   assert.doesNotMatch(text, /PRIVATE/);
   assert.equal(result.kind, "inspection");
 });
 
-it("omits absent primary fields without reordering the v2 contract", async () => {
+it("omits absent primary fields without reordering the v3 contract", async () => {
   let text = "";
   const ctx = context(async (input) => {
     text = input.input[0]?.type === "text" ? input.input[0].text : "";
@@ -424,11 +425,11 @@ it("omits absent primary fields without reordering the v2 contract", async () =>
   const result = await classifyOperationFacts(ctx, options(), request);
   assert.equal(result.kind, "inspection");
   assert.equal(text,
-    `{"action":"read","resources":["/repo/README.md"],"operation":{"tool":"read","access":"read","targets":["/repo/README.md"],"arguments":{"path":"/repo/README.md"},"complete":true}}`);
+    `{"action":"read","resources":["/repo/README.md"],"operation":{"tool":"read","access":"read","targets":["/repo/README.md"],"arguments":{"path":"/repo/README.md"},"complete":true},"platform":"${process.platform}"}`);
 });
 
-it("projects the synthetic v2 operation literal in producer order without unknown keys", async () => {
-  assert.equal(OPERATION_FACT_INPUT_CONTRACT_VERSION, "v2");
+it("projects the synthetic v3 operation literal in producer order without unknown keys", async () => {
+  assert.equal(OPERATION_FACT_INPUT_CONTRACT_VERSION, "v3");
   let text = "";
   const ctx = context(async (input) => {
     text = input.input[0]?.type === "text" ? input.input[0].text : "";
@@ -445,13 +446,82 @@ it("projects the synthetic v2 operation literal in producer order without unknow
   const result = await classifyOperationFacts(ctx, options(), request);
   assert.equal(result.kind, "inspection");
   assert.equal(text,
-    `{"action":"read","resources":["/repo/README.md"],"operation":{"tool":"read","access":"read","complete":true}}`);
+    `{"action":"read","resources":["/repo/README.md"],"operation":{"tool":"read","access":"read","complete":true},"platform":"${process.platform}"}`);
   assert.deepEqual(Object.keys((JSON.parse(text) as { operation: object }).operation),
     ["tool", "access", "complete"]);
   assert.doesNotMatch(text, /PRIVATE|"metadata"|"source"|"unknownKey"/);
 });
 
-it("sends the v2 segment input as command, full command, index then cwd", async () => {
+it("carries the bounded host platform and requested shell into the whole-command input", async () => {
+  let text = "";
+  const ctx = context(async (input) => {
+    text = input.input[0]?.type === "text" ? input.input[0].text : "";
+    return inspectionReply(true, 0.95)();
+  });
+  const request: OperationFactRequest = {
+    ...shellRequest("sort input.txt /o output.txt"),
+    shell: { platform: "win32", interpreter: "cmd.exe" },
+  };
+  const result = await classifyOperationFacts(ctx, options(), request);
+  assert.equal(result.kind, "inspection");
+  const parsed = JSON.parse(text) as Record<string, unknown>;
+  assert.equal(parsed.platform, process.platform);
+  assert.deepEqual(parsed.shell, { platform: "win32", interpreter: "cmd.exe" });
+  assert.deepEqual(Object.keys(parsed),
+    ["action", "resources", "operation", "projectDir", "worktreeRoot", "platform", "shell"]);
+});
+
+it("abstains before generation when carried shell evidence is truncated", async () => {
+  const fake = responder([inspectionReply(true, 0.99)]);
+  const request: OperationFactRequest = {
+    ...shellRequest("bun test"),
+    shell: { interpreter: `/${"x".repeat(600)}` },
+  };
+  const result = await classifyOperationFacts(fake.ctx, options(), request);
+  assert.equal(result.kind, "unknown");
+  assert.equal(result.errorKind, "context");
+  assert.equal(fake.calls(), 0);
+});
+
+it("skips POSIX segmentation and cd folding for a non-POSIX shell", async () => {
+  for (const shell of [{ platform: "win32", interpreter: "cmd.exe" }, { interpreter: "pwsh" }, { interpreter: "fish" }]) {
+    const texts: string[] = [];
+    const replies: Reply[] = [inspectionReply(false, 0.02), kindReply("test_run", 0.97)];
+    const ctx = context(async (input) => {
+      texts.push(input.input[0]?.type === "text" ? input.input[0].text : "");
+      const reply = replies[texts.length - 1];
+      return reply === undefined ? undefined : reply();
+    });
+    const request: OperationFactRequest = { ...shellRequest("git status && git log"), shell };
+    const result = await classifyOperationFacts(ctx, options(), request);
+    assert.equal(result.kind, "test_run", JSON.stringify(shell));
+    assert.equal(texts.length, 2, JSON.stringify(shell));
+    const input = JSON.parse(texts[1] ?? "") as Record<string, unknown>;
+    assert.equal(input.command, "git status && git log", JSON.stringify(shell));
+    assert.equal(input.platform, process.platform, JSON.stringify(shell));
+    assert.deepEqual(input.shell, shell, JSON.stringify(shell));
+  }
+});
+
+it("keeps POSIX segmentation for a POSIX shell interpreter", async () => {
+  const texts: string[] = [];
+  const replies: Reply[] = [inspectionReply(false, 0.02), inspectionReply(true, 0.97), inspectionReply(true, 0.96)];
+  const ctx = context(async (input) => {
+    texts.push(input.input[0]?.type === "text" ? input.input[0].text : "");
+    const reply = replies[texts.length - 1];
+    return reply === undefined ? undefined : reply();
+  });
+  const request: OperationFactRequest = { ...shellRequest("git status && git log"), shell: { interpreter: "/bin/bash" } };
+  const result = await classifyOperationFacts(ctx, options(), request);
+  assert.equal(result.kind, "inspection");
+  assert.equal(texts.length, 3);
+  assert.deepEqual(JSON.parse(texts[1] ?? ""), {
+    command: "git status", fullCommand: "git status && git log", segmentIndex: 0,
+    cwd: "/repo", platform: process.platform, shell: { interpreter: "/bin/bash" },
+  });
+});
+
+it("sends the v3 segment input as command, full command, index, cwd then context", async () => {
   const texts: string[] = [];
   const replies: Reply[] = [
     inspectionReply(false, 0.02),
@@ -466,7 +536,7 @@ it("sends the v2 segment input as command, full command, index then cwd", async 
   const result = await classifyOperationFacts(ctx, options(), shellRequest("bun test --filter 'decision suite'"));
   assert.equal(result.kind, "shell_segments");
   assert.equal(texts.length, 3);
-  assert.equal(texts[1], `{"command":"bun test --filter 'decision suite'","fullCommand":"bun test --filter 'decision suite'","segmentIndex":0,"cwd":"/repo"}`);
+  assert.equal(texts[1], `{"command":"bun test --filter 'decision suite'","fullCommand":"bun test --filter 'decision suite'","segmentIndex":0,"cwd":"/repo","platform":"${process.platform}"}`);
   assert.equal(texts[2], texts[1]);
 });
 
@@ -492,7 +562,7 @@ it("prefers an explicit captured workdir over the evaluated projectDir", async (
   const result = await classifyOperationFacts(ctx, options(), request);
   assert.equal(result.kind, "shell_segments");
   assert.equal(texts.length, 3);
-  assert.equal(texts[1], `{"command":"bun test","fullCommand":"bun test","segmentIndex":0,"cwd":"/repo/pkg"}`);
+  assert.equal(texts[1], `{"command":"bun test","fullCommand":"bun test","segmentIndex":0,"cwd":"/repo/pkg","platform":"${process.platform}"}`);
   assert.equal(texts[2], texts[1]);
 });
 
@@ -515,7 +585,7 @@ it("resolves a relative explicit workdir against the evaluated projectDir", asyn
   const result = await classifyOperationFacts(ctx, options(), request);
   assert.equal(result.kind, "shell_segments");
   assert.equal(texts.length, 3);
-  assert.equal(texts[1], `{"command":"bun test","fullCommand":"bun test","segmentIndex":0,"cwd":"/repo/sub"}`);
+  assert.equal(texts[1], `{"command":"bun test","fullCommand":"bun test","segmentIndex":0,"cwd":"/repo/sub","platform":"${process.platform}"}`);
   assert.equal(texts[2], texts[1]);
 });
 
@@ -553,6 +623,30 @@ it("abstains before any call for a missing cwd under an existing root", async ()
   assert.equal(fake.calls(), 0);
 });
 
+it("abstains before any call for an explicit workdir that is a regular file", async () => {
+  const fake = responder([inspectionReply(true, 0.99)]);
+  const result = await classifyOperationFacts(fake.ctx, options(),
+    realShellRequest("bun test", join(SHELL_ROOT, "sub", "plainfile")));
+  assert.equal(result.kind, "unknown");
+  assert.equal(result.errorKind, "context");
+  assert.match(result.reason, /usable explicit cwd/);
+  assert.equal(fake.calls(), 0);
+});
+
+it("abstains after inspection when a folded cd target is a regular file", async () => {
+  // A leading `cd` only folds when every later separator is `&&`, so a target
+  // that is a regular file must abort before `rm ../victim` is classified
+  // under the file path as cwd; only the whole-command call runs.
+  for (const command of ["cd ./sub/plainfile && rm ../victim", "cd sub/plainfile && rm ../victim"]) {
+    const fake = responder([inspectionReply(false, 0.02), inspectionReply(true, 0.99)]);
+    const result = await classifyOperationFacts(fake.ctx, options(), realShellRequest(command));
+    assert.equal(result.kind, "unknown", command);
+    assert.equal(result.errorKind, "context", command);
+    assert.match(result.reason, /leading cd/, command);
+    assert.equal(fake.calls(), 1, command);
+  }
+});
+
 it("abstains after inspection for a folded cd target missing under an existing root", async () => {
   const fake = responder([inspectionReply(false, 0.02), inspectionReply(true, 0.99)]);
   const result = await classifyOperationFacts(fake.ctx, options(),
@@ -575,12 +669,13 @@ it("accepts an existing subdirectory inside the real root as the explicit workdi
   assert.equal(result.kind, "inspection");
   assert.equal(texts[1], JSON.stringify({
     command: "git status", fullCommand: "git status", segmentIndex: 0, cwd: SHELL_SUB,
+    platform: process.platform,
   }));
 });
 
 it("abstains after inspection when a folded cd follows a symlink outside the real root", async () => {
   const fake = responder([inspectionReply(false, 0.02)]);
-  const result = await classifyOperationFacts(fake.ctx, options(), realShellRequest("cd link && rm x"));
+  const result = await classifyOperationFacts(fake.ctx, options(), realShellRequest("cd ./link && rm x"));
   assert.equal(result.kind, "unknown");
   assert.equal(result.errorKind, "context");
   assert.match(result.reason, /leading cd/);
@@ -589,7 +684,7 @@ it("abstains after inspection when a folded cd follows a symlink outside the rea
 
 it("does not flatten a symlink followed by .. before the physical cwd check", async () => {
   const fake = responder([inspectionReply(false, 0.02)]);
-  const result = await classifyOperationFacts(fake.ctx, options(), realShellRequest("cd link/.. && git status"));
+  const result = await classifyOperationFacts(fake.ctx, options(), realShellRequest("cd ./link/.. && git status"));
   assert.equal(result.kind, "unknown");
   assert.equal(result.errorKind, "context");
   assert.match(result.reason, /leading cd/);
@@ -600,7 +695,7 @@ it("abstains after inspection when a folded cd climbs past an internal symlink",
   // Bash folds `inner/../..` logically to the root's parent, while the physical
   // walk names an in-root directory; the fold must not certify a cwd at all.
   const fake = responder([inspectionReply(false, 0.02), inspectionReply(true, 0.99)]);
-  const result = await classifyOperationFacts(fake.ctx, options(), realShellRequest("cd inner/../.. && rm victim"));
+  const result = await classifyOperationFacts(fake.ctx, options(), realShellRequest("cd ./inner/../.. && rm victim"));
   assert.equal(result.kind, "unknown");
   assert.equal(result.errorKind, "context");
   assert.match(result.reason, /leading cd/);
@@ -615,10 +710,11 @@ it("still folds a parent step with no symlink component", async () => {
     const reply = replies[texts.length - 1];
     return reply === undefined ? undefined : reply();
   });
-  const result = await classifyOperationFacts(ctx, options(), realShellRequest("cd pkg/../sub && git status"));
+  const result = await classifyOperationFacts(ctx, options(), realShellRequest("cd ./pkg/../sub && git status"));
   assert.equal(result.kind, "inspection");
   assert.equal(texts[1], JSON.stringify({
-    command: "git status", fullCommand: "cd pkg/../sub && git status", segmentIndex: 0, cwd: SHELL_SUB,
+    command: "git status", fullCommand: "cd ./pkg/../sub && git status", segmentIndex: 0, cwd: SHELL_SUB,
+    platform: process.platform,
   }));
 });
 
@@ -644,7 +740,7 @@ it("omits an unknown shell cwd but still sends the complete captured command", a
   const result = await classifyOperationFacts(ctx, options(), request);
   assert.equal(result.kind, "shell_segments");
   assert.equal(texts.length, 3);
-  assert.equal(texts[1], `{"command":"bun test","fullCommand":"bun test","segmentIndex":0}`);
+  assert.equal(texts[1], `{"command":"bun test","fullCommand":"bun test","segmentIndex":0,"platform":"${process.platform}"}`);
   assert.equal(texts[2], texts[1]);
 });
 
@@ -714,7 +810,7 @@ it("runs the segment stage for the bash shell alias", async () => {
   assert.equal(result.probability, 0.97);
   assert.equal(texts.length, 3);
   assert.match(texts[0] ?? "", /"action":"bash"/);
-  assert.equal(texts[1], `{"command":"bun test","fullCommand":"bun test","segmentIndex":0,"cwd":"/repo"}`);
+  assert.equal(texts[1], `{"command":"bun test","fullCommand":"bun test","segmentIndex":0,"cwd":"/repo","platform":"${process.platform}"}`);
   assert.equal(texts[2], texts[1]);
 });
 
@@ -922,14 +1018,14 @@ it("classifies every top-level segment and reports the weakest probability", asy
   assert.equal(result.kind, "shell_segments");
   assert.equal(result.probability, 0.95);
   assert.deepEqual(texts.slice(1), [
-    `{"command":"grep -n foo src/a.ts","fullCommand":"grep -n foo src/a.ts; git diff | head; bun run typecheck","segmentIndex":0,"cwd":"/repo"}`,
-    `{"command":"grep -n foo src/a.ts","fullCommand":"grep -n foo src/a.ts; git diff | head; bun run typecheck","segmentIndex":0,"cwd":"/repo"}`,
-    `{"command":"git diff","fullCommand":"grep -n foo src/a.ts; git diff | head; bun run typecheck","segmentIndex":1,"cwd":"/repo"}`,
-    `{"command":"git diff","fullCommand":"grep -n foo src/a.ts; git diff | head; bun run typecheck","segmentIndex":1,"cwd":"/repo"}`,
-    `{"command":"head","fullCommand":"grep -n foo src/a.ts; git diff | head; bun run typecheck","segmentIndex":2,"cwd":"/repo"}`,
-    `{"command":"head","fullCommand":"grep -n foo src/a.ts; git diff | head; bun run typecheck","segmentIndex":2,"cwd":"/repo"}`,
-    `{"command":"bun run typecheck","fullCommand":"grep -n foo src/a.ts; git diff | head; bun run typecheck","segmentIndex":3,"cwd":"/repo"}`,
-    `{"command":"bun run typecheck","fullCommand":"grep -n foo src/a.ts; git diff | head; bun run typecheck","segmentIndex":3,"cwd":"/repo"}`,
+    `{"command":"grep -n foo src/a.ts","fullCommand":"grep -n foo src/a.ts; git diff | head; bun run typecheck","segmentIndex":0,"cwd":"/repo","platform":"${process.platform}"}`,
+    `{"command":"grep -n foo src/a.ts","fullCommand":"grep -n foo src/a.ts; git diff | head; bun run typecheck","segmentIndex":0,"cwd":"/repo","platform":"${process.platform}"}`,
+    `{"command":"git diff","fullCommand":"grep -n foo src/a.ts; git diff | head; bun run typecheck","segmentIndex":1,"cwd":"/repo","platform":"${process.platform}"}`,
+    `{"command":"git diff","fullCommand":"grep -n foo src/a.ts; git diff | head; bun run typecheck","segmentIndex":1,"cwd":"/repo","platform":"${process.platform}"}`,
+    `{"command":"head","fullCommand":"grep -n foo src/a.ts; git diff | head; bun run typecheck","segmentIndex":2,"cwd":"/repo","platform":"${process.platform}"}`,
+    `{"command":"head","fullCommand":"grep -n foo src/a.ts; git diff | head; bun run typecheck","segmentIndex":2,"cwd":"/repo","platform":"${process.platform}"}`,
+    `{"command":"bun run typecheck","fullCommand":"grep -n foo src/a.ts; git diff | head; bun run typecheck","segmentIndex":3,"cwd":"/repo","platform":"${process.platform}"}`,
+    `{"command":"bun run typecheck","fullCommand":"grep -n foo src/a.ts; git diff | head; bun run typecheck","segmentIndex":3,"cwd":"/repo","platform":"${process.platform}"}`,
   ]);
   assert.match(result.reason, /segments fact 4 local/);
 });
@@ -967,7 +1063,7 @@ it("keeps the operation-kind path when the command cannot be split", async () =>
   const result = await classifyOperationFacts(ctx, options(), shellRequest("bun test > /tmp/out"));
   assert.equal(result.kind, "test_run");
   assert.equal(texts.length, 2);
-  assert.equal(texts[1], `{"command":"bun test > /tmp/out","cwd":"/repo"}`);
+  assert.equal(texts[1], `{"command":"bun test > /tmp/out","cwd":"/repo","platform":"${process.platform}"}`);
 });
 
 it("passes the whole command through as segment context for a filtering segment", async () => {
@@ -989,10 +1085,10 @@ it("passes the whole command through as segment context for a filtering segment"
   assert.equal(result.kind, "shell_segments");
   assert.equal(result.probability, 0.95);
   assert.deepEqual(texts.slice(1), [
-    `{"command":"echo x","fullCommand":"echo x | head","segmentIndex":0,"cwd":"/repo"}`,
-    `{"command":"echo x","fullCommand":"echo x | head","segmentIndex":0,"cwd":"/repo"}`,
-    `{"command":"head","fullCommand":"echo x | head","segmentIndex":1,"cwd":"/repo"}`,
-    `{"command":"head","fullCommand":"echo x | head","segmentIndex":1,"cwd":"/repo"}`,
+    `{"command":"echo x","fullCommand":"echo x | head","segmentIndex":0,"cwd":"/repo","platform":"${process.platform}"}`,
+    `{"command":"echo x","fullCommand":"echo x | head","segmentIndex":0,"cwd":"/repo","platform":"${process.platform}"}`,
+    `{"command":"head","fullCommand":"echo x | head","segmentIndex":1,"cwd":"/repo","platform":"${process.platform}"}`,
+    `{"command":"head","fullCommand":"echo x | head","segmentIndex":1,"cwd":"/repo","platform":"${process.platform}"}`,
   ]);
   assert.deepEqual(instructions, [SEGMENT_INSPECTION_QUESTION.instructions, SEGMENT_INSPECTION_QUESTION.instructions]);
 });
@@ -1012,8 +1108,8 @@ it("passes an echo segment through with the whole command as context", async () 
   const result = await classifyOperationFacts(ctx, options(), shellRequest("echo x"));
   assert.equal(result.kind, "shell_segments");
   assert.deepEqual(texts.slice(1), [
-    `{"command":"echo x","fullCommand":"echo x","segmentIndex":0,"cwd":"/repo"}`,
-    `{"command":"echo x","fullCommand":"echo x","segmentIndex":0,"cwd":"/repo"}`,
+    `{"command":"echo x","fullCommand":"echo x","segmentIndex":0,"cwd":"/repo","platform":"${process.platform}"}`,
+    `{"command":"echo x","fullCommand":"echo x","segmentIndex":0,"cwd":"/repo","platform":"${process.platform}"}`,
   ]);
 });
 
@@ -1035,8 +1131,10 @@ it("asks one command_local question when an unsplittable operation_kind does not
   assert.equal(result.probability, 0.96);
   assert.match(result.reason, /local-only/);
   assert.equal(texts.length, 3);
-  assert.equal(texts[1], JSON.stringify({ command, cwd: "/repo" }));
-  assert.deepEqual(JSON.parse(texts[2] ?? ""), { command, cwd: "/repo", tempDir: resolve(tmpdir()) });
+  assert.equal(texts[1], JSON.stringify({ command, cwd: "/repo", platform: process.platform }));
+  assert.deepEqual(JSON.parse(texts[2] ?? ""), {
+    command, cwd: "/repo", tempDir: resolve(tmpdir()), platform: process.platform,
+  });
 });
 
 it("keeps a false or below-floor command_local answer unknown", async () => {
@@ -1085,8 +1183,8 @@ it("folds one leading literal cd and classifies every segment under the confined
   assert.equal(result.kind, "inspection");
   assert.equal(result.probability, 0.97);
   assert.deepEqual(texts.slice(1), [
-    JSON.stringify({ command: "git status", fullCommand: command, segmentIndex: 0, cwd: SHELL_SUB }),
-    JSON.stringify({ command: "git log -3", fullCommand: command, segmentIndex: 1, cwd: SHELL_SUB }),
+    JSON.stringify({ command: "git status", fullCommand: command, segmentIndex: 0, cwd: SHELL_SUB, platform: process.platform }),
+    JSON.stringify({ command: "git log -3", fullCommand: command, segmentIndex: 1, cwd: SHELL_SUB, platform: process.platform }),
   ]);
 });
 
@@ -1099,12 +1197,12 @@ it("resolves a folded relative cd against the explicit workdir", async () => {
     return reply === undefined ? undefined : reply();
   });
   const request: OperationFactRequest = {
-    ...shellRequest("cd sub && git status"),
-    operation: { ...shellOperation("cd sub && git status"), arguments: { command: "cd sub && git status", workdir: "/repo/pkg" } },
+    ...shellRequest("cd ./sub && git status"),
+    operation: { ...shellOperation("cd ./sub && git status"), arguments: { command: "cd ./sub && git status", workdir: "/repo/pkg" } },
   };
   const result = await classifyOperationFacts(ctx, options(), request);
   assert.equal(result.kind, "inspection");
-  assert.equal(texts[1], `{"command":"git status","fullCommand":"cd sub && git status","segmentIndex":0,"cwd":"/repo/pkg/sub"}`);
+  assert.equal(texts[1], `{"command":"git status","fullCommand":"cd ./sub && git status","segmentIndex":0,"cwd":"/repo/pkg/sub","platform":"${process.platform}"}`);
 });
 
 it("abstains after the whole-command inspection when the folded cd escapes containment", async () => {
@@ -1116,6 +1214,17 @@ it("abstains after the whole-command inspection when the folded cd escapes conta
     assert.match(result.reason, /leading cd/, command);
     assert.equal(fake.calls(), 1, command);
   }
+});
+
+it("refuses to fold a bare relative cd target that CDPATH could redirect", async () => {
+  // CDPATH=/outside can make `cd sub` enter /outside/sub, so only explicitly
+  // relative `./sub` targets carry a cwd the classifier can certify.
+  const fake = responder([inspectionReply(false, 0.02), inspectionReply(true, 0.99)]);
+  const result = await classifyOperationFacts(fake.ctx, options(), realShellRequest("cd sub && rm victim"));
+  assert.equal(result.kind, "unknown");
+  assert.equal(result.errorKind, "context");
+  assert.match(result.reason, /leading cd/);
+  assert.equal(fake.calls(), 1);
 });
 
 it("certifies a single read-only segment as inspection without a segment_local call", async () => {
