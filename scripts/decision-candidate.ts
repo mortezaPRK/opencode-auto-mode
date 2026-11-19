@@ -62,7 +62,10 @@ function answersOf(response: unknown, questions: readonly Question[]): Map<strin
   const types = new Map(questions.map((q) => [q.name, q.type]));
   const found = new Map<string, Answer>();
   for (const answer of answers) {
-    if (!isRecord(answer) || typeof answer.name !== "string" || found.has(answer.name) || types.get(answer.name) !== answer.type) return undefined;
+    // An unknown name has no expected type; without the has() check an answer
+    // with no `type` matches `undefined === undefined` and later throws.
+    if (!isRecord(answer) || typeof answer.name !== "string" || !types.has(answer.name) ||
+        types.get(answer.name) !== answer.type || found.has(answer.name)) return undefined;
     found.set(answer.name, answer);
   }
   return found.size === questions.length ? found : undefined;

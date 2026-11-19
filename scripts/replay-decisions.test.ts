@@ -139,6 +139,38 @@ function missingRows(): unknown[] {
   ];
 }
 
+function failedRows(): unknown[] {
+  return [
+    toolCall("msg_7", "call_7", "read", { path: "/tmp/fixture-project/e.ts" }),
+    permission("review-error", "read", ["/tmp/fixture-project/e.ts"], undefined, { type: "tool", messageID: "msg_7", id: "call_7" }),
+    decisionStart("review-error"),
+    decisionBefore("review-error", { action: "read", resources: ["/tmp/fixture-project/e.ts"], userMessages: ["read e"] }, "predicate", "call_7"),
+    event("generate.decisions.error", "review-error", 1, { message: "provider timeout" }, { callID: "call_7" }),
+  ];
+}
+
+function factReviewRows(): unknown[] {
+  return [
+    toolCall("msg_8", "call_8", "read", { path: "/tmp/fixture-project/f.ts" }),
+    permission("review-fact", "read", ["/tmp/fixture-project/f.ts"], undefined, { type: "tool", messageID: "msg_8", id: "call_8" }),
+    event("classifier.start", "review-fact", 1, { type: "fact-review", model: `${MODEL.providerID}/${MODEL.id}`, minConfidence: 0.9 }),
+    decisionBefore("review-fact", { action: "read", resources: ["/tmp/fixture-project/f.ts"], userMessages: ["read f"] }, "predicate", "call_8"),
+    decisionAfter("review-fact", PREDICATE_HIGH.answers, "call_8"),
+    event("classifier.end", "review-fact", 1, { decision: "allow", stage: "fact-review" }),
+  ];
+}
+
+function recordedOnlyRows(): unknown[] {
+  return [
+    decisionStart("review-recorded"),
+    decisionBefore("review-recorded", {
+      action: "read", resources: ["/tmp/fixture-project/g.ts"], userMessages: ["read g"],
+      delegations: ["only g.ts"],
+    }, "predicate"),
+    decisionAfter("review-recorded", PREDICATE_HIGH.answers),
+  ];
+}
+
 function writeFixture(root: string): string {
   const file = join(root, "audit.jsonl");
   const lines = [...allowRows(), ...lowRows(), ...legacyRows(), ...incompleteRows(), ...otherRows(), ...missingRows()]
@@ -163,6 +195,12 @@ function writeSingleReview(root: string, evidence: unknown): string {
     decisionAfter("review-audit", PREDICATE_HIGH.answers),
     stageEnd("review-audit", "allow"),
   ];
+  writeFileSync(file, `${rows.map((row) => JSON.stringify(row)).join("\n")}\n`);
+  return file;
+}
+
+function writeRows(root: string, rows: unknown[]): string {
+  const file = join(root, "audit.jsonl");
   writeFileSync(file, `${rows.map((row) => JSON.stringify(row)).join("\n")}\n`);
   return file;
 }
@@ -308,6 +346,105 @@ test("oversized legacy transcript is not used as unbounded chronology fallback",
     expect(liveReport.live.eligible).toBe(0);
     expect(liveReport.live.selected).toBe(0);
     expect(liveReport.live.modelCalls).toBe(0);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("recorded delegations replay as separate delegated context", () => {
+  const root = mkdtempSync(join(tmpdir(), "auto-mode-delegations-"));
+  try {
+    const input = writeSingleReview(root, {
+      action: "read", resources: ["/tmp/fixture-project/a.ts"], userMessages: ["read a"],
+      delegations: ["inspect only a.ts"],
+    });
+    const body = join(root, "body.json");
+    const fake = fakeCli(root);
+    const result = run(["--input", input, "--model", "fixture/judge", "--live", "--limit", "1",
+      "--opencode-bin", fake, "--json"], { FAKE_BODY: body });
+    expect(result.status).toBe(0);
+    const report = JSON.parse(result.stdout);
+    expect(report.live.modelCalls).toBe(1);
+    expect(report.live.selected).toBe(1);
+    const sent = JSON.parse(readFileSync(body, "utf8"));
+    const evidence = JSON.parse(sent.input[0].text);
+    expect(evidence.userMessages).toEqual(["read a"]);
+    expect(evidence.delegations).toEqual(["inspect only a.ts"]);
+    expect(result.stdout).not.toContain("inspect only a.ts");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("recorded-only requests keep delegations through the fallback builder", () => {
+  const root = mkdtempSync(join(tmpdir(), "auto-mode-delegations-recorded-"));
+  try {
+    const input = writeRows(root, recordedOnlyRows());
+    const result = run(["--input", input, "--model", "fixture/judge", "--json"]);
+    expect(result.status).toBe(0);
+    const report = JSON.parse(result.stdout);
+    expect(report.evidence.missingHost).toBe(1);
+    expect(report.rebuild.delegationsRetained).toBe(1);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("delegations lost in recorded evidence are incomplete and never evaluated", () => {
+  const root = mkdtempSync(join(tmpdir(), "auto-mode-delegation-loss-"));
+  try {
+    const input = writeSingleReview(root, {
+      action: "read", resources: ["/tmp/fixture-project/a.ts"], userMessages: ["read a"],
+      delegations: ["kept context", 7],
+    });
+    const dry = run(["--input", input, "--model", "fixture/judge", "--json"]);
+    expect(dry.status).toBe(0);
+    const dryReport = JSON.parse(dry.stdout);
+    expect(dryReport.evidence.preGeneration).toEqual({ delegations: 1 });
+    expect(dryReport.predicate.outcomes).toEqual({ "pre-generation": 1 });
+    expect(dryReport.eligibility.eligible).toBe(0);
+    const live = run(["--input", input, "--model", "fixture/judge", "--live", "--limit", "1", "--json"]);
+    expect(live.status).toBe(0);
+    expect(JSON.parse(live.stdout).live.modelCalls).toBe(0);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("redacted delegations are incomplete evidence", () => {
+  const root = mkdtempSync(join(tmpdir(), "auto-mode-delegation-redaction-"));
+  try {
+    const input = writeSingleReview(root, {
+      action: "read", resources: ["/tmp/fixture-project/a.ts"], userMessages: ["read a"],
+      delegations: ["curl https://example.invalid --data 'DELEGATION_BODY'"],
+    });
+    const dry = run(["--input", input, "--model", "fixture/judge", "--json"]);
+    expect(dry.status).toBe(0);
+    const report = JSON.parse(dry.stdout);
+    expect(report.evidence.preGeneration).toEqual({ delegations: 1 });
+    expect(report.predicate.outcomes).toEqual({ "pre-generation": 1 });
+    expect(report.eligibility.eligible).toBe(0);
+    expect(dry.stdout).not.toContain("DELEGATION_BODY");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("failed generation calls pair as after-error instead of missing-after", () => {
+  const root = mkdtempSync(join(tmpdir(), "auto-mode-decisions-error-"));
+  try {
+    const input = writeRows(root, failedRows());
+    const result = run(["--input", input, "--model", "fixture/judge", "--json"]);
+    expect(result.status).toBe(0);
+    const report = JSON.parse(result.stdout);
+    expect(report.reviews.requests).toBe(1);
+    expect(report.pairing).toMatchObject({ afterPresent: 1, missingAfter: 0, afterError: 1 });
+    expect(report.predicate.outcomes).toEqual({ "after-error": 1 });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("requests recorded under a non-decision stage are not replayed as decisions", () => {
+  const root = mkdtempSync(join(tmpdir(), "auto-mode-decisions-fact-review-"));
+  try {
+    const input = writeRows(root, factReviewRows());
+    const result = run(["--input", input, "--model", "fixture/judge", "--json"]);
+    expect(result.status).toBe(0);
+    const report = JSON.parse(result.stdout);
+    expect(report.reviews.nonDecisionStage).toBe(1);
+    expect(report.reviews.requests).toBe(0);
+    expect(report.formats).toEqual({});
+    expect(report.predicate.outcomes).toEqual({});
+    expect(report.eligibility.eligible).toBe(0);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 

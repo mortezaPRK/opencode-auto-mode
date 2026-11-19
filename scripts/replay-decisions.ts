@@ -32,6 +32,7 @@ const MAX_TOOL_CAPTURES = 256;
 const MAX_DETAIL_ROWS = 200;
 const MAX_PROBLEMS = 8;
 const CLI_MAX_BUFFER = 2 * 1024 * 1024;
+const DELEGATION_LOSS = "Delegated context was redacted or lost";
 
 type Counts = Record<string, number>;
 type Json = Record<string, unknown>;
@@ -153,6 +154,7 @@ interface State {
   duplicateEvents: number;
   filteredOut: number;
   orphanAfter: number;
+  nonDecisionStage: number;
 }
 
 interface RecordedEvidence {
@@ -163,6 +165,9 @@ interface RecordedEvidence {
   worktreeRoot?: string;
   scopeResolution?: "unknown";
   userMessages?: string[];
+  delegations?: string[];
+  /** True when the recorded delegation list was dropped (bounds or invalid entries). */
+  delegationsLost: boolean;
   transcript?: string;
   staticAnalysis?: { band: string; reason: string; findings?: string[] };
   gitState?: { branch?: string; defaultBranch?: string; clean?: boolean };
@@ -178,7 +183,7 @@ interface Candidate {
   metadataInvalid: boolean;
   codeModeError: boolean;
   terminal?: "opaque";
-  preGeneration?: "resources" | "operation" | "too-large";
+  preGeneration?: "resources" | "operation" | "delegations" | "too-large";
   bytes: number;
   readOnly: boolean;
   userMessagesRetained: boolean;
@@ -281,6 +286,7 @@ interface RebuildReport {
   userMessagesRetained: number;
   chronologyFallback: number;
   resourcesChanged: number;
+  delegationsRetained: number;
   operationAccess: Counts;
   operationTool: Counts;
   operationTargets: number;
@@ -308,6 +314,7 @@ interface Report {
     duplicateEvents: number;
     filteredOut: number;
     orphanAfter: number;
+    nonDecisionStage: number;
   };
   formats: Counts;
   evidence: {
@@ -622,7 +629,7 @@ function ensureState(): State {
     stats: { files: 0, lines: 0, bytes: 0, parsed: 0, malformed: 0, oversized: 0, skipped: 0 },
     reviews: new Map(), pendingHosts: new Map(), pendingStarts: new Map(),
     toolInputs: createToolInputStore(MAX_TOOL_CAPTURES), seen: new Set(),
-    problems: [], duplicateEvents: 0, filteredOut: 0, orphanAfter: 0,
+    problems: [], duplicateEvents: 0, filteredOut: 0, orphanAfter: 0, nonDecisionStage: 0,
   };
 }
 
@@ -895,6 +902,21 @@ function decisionAfter(state: State, env: Json): void {
   target.after = { answers: payload.answers, hasError: payload.answers === undefined, callID: ids.callID, ts: stringValue(env.ts) };
 }
 
+/** A rejected SDK promise emits `generate.decisions.error` instead of `.after`;
+ * pairing it as a failed outcome keeps provider failures out of missing-after. */
+function decisionError(state: State, env: Json): void {
+  const ids = decisionAfterKey(env);
+  if (!ids) return;
+  const key = `generate.decisions.error|${ids.reviewID}|${ids.stageIndex}|${ids.callID ?? stringValue(env.ts) ?? "-"}`;
+  if (seenBefore(state, key)) return;
+  const review = state.reviews.get(ids.reviewID);
+  if (!review) return;
+  const target = afterTarget(review, ids.stageIndex, ids.callID);
+  if (!target) { state.orphanAfter++; return; }
+  if (target.after) { state.duplicateEvents++; return; }
+  target.after = { hasError: true, callID: ids.callID, ts: stringValue(env.ts) };
+}
+
 function onFinal(state: State, env: Json): void {
   const reviewID = stringValue(env.reviewID);
   const decision = stringValue(env.decision);
@@ -905,14 +927,20 @@ function onFinal(state: State, env: Json): void {
   review.final = { decision, stage, errorKind: stringValue(env.errorKind) };
 }
 
+function decisionEvent(state: State, type: string | undefined, env: Json, filter: ModelFilter): boolean {
+  if (type === "generate.decisions.before") { decisionBefore(state, env, filter); return true; }
+  if (type === "generate.decisions.after") { decisionAfter(state, env); return true; }
+  if (type === "generate.decisions.error") { decisionError(state, env); return true; }
+  return false;
+}
+
 function dispatch(state: State, env: Json, filter: ModelFilter): void {
   const type = stringValue(env.type);
   if (type === "tool.execute.before") { onToolExecute(state, env); return; }
   if (type === "permission.evaluate.before") { onPermission(state, env); return; }
   if (type === "classifier.start") { onStageStart(state, env); return; }
   if (type === "classifier.end") { onStageEnd(state, env); return; }
-  if (type === "generate.decisions.before") { decisionBefore(state, env, filter); return; }
-  if (type === "generate.decisions.after") { decisionAfter(state, env); return; }
+  if (decisionEvent(state, type, env, filter)) return;
   if (type === undefined && env.decision !== undefined && env.stage !== undefined) onFinal(state, env);
 }
 
@@ -983,6 +1011,18 @@ function boundedTranscript(value: unknown): string | undefined {
   return text === undefined || Buffer.byteLength(text) > MAX_CHRONOLOGY_BYTES ? undefined : text;
 }
 
+/** Delegations are neither user authority nor part of userMessages. Anything
+ * dropped by bounds or validation is reported as loss so replay can abstain. */
+function recordedDelegations(value: unknown): { delegations?: string[]; lost: boolean } {
+  if (value === undefined) return { lost: false };
+  if (!Array.isArray(value)) return { lost: true };
+  const delegations = value.filter((item): item is string => typeof item === "string");
+  return {
+    ...(delegations.length === 0 ? {} : { delegations }),
+    lost: delegations.length !== value.length,
+  };
+}
+
 function staticAnalysis(value: unknown): RecordedEvidence["staticAnalysis"] {
   const object = jsonRecord(value);
   if (!object) return undefined;
@@ -1014,6 +1054,7 @@ function recordedEvidence(text: string | undefined): RecordedEvidence | undefine
   const object = jsonRecord(parsed);
   if (!object) return undefined;
   const scope = object.scopeResolution === "unknown" ? "unknown" as const : undefined;
+  const delegations = recordedDelegations(object.delegations);
   return {
     action: optionalString(object.action),
     resources: stringArray(object.resources),
@@ -1022,6 +1063,8 @@ function recordedEvidence(text: string | undefined): RecordedEvidence | undefine
     worktreeRoot: optionalString(object.worktreeRoot),
     scopeResolution: scope,
     userMessages: chronology(object.userMessages),
+    delegations: delegations.delegations,
+    delegationsLost: delegations.lost,
     transcript: boundedTranscript(object.userInstruction),
     staticAnalysis: staticAnalysis(object.staticAnalysis),
     gitState: gitState(object.gitState),
@@ -1034,6 +1077,7 @@ function requestFromRecorded(recorded: RecordedEvidence | undefined): DecisionEv
     action: recorded.action, resources: recorded.resources, agent: recorded.agent,
     projectDir: recorded.projectDir, worktreeRoot: recorded.worktreeRoot,
     scopeResolution: recorded.scopeResolution, userMessages: recorded.userMessages,
+    delegations: recorded.delegations,
     transcript: recorded.transcript, staticAnalysis: recorded.staticAnalysis, gitState: recorded.gitState,
   };
 }
@@ -1063,7 +1107,8 @@ function requestFromHost(host: HostEvent, recorded: RecordedEvidence | undefined
   return {
     action: host.action, resources, agent: hostAgent(host, recorded), projectDir: hostProjectDir(host, recorded),
     worktreeRoot: recorded?.worktreeRoot, scopeResolution: recorded?.scopeResolution,
-    userMessages: recorded?.userMessages, transcript: recorded?.transcript,
+    userMessages: recorded?.userMessages, delegations: recorded?.delegations,
+    transcript: recorded?.transcript,
     staticAnalysis: recorded?.staticAnalysis, gitState: recorded?.gitState, operation,
   };
 }
@@ -1078,8 +1123,17 @@ function resourceLoss(request: DecisionEvidenceRequest): boolean {
   return request.resources.some((resource) => redactHttpBodies(resource) !== resource);
 }
 
+/** Recorded delegations dropped by bounds or validation, or redacted on rebuild,
+ * are incomplete context: replay abstains before generation instead of narrowing
+ * authorization with missing delegated scope. */
+function delegationLoss(recorded: RecordedEvidence | undefined, evidence: DecisionEvidence): DecisionEvidence {
+  if (recorded?.delegationsLost !== true || evidence.incompleteEvidenceKind !== undefined) return evidence;
+  return { ...evidence, incompleteEvidence: DELEGATION_LOSS, incompleteEvidenceKind: "delegations" };
+}
+
 function preGenerationOf(evidence: DecisionEvidence, bytes: number, request: DecisionEvidenceRequest): Candidate["preGeneration"] {
   if (resourceLoss(request)) return "resources";
+  if (evidence.incompleteEvidenceKind === "delegations") return "delegations";
   if (evidence.operation?.complete === false) return "operation";
   return bytes > 60_000 ? "too-large" : undefined;
 }
@@ -1118,7 +1172,7 @@ function rebuildFlags(recorded: RecordedEvidence | undefined, evidence: Decision
 
 function missingHostCandidate(recorded: RecordedEvidence | undefined): Candidate {
   const fallback = requestFromRecorded(recorded);
-  const evidence: DecisionEvidence = fallback === undefined ? { action: "", resources: [] } : buildDecisionEvidence(fallback);
+  const evidence: DecisionEvidence = fallback === undefined ? { action: "", resources: [] } : delegationLoss(recorded, buildDecisionEvidence(fallback));
   const bytes = fallback === undefined ? 0 : Buffer.byteLength(JSON.stringify(evidence));
   return {
     request: fallback ?? { action: "", resources: [] }, evidence,
@@ -1147,7 +1201,7 @@ function candidateFor(review: ReviewState, request: DecisionRequestAudit): Candi
   if (!resources) return codeModeCandidate(review.host, fallback);
   const operation = hostOperation(review.host, recorded);
   const built = requestFromHost(review.host, recorded, resources, operation);
-  const evidence = buildDecisionEvidence(built);
+  const evidence = delegationLoss(recorded, buildDecisionEvidence(built));
   const bytes = Buffer.byteLength(JSON.stringify(evidence));
   return {
     request: built, evidence, hostJoined: true, missingHost: false,
@@ -1492,6 +1546,7 @@ function reviewsReport(state: State, views: readonly RequestView[]): Report["rev
   return {
     requests: views.length, sessions: new Set(views.map((view) => view.sessionID ?? view.key)).size,
     duplicateEvents: state.duplicateEvents, filteredOut: state.filteredOut, orphanAfter: state.orphanAfter,
+    nonDecisionStage: state.nonDecisionStage,
   };
 }
 
@@ -1574,6 +1629,7 @@ function rebuildReport(views: readonly RequestView[]): RebuildReport {
     userMessagesRetained: countWhere(views, (view) => view.candidate.userMessagesRetained),
     chronologyFallback: countWhere(views, (view) => view.candidate.chronologyFallback),
     resourcesChanged: countWhere(views, (view) => view.candidate.resourcesChanged),
+    delegationsRetained: countWhere(views, (view) => view.candidate.evidence.delegations !== undefined),
     operationAccess: tallyBy(views.flatMap((view) => view.candidate.operationAccess === undefined ? [] : [view.candidate.operationAccess]), (access) => access),
     operationTool: tallyBy(views.flatMap((view) => view.candidate.operationTool === undefined ? [] : [view.candidate.operationTool]), (tool) => tool),
     operationTargets: countWhere(views, (view) => view.candidate.operationTargets > 0),
@@ -1796,7 +1852,7 @@ function printHuman(report: Report, views: readonly RequestView[], options: CliO
   console.log(`Snapshot: captured=${report.snapshot.capturedAt} files=${report.snapshot.files} bytes=${report.snapshot.bytes} fingerprint=${report.snapshot.fingerprint}`);
   console.log(`Prompt: captured=${report.prompt.capturedAt} hash=${report.prompt.hash} questions=${report.prompt.questions.join(",")}`);
   console.log(`Sources: files=${report.sources.files} lines=${report.sources.lines} parsed=${report.sources.parsed} malformed=${report.sources.malformed} oversized=${report.sources.oversized} skipped=${report.sources.skipped}`);
-  console.log(`Reviews: requests=${report.reviews.requests} sessions=${report.reviews.sessions} duplicates=${report.reviews.duplicateEvents} filtered-out=${report.reviews.filteredOut} orphan-after=${report.reviews.orphanAfter}`);
+  console.log(`Reviews: requests=${report.reviews.requests} sessions=${report.reviews.sessions} duplicates=${report.reviews.duplicateEvents} filtered-out=${report.reviews.filteredOut} orphan-after=${report.reviews.orphanAfter} non-decision-stage=${report.reviews.nonDecisionStage}`);
   printCounts("Formats", report.formats);
   console.log(`Evidence: host-joined=${report.evidence.hostJoined} missing-host=${report.evidence.missingHost} operation-present=${report.evidence.operationPresent} complete=${report.evidence.operationComplete} incomplete=${report.evidence.operationIncomplete} missing=${report.evidence.operationMissing}`);
   console.log(`  metadata-invalid=${report.evidence.metadataInvalid} code-mode-error=${report.evidence.codeModeError} missing-chronology=${report.evidence.missingChronology} terminal-opaque=${report.evidence.terminal}`);
@@ -1831,7 +1887,7 @@ function printHuman(report: Report, views: readonly RequestView[], options: CliO
   console.log(`Eligibility: total=${report.eligibility.total} eligible=${report.eligibility.eligible} reasons=${inlineCounts(report.eligibility.reasons)}`);
   console.log(`Read-only eligible: total=${report.eligibility.readOnly.total} eligible=${report.eligibility.readOnly.eligible} predicate=${inlineCounts(report.eligibility.readOnly.predicate)} llm=${inlineCounts(report.eligibility.readOnly.llm)}`);
   console.log(`Simple grep eligible: n=${report.eligibility.simpleGrep.eligible} predicate=${inlineCounts(report.eligibility.simpleGrep.predicate)} llm=${inlineCounts(report.eligibility.simpleGrep.llm)}`);
-  console.log(`Rebuild: user-messages-retained=${report.rebuild.userMessagesRetained} chronology-fallback=${report.rebuild.chronologyFallback} resources-changed=${report.rebuild.resourcesChanged} operation-access=${inlineCounts(report.rebuild.operationAccess)} operation-tools=${inlineCounts(report.rebuild.operationTool)} targets=${report.rebuild.operationTargets} args=${report.rebuild.operationArguments}`);
+  console.log(`Rebuild: user-messages-retained=${report.rebuild.userMessagesRetained} chronology-fallback=${report.rebuild.chronologyFallback} resources-changed=${report.rebuild.resourcesChanged} delegations-retained=${report.rebuild.delegationsRetained} operation-access=${inlineCounts(report.rebuild.operationAccess)} operation-tools=${inlineCounts(report.rebuild.operationTool)} targets=${report.rebuild.operationTargets} args=${report.rebuild.operationArguments}`);
   if (report.problems.length > 0) console.log(`Problems: ${report.problems.map((item) => `${item.kind}@file${item.file + 1}:${item.line}`).join(", ")}`);
   if (report.live) {
     console.log(`Live: eligible=${report.live.eligible} sampling=${report.live.sampling} sample=${report.live.sampleFingerprint} selected=${report.live.selected} read-only-selected=${report.live.readOnlySelected} sessions=${report.live.sessions} model-calls=${report.live.modelCalls} model-errors=${report.live.modelErrors} pre-generation=${report.live.preGeneration}`);
@@ -1849,10 +1905,18 @@ function printHuman(report: Report, views: readonly RequestView[], options: CliO
   console.log(`Fidelity: ${report.fidelity}`);
 }
 
+function decisionStageRequest(review: ReviewState, request: DecisionRequestAudit): boolean {
+  const start = review.stages.get(request.stageIndex);
+  return start === undefined || start.type === "decision";
+}
+
 async function evaluateViews(state: State, options: CliOptions): Promise<RequestView[]> {
   const views: RequestView[] = [];
   for (const review of state.reviews.values()) {
     for (const request of review.requests.values()) {
+      // `generate.decisions` is also used by the fact-review stage; only the
+      // recorded decision stage may be evaluated with decision thresholds.
+      if (!decisionStageRequest(review, request)) { state.nonDecisionStage++; continue; }
       const view = viewFor(review, request, options);
       if (view.format === "predicate") view.predicate = await predicateOutcome(view);
       if (view.format === "legacy") view.legacy = legacyOutcome(view);

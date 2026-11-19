@@ -67,6 +67,18 @@ test("malformed names, types, and non-max selections are rejected", () => {
   expect(evaluateResponse([choice], nonMax).error).toBe("invalid-probability");
 });
 
+test("unknown answer names without a type are malformed, never thrown", () => {
+  // `types.get(name)` and `answer.type` are both undefined here; the name must
+  // exist before comparing types or the missing answer throws later.
+  const unknown = { answers: [{ name: "unexpected", probability: 0.99 }] };
+  expect(evaluateResponse([predicate], unknown)).toEqual({ accepted: false, probabilities: {}, error: "invalid-answers" });
+  const run = cli([candidate("unknown-name", predicate, unknown, "allow")]);
+  expect(run.status).toBe(0);
+  expect(run.report.aggregate).toMatchObject({ attempted: 1, accepted: 0, reviewed: 1, errors: 1, expected: 1, matched: 0, mismatched: 1 });
+  expect(run.stdout).toContain("case unknown-name verdict=review");
+  expect(run.stdout).toContain("error=invalid-answers");
+});
+
 test("explicit model required and weak thresholds rejected", () => {
   expect(parseArgs(["--input", "x"])).toEqual({ error: "--model is required" });
   expect(parseArgs(["--input", "x", "--model", "fixture/judge", "--threshold", "0.8"])).toEqual({ error: "invalid --threshold" });
