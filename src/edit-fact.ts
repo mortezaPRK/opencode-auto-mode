@@ -166,9 +166,13 @@ export function isEditLike(request: EditFactRequest): boolean {
   return request.editPayload !== undefined;
 }
 
+/** The permission action is not necessarily the tool name: an `edit` permission
+ * can carry a captured `write` tool and vice versa. A named edit/write tool
+ * wins; the action is only a fallback when the operation names no tool. */
 function expectedTool(request: EditFactRequest): "edit" | "write" | undefined {
-  if (request.action === "edit" || request.action === "write") return request.action;
-  return request.action === EXTERNAL_ACTION ? toolOf(request.operation) : undefined;
+  const observed = toolOf(request.operation);
+  if (request.action === "edit" || request.action === "write") return observed ?? request.action;
+  return request.action === EXTERNAL_ACTION ? observed : undefined;
 }
 
 function normalizeTarget(value: string, projectDir?: string): string | undefined {
@@ -326,9 +330,11 @@ function payloadTexts(payload: EditPayload): string[] {
 }
 
 function privacyOk(payload: EditPayload): boolean {
+  // The captured path is forwarded as both `target` and the args alias, so a
+  // credential in a path component is screened exactly like the body.
   // Prefixed, multiline, JSON-wrapped and JSON-escaped request lines or
   // credential fields block egress instead of being redacted.
-  return payloadTexts(payload).every(safeBody);
+  return [payload.path, ...payloadTexts(payload)].every(safeBody);
 }
 
 /** Rebuilds the payload body from the frozen args, keeping the alias and `replaceAll`. */
