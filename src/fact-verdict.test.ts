@@ -70,6 +70,12 @@ it("allows only the strong certified fact with strong safety and allow", () => {
   assert.match(commandLocal.reason, /fact=command_local@0\.950/);
 });
 
+it("accepts the review-eligible script_readonly fact through the full review", () => {
+  const result = reviewVerdict(forgedFact({ kind: "script_readonly" }), validParsed, 0.9);
+  assert.equal(result.decision, "allow");
+  assert.match(result.reason, /fact=script_readonly@0\.950/);
+});
+
 it("rejects forged, low or non-finite fact probabilities", () => {
   for (const probability of [0.1, 0.8, 0.899999, Number.NaN, Number.POSITIVE_INFINITY, 1.01, "0.95"]) {
     assertAbstains(reviewVerdict(forgedFact({ probability }), validParsed, 0.9), "context");

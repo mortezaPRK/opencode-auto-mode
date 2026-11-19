@@ -3,6 +3,8 @@
  * question text: a certified fact is evidence, never authority. With zero static
  * findings, inspection, shell_segments and project_edit are allowed on the fact
  * alone; review asks the safety predicate, then the authorization choice.
+ * `script_readonly` is never fact-only: a Code Mode program always takes the full
+ * safety and authorization review.
  * `delegation` is the one narrowed shape: authorization alone, because the
  * child's actions are reviewed separately.
  */
@@ -64,9 +66,9 @@ const isSelected = (value: unknown): value is "allow" | "review" =>
   value === "allow" || value === "review";
 
 const isCertifiedKind = (value: unknown): value is CertifiedOperationKind =>
-  value === "inspection" || value === "test_run" || value === "shell_segments" ||
-  value === "command_local" || value === "local_edit" || value === "project_edit" ||
-  value === "delegation";
+  value === "inspection" || value === "script_readonly" || value === "test_run" ||
+  value === "shell_segments" || value === "command_local" || value === "local_edit" ||
+  value === "project_edit" || value === "delegation";
 
 const isThreshold = (value: unknown): value is number =>
   typeof value === "number" && Number.isFinite(value) && value >= MIN_FACT_REVIEW_CONFIDENCE && value <= MAX_THRESHOLD;

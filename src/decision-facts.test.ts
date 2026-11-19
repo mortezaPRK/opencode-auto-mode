@@ -99,9 +99,15 @@ function shellOperation(command = "bun test"): OperationEvidence {
   };
 }
 
+/** Explicit bash evidence: per-segment splitting only runs for a named bash/sh. */
+const BASH = { interpreter: "/bin/bash" } as const;
+
+/** Kinds a fact-only allow may act on; a Code Mode script is never one of them. */
+const FACT_ONLY_KINDS = new Set<string>(["inspection", "shell_segments", "project_edit"]);
+
 const shellRequest = (command = "bun test"): OperationFactRequest => ({
   action: "shell", resources: [SYNTHETIC_ROOT], projectDir: SYNTHETIC_ROOT, worktreeRoot: SYNTHETIC_ROOT,
-  operation: shellOperation(command),
+  operation: shellOperation(command), shell: BASH,
 });
 
 const shellAliasRequest = (action: "shell" | "bash", command = "bun test"): OperationFactRequest => ({
@@ -183,7 +189,7 @@ const realShellOperation = (command = "bun test", workdir = SHELL_ROOT): Operati
 
 const realShellRequest = (command = "bun test", workdir = SHELL_ROOT): OperationFactRequest => ({
   action: "shell", resources: [SHELL_ROOT], projectDir: SHELL_ROOT, worktreeRoot: SHELL_ROOT,
-  operation: realShellOperation(command, workdir),
+  operation: realShellOperation(command, workdir), shell: BASH,
 });
 
 const CAPTURE = { sessionID: "session-1", messageID: "message-1", callID: "call-1" } as const;
@@ -430,9 +436,9 @@ it("sends only the projected operation fields in the v3 producer order and retai
   };
   const result = await classifyOperationFacts(ctx, options(), request);
   assert.equal(text,
-    `{"action":"shell","resources":["${SYNTHETIC_ROOT}"],"operation":{"tool":"shell","access":"execute","targets":["${SYNTHETIC_ROOT}"],"arguments":{"command":"bun test --filter decision","workdir":"${SYNTHETIC_ROOT}"},"complete":true},"projectDir":"${SYNTHETIC_ROOT}","worktreeRoot":"${SYNTHETIC_ROOT}","platform":"${process.platform}"}`);
+    `{"action":"shell","resources":["${SYNTHETIC_ROOT}"],"operation":{"tool":"shell","access":"execute","targets":["${SYNTHETIC_ROOT}"],"arguments":{"command":"bun test --filter decision","workdir":"${SYNTHETIC_ROOT}"},"complete":true},"projectDir":"${SYNTHETIC_ROOT}","worktreeRoot":"${SYNTHETIC_ROOT}","platform":"${process.platform}","shell":{"interpreter":"/bin/bash"}}`);
   assert.deepEqual(Object.keys(JSON.parse(text) as Record<string, unknown>),
-    ["action", "resources", "operation", "projectDir", "worktreeRoot", "platform"]);
+    ["action", "resources", "operation", "projectDir", "worktreeRoot", "platform", "shell"]);
   const parsed = JSON.parse(text) as { operation: Record<string, unknown> };
   assert.deepEqual(Object.keys(parsed.operation), ["tool", "access", "targets", "arguments", "complete"]);
   assert.doesNotMatch(text, /PRIVATE/);
@@ -509,8 +515,11 @@ it("abstains before generation when carried shell evidence is truncated", async 
   assert.equal(fake.calls(), 0);
 });
 
-it("skips POSIX segmentation and cd folding for a non-POSIX shell", async () => {
-  for (const shell of [{ platform: "win32", interpreter: "cmd.exe" }, { interpreter: "pwsh" }, { interpreter: "fish" }]) {
+it("skips POSIX segmentation and cd folding without an explicit bash or sh interpreter", async () => {
+  for (const shell of [
+    { platform: "win32", interpreter: "cmd.exe" }, { interpreter: "pwsh" }, { interpreter: "fish" },
+    { interpreter: "zsh" }, { interpreter: "/bin/dash" }, { interpreter: "/bin/ksh" }, undefined,
+  ]) {
     const texts: string[] = [];
     const replies: Reply[] = [inspectionReply(false, 0.02), kindReply("test_run", 0.97)];
     const ctx = context(async (input) => {
@@ -520,12 +529,14 @@ it("skips POSIX segmentation and cd folding for a non-POSIX shell", async () => 
     });
     const request: OperationFactRequest = { ...shellRequest("git status && git log"), shell };
     const result = await classifyOperationFacts(ctx, options(), request);
-    assert.equal(result.kind, "test_run", JSON.stringify(shell));
-    assert.equal(texts.length, 2, JSON.stringify(shell));
+    const label = JSON.stringify(shell);
+    assert.equal(result.kind, "test_run", label);
+    assert.equal(texts.length, 2, label);
     const input = JSON.parse(texts[1] ?? "") as Record<string, unknown>;
-    assert.equal(input.command, "git status && git log", JSON.stringify(shell));
-    assert.equal(input.platform, process.platform, JSON.stringify(shell));
-    assert.deepEqual(input.shell, shell, JSON.stringify(shell));
+    assert.equal(input.command, "git status && git log", label);
+    assert.equal(input.platform, process.platform, label);
+    assert.equal("segmentIndex" in input, false, label);
+    assert.deepEqual(input.shell, shell, label);
   }
 });
 
@@ -562,7 +573,7 @@ it("sends the v3 segment input as command, full command, index, cwd then context
   const result = await classifyOperationFacts(ctx, options(), shellRequest("bun test --filter 'decision suite'"));
   assert.equal(result.kind, "shell_segments");
   assert.equal(texts.length, 3);
-  assert.equal(texts[1], `{"command":"bun test --filter 'decision suite'","fullCommand":"bun test --filter 'decision suite'","segmentIndex":0,"cwd":"${SYNTHETIC_ROOT}","platform":"${process.platform}"}`);
+  assert.equal(texts[1], `{"command":"bun test --filter 'decision suite'","fullCommand":"bun test --filter 'decision suite'","segmentIndex":0,"cwd":"${SYNTHETIC_ROOT}","platform":"${process.platform}","shell":{"interpreter":"/bin/bash"}}`);
   assert.equal(texts[2], texts[1]);
 });
 
@@ -588,7 +599,7 @@ it("prefers an explicit captured workdir over the evaluated projectDir", async (
   const result = await classifyOperationFacts(ctx, options(), request);
   assert.equal(result.kind, "shell_segments");
   assert.equal(texts.length, 3);
-  assert.equal(texts[1], `{"command":"bun test","fullCommand":"bun test","segmentIndex":0,"cwd":"${SYNTHETIC_ROOT}/pkg","platform":"${process.platform}"}`);
+  assert.equal(texts[1], `{"command":"bun test","fullCommand":"bun test","segmentIndex":0,"cwd":"${SYNTHETIC_ROOT}/pkg","platform":"${process.platform}","shell":{"interpreter":"/bin/bash"}}`);
   assert.equal(texts[2], texts[1]);
 });
 
@@ -611,7 +622,7 @@ it("resolves a relative explicit workdir against the evaluated projectDir", asyn
   const result = await classifyOperationFacts(ctx, options(), request);
   assert.equal(result.kind, "shell_segments");
   assert.equal(texts.length, 3);
-  assert.equal(texts[1], `{"command":"bun test","fullCommand":"bun test","segmentIndex":0,"cwd":"${SYNTHETIC_ROOT}/sub","platform":"${process.platform}"}`);
+  assert.equal(texts[1], `{"command":"bun test","fullCommand":"bun test","segmentIndex":0,"cwd":"${SYNTHETIC_ROOT}/sub","platform":"${process.platform}","shell":{"interpreter":"/bin/bash"}}`);
   assert.equal(texts[2], texts[1]);
 });
 
@@ -701,6 +712,7 @@ it("abstains after inspection when a folded cd target lacks search permission",
             tool: "shell", access: "execute", targets: [root],
             arguments: { command, workdir: root }, complete: true,
           },
+          shell: BASH,
         };
         const fake = responder([inspectionReply(false, 0.02), inspectionReply(true, 0.99)]);
         const result = await classifyOperationFacts(fake.ctx, options(), request);
@@ -727,7 +739,7 @@ it("accepts an existing subdirectory inside the real root as the explicit workdi
   assert.equal(result.kind, "inspection");
   assert.equal(texts[1], JSON.stringify({
     command: "git status", fullCommand: "git status", segmentIndex: 0, cwd: SHELL_SUB,
-    platform: process.platform,
+    platform: process.platform, shell: { interpreter: "/bin/bash" },
   }));
 });
 
@@ -772,7 +784,7 @@ it("still folds a parent step with no symlink component", async () => {
   assert.equal(result.kind, "inspection");
   assert.equal(texts[1], JSON.stringify({
     command: "git status", fullCommand: "cd ./pkg/../sub && git status", segmentIndex: 0, cwd: SHELL_SUB,
-    platform: process.platform,
+    platform: process.platform, shell: { interpreter: "/bin/bash" },
   }));
 });
 
@@ -794,11 +806,12 @@ it("omits an unknown shell cwd but still sends the complete captured command", a
       tool: "shell", access: "execute", targets: [SYNTHETIC_ROOT], complete: true,
       arguments: { command: "bun test" },
     },
+    shell: BASH,
   };
   const result = await classifyOperationFacts(ctx, options(), request);
   assert.equal(result.kind, "shell_segments");
   assert.equal(texts.length, 3);
-  assert.equal(texts[1], `{"command":"bun test","fullCommand":"bun test","segmentIndex":0,"platform":"${process.platform}"}`);
+  assert.equal(texts[1], `{"command":"bun test","fullCommand":"bun test","segmentIndex":0,"platform":"${process.platform}","shell":{"interpreter":"/bin/bash"}}`);
   assert.equal(texts[2], texts[1]);
 });
 
@@ -868,7 +881,7 @@ it("runs the segment stage for the bash shell alias", async () => {
   assert.equal(result.probability, 0.97);
   assert.equal(texts.length, 3);
   assert.match(texts[0] ?? "", /"action":"bash"/);
-  assert.equal(texts[1], `{"command":"bun test","fullCommand":"bun test","segmentIndex":0,"cwd":"${SYNTHETIC_ROOT}","platform":"${process.platform}"}`);
+  assert.equal(texts[1], `{"command":"bun test","fullCommand":"bun test","segmentIndex":0,"cwd":"${SYNTHETIC_ROOT}","platform":"${process.platform}","shell":{"interpreter":"/bin/bash"}}`);
   assert.equal(texts[2], texts[1]);
 });
 
@@ -1076,14 +1089,14 @@ it("classifies every top-level segment and reports the weakest probability", asy
   assert.equal(result.kind, "shell_segments");
   assert.equal(result.probability, 0.95);
   assert.deepEqual(texts.slice(1), [
-    `{"command":"grep -n foo src/a.ts","fullCommand":"grep -n foo src/a.ts; git diff | head; bun run typecheck","segmentIndex":0,"cwd":"${SYNTHETIC_ROOT}","platform":"${process.platform}"}`,
-    `{"command":"grep -n foo src/a.ts","fullCommand":"grep -n foo src/a.ts; git diff | head; bun run typecheck","segmentIndex":0,"cwd":"${SYNTHETIC_ROOT}","platform":"${process.platform}"}`,
-    `{"command":"git diff","fullCommand":"grep -n foo src/a.ts; git diff | head; bun run typecheck","segmentIndex":1,"cwd":"${SYNTHETIC_ROOT}","platform":"${process.platform}"}`,
-    `{"command":"git diff","fullCommand":"grep -n foo src/a.ts; git diff | head; bun run typecheck","segmentIndex":1,"cwd":"${SYNTHETIC_ROOT}","platform":"${process.platform}"}`,
-    `{"command":"head","fullCommand":"grep -n foo src/a.ts; git diff | head; bun run typecheck","segmentIndex":2,"cwd":"${SYNTHETIC_ROOT}","platform":"${process.platform}"}`,
-    `{"command":"head","fullCommand":"grep -n foo src/a.ts; git diff | head; bun run typecheck","segmentIndex":2,"cwd":"${SYNTHETIC_ROOT}","platform":"${process.platform}"}`,
-    `{"command":"bun run typecheck","fullCommand":"grep -n foo src/a.ts; git diff | head; bun run typecheck","segmentIndex":3,"cwd":"${SYNTHETIC_ROOT}","platform":"${process.platform}"}`,
-    `{"command":"bun run typecheck","fullCommand":"grep -n foo src/a.ts; git diff | head; bun run typecheck","segmentIndex":3,"cwd":"${SYNTHETIC_ROOT}","platform":"${process.platform}"}`,
+    `{"command":"grep -n foo src/a.ts","fullCommand":"grep -n foo src/a.ts; git diff | head; bun run typecheck","segmentIndex":0,"cwd":"${SYNTHETIC_ROOT}","platform":"${process.platform}","shell":{"interpreter":"/bin/bash"}}`,
+    `{"command":"grep -n foo src/a.ts","fullCommand":"grep -n foo src/a.ts; git diff | head; bun run typecheck","segmentIndex":0,"cwd":"${SYNTHETIC_ROOT}","platform":"${process.platform}","shell":{"interpreter":"/bin/bash"}}`,
+    `{"command":"git diff","fullCommand":"grep -n foo src/a.ts; git diff | head; bun run typecheck","segmentIndex":1,"cwd":"${SYNTHETIC_ROOT}","platform":"${process.platform}","shell":{"interpreter":"/bin/bash"}}`,
+    `{"command":"git diff","fullCommand":"grep -n foo src/a.ts; git diff | head; bun run typecheck","segmentIndex":1,"cwd":"${SYNTHETIC_ROOT}","platform":"${process.platform}","shell":{"interpreter":"/bin/bash"}}`,
+    `{"command":"head","fullCommand":"grep -n foo src/a.ts; git diff | head; bun run typecheck","segmentIndex":2,"cwd":"${SYNTHETIC_ROOT}","platform":"${process.platform}","shell":{"interpreter":"/bin/bash"}}`,
+    `{"command":"head","fullCommand":"grep -n foo src/a.ts; git diff | head; bun run typecheck","segmentIndex":2,"cwd":"${SYNTHETIC_ROOT}","platform":"${process.platform}","shell":{"interpreter":"/bin/bash"}}`,
+    `{"command":"bun run typecheck","fullCommand":"grep -n foo src/a.ts; git diff | head; bun run typecheck","segmentIndex":3,"cwd":"${SYNTHETIC_ROOT}","platform":"${process.platform}","shell":{"interpreter":"/bin/bash"}}`,
+    `{"command":"bun run typecheck","fullCommand":"grep -n foo src/a.ts; git diff | head; bun run typecheck","segmentIndex":3,"cwd":"${SYNTHETIC_ROOT}","platform":"${process.platform}","shell":{"interpreter":"/bin/bash"}}`,
   ]);
   assert.match(result.reason, /segments fact 4 local/);
 });
@@ -1121,7 +1134,7 @@ it("keeps the operation-kind path when the command cannot be split", async () =>
   const result = await classifyOperationFacts(ctx, options(), shellRequest("bun test > /tmp/out"));
   assert.equal(result.kind, "test_run");
   assert.equal(texts.length, 2);
-  assert.equal(texts[1], `{"command":"bun test > /tmp/out","cwd":"${SYNTHETIC_ROOT}","platform":"${process.platform}"}`);
+  assert.equal(texts[1], `{"command":"bun test > /tmp/out","cwd":"${SYNTHETIC_ROOT}","platform":"${process.platform}","shell":{"interpreter":"/bin/bash"}}`);
 });
 
 it("passes the whole command through as segment context for a filtering segment", async () => {
@@ -1143,10 +1156,10 @@ it("passes the whole command through as segment context for a filtering segment"
   assert.equal(result.kind, "shell_segments");
   assert.equal(result.probability, 0.95);
   assert.deepEqual(texts.slice(1), [
-    `{"command":"echo x","fullCommand":"echo x | head","segmentIndex":0,"cwd":"${SYNTHETIC_ROOT}","platform":"${process.platform}"}`,
-    `{"command":"echo x","fullCommand":"echo x | head","segmentIndex":0,"cwd":"${SYNTHETIC_ROOT}","platform":"${process.platform}"}`,
-    `{"command":"head","fullCommand":"echo x | head","segmentIndex":1,"cwd":"${SYNTHETIC_ROOT}","platform":"${process.platform}"}`,
-    `{"command":"head","fullCommand":"echo x | head","segmentIndex":1,"cwd":"${SYNTHETIC_ROOT}","platform":"${process.platform}"}`,
+    `{"command":"echo x","fullCommand":"echo x | head","segmentIndex":0,"cwd":"${SYNTHETIC_ROOT}","platform":"${process.platform}","shell":{"interpreter":"/bin/bash"}}`,
+    `{"command":"echo x","fullCommand":"echo x | head","segmentIndex":0,"cwd":"${SYNTHETIC_ROOT}","platform":"${process.platform}","shell":{"interpreter":"/bin/bash"}}`,
+    `{"command":"head","fullCommand":"echo x | head","segmentIndex":1,"cwd":"${SYNTHETIC_ROOT}","platform":"${process.platform}","shell":{"interpreter":"/bin/bash"}}`,
+    `{"command":"head","fullCommand":"echo x | head","segmentIndex":1,"cwd":"${SYNTHETIC_ROOT}","platform":"${process.platform}","shell":{"interpreter":"/bin/bash"}}`,
   ]);
   assert.deepEqual(instructions, [SEGMENT_INSPECTION_QUESTION.instructions, SEGMENT_INSPECTION_QUESTION.instructions]);
 });
@@ -1166,8 +1179,8 @@ it("passes an echo segment through with the whole command as context", async () 
   const result = await classifyOperationFacts(ctx, options(), shellRequest("echo x"));
   assert.equal(result.kind, "shell_segments");
   assert.deepEqual(texts.slice(1), [
-    `{"command":"echo x","fullCommand":"echo x","segmentIndex":0,"cwd":"${SYNTHETIC_ROOT}","platform":"${process.platform}"}`,
-    `{"command":"echo x","fullCommand":"echo x","segmentIndex":0,"cwd":"${SYNTHETIC_ROOT}","platform":"${process.platform}"}`,
+    `{"command":"echo x","fullCommand":"echo x","segmentIndex":0,"cwd":"${SYNTHETIC_ROOT}","platform":"${process.platform}","shell":{"interpreter":"/bin/bash"}}`,
+    `{"command":"echo x","fullCommand":"echo x","segmentIndex":0,"cwd":"${SYNTHETIC_ROOT}","platform":"${process.platform}","shell":{"interpreter":"/bin/bash"}}`,
   ]);
 });
 
@@ -1189,9 +1202,10 @@ it("asks one command_local question when an unsplittable operation_kind does not
   assert.equal(result.probability, 0.96);
   assert.match(result.reason, /local-only/);
   assert.equal(texts.length, 3);
-  assert.equal(texts[1], JSON.stringify({ command, cwd: SYNTHETIC_ROOT, platform: process.platform }));
+  assert.equal(texts[1], JSON.stringify({ command, cwd: SYNTHETIC_ROOT, platform: process.platform, shell: { interpreter: "/bin/bash" } }));
   assert.deepEqual(JSON.parse(texts[2] ?? ""), {
     command, cwd: SYNTHETIC_ROOT, tempDir: resolve(tmpdir()), platform: process.platform,
+    shell: { interpreter: "/bin/bash" },
   });
 });
 
@@ -1241,8 +1255,8 @@ it("folds one leading literal cd and classifies every segment under the confined
   assert.equal(result.kind, "inspection");
   assert.equal(result.probability, 0.97);
   assert.deepEqual(texts.slice(1), [
-    JSON.stringify({ command: "git status", fullCommand: command, segmentIndex: 0, cwd: SHELL_SUB, platform: process.platform }),
-    JSON.stringify({ command: "git log -3", fullCommand: command, segmentIndex: 1, cwd: SHELL_SUB, platform: process.platform }),
+    JSON.stringify({ command: "git status", fullCommand: command, segmentIndex: 0, cwd: SHELL_SUB, platform: process.platform, shell: { interpreter: "/bin/bash" } }),
+    JSON.stringify({ command: "git log -3", fullCommand: command, segmentIndex: 1, cwd: SHELL_SUB, platform: process.platform, shell: { interpreter: "/bin/bash" } }),
   ]);
 });
 
@@ -1260,7 +1274,7 @@ it("resolves a folded relative cd against the explicit workdir", async () => {
   };
   const result = await classifyOperationFacts(ctx, options(), request);
   assert.equal(result.kind, "inspection");
-  assert.equal(texts[1], `{"command":"git status","fullCommand":"cd ./sub && git status","segmentIndex":0,"cwd":"${SYNTHETIC_ROOT}/pkg/sub","platform":"${process.platform}"}`);
+  assert.equal(texts[1], `{"command":"git status","fullCommand":"cd ./sub && git status","segmentIndex":0,"cwd":"${SYNTHETIC_ROOT}/pkg/sub","platform":"${process.platform}","shell":{"interpreter":"/bin/bash"}}`);
 });
 
 it("abstains after the whole-command inspection when the folded cd escapes containment", async () => {
@@ -1354,7 +1368,8 @@ it("asks the tool question with the captured execute script", async () => {
   });
   const script = "const page = await tools.read({ path: 'README.md' });";
   const result = await classifyOperationFacts(ctx, options(), executeRequest(script));
-  assert.equal(result.kind, "inspection");
+  assert.equal(result.kind, "script_readonly");
+  assert.match(result.reason, /Execute script fact read-only/);
   assert.deepEqual(JSON.parse(inputs[0] ?? ""), { tool: "execute", access: "execute", script });
 });
 
@@ -1436,12 +1451,65 @@ it("abstains without a tool call when comments or regex literals hide a protecte
   }
 });
 
-it("keeps an execute script without protected paths eligible", async () => {
+it("abstains without a tool call when a script concatenates a hidden target", async () => {
+  const scripts = [
+    "const env = await tools.read({ path: '.e' + 'nv' });",
+    `const env = await tools.read({ path: '.e' + "nv" });`,
+    "const env = await tools.read({ path: `${'.'}env` });",
+  ];
+  for (const script of scripts) {
+    const fake = responder([toolReadonlyReply(true, 0.99)]);
+    const result = await classifyOperationFacts(fake.ctx, options(), executeRequest(script));
+    assert.equal(result.kind, "unknown", script);
+    assert.equal(result.errorKind, "context", script);
+    assert.equal(FACT_ONLY_KINDS.has(result.kind), false, script);
+    assert.equal(fake.calls(), 0, script);
+  }
+});
+
+it("abstains without a tool call when a script target cannot be resolved", async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "opencode-script-unresolved-")));
+  try {
+    const file = join(root, "plain.txt");
+    writeFileSync(file, "x");
+    let link = file;
+    for (let index = 0; index < 40; index++) {
+      const next = join(root, `s${index}`);
+      symlinkSync(link, next);
+      link = next;
+    }
+    const script = `const file = await tools.read({ path: '${link}' });`;
+    const fake = responder([toolReadonlyReply(true, 0.99)]);
+    const result = await classifyOperationFacts(fake.ctx, options(), executeRequest(script));
+    assert.equal(result.kind, "unknown");
+    assert.equal(result.errorKind, "context");
+    assert.equal(FACT_ONLY_KINDS.has(result.kind), false);
+    assert.equal(fake.calls(), 0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+it("never certifies inspection for a script comment that hides an escaped target", async () => {
+  // Copilot example: the unmatched quote in the comment swallows the literal
+  // opener, so the escape is never screened; the fact must stay review-only.
+  const script = "// don't\nawait tools.read({ path: '\\u002eenv' });";
+  const fake = responder([toolReadonlyReply(true, 0.99)]);
+  const result = await classifyOperationFacts(fake.ctx, options(), executeRequest(script));
+  assert.equal(result.kind, "script_readonly");
+  assert.notEqual(result.kind, "inspection");
+  assert.equal(FACT_ONLY_KINDS.has(result.kind), false);
+  assert.equal(fake.calls(), 1);
+});
+
+it("certifies a read-only execute script as review-eligible script_readonly, never inspection", async () => {
   const fake = responder([toolReadonlyReply(true, 0.97)]);
   const script = "const page = await tools.webfetch({ url: 'https://example.invalid/readme' });";
   const result = await classifyOperationFacts(fake.ctx, options(), executeRequest(script));
-  assert.equal(result.kind, "inspection");
+  assert.equal(result.kind, "script_readonly");
   assert.equal(result.probability, 0.97);
+  assert.notEqual(result.kind, "inspection");
+  assert.equal(FACT_ONLY_KINDS.has(result.kind), false);
   assert.equal(fake.calls(), 1);
 });
 

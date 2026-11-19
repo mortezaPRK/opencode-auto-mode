@@ -1,7 +1,7 @@
 /** Fact classification only: never a permission, approval or safety verdict. */
 import { accessSync, constants, lstatSync, realpathSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, isAbsolute, parse, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, parse, resolve, sep } from "node:path";
 import { Model } from "@opencode/schema/model";
 import type { Generate } from "@opencode/schema/generate";
 import { DEFAULT_FACT_REVIEW_CONFIDENCE, MIN_FACT_REVIEW_CONFIDENCE } from "./config.js";
@@ -37,7 +37,6 @@ import {
 } from "./guards.js";
 import { classifyPath, envName, isInside, PROTECTED_NAME, PROTECTED_SUFFIX } from "./path-policy.js";
 import type { PermissionRequest } from "./reviewer.js";
-import { supportsPosixReview } from "./shell-policy.js";
 import { splitShellSegmentsWithLeadingCd, type ShellSegmentSplit } from "./shell-segments.js";
 import { withTimeout } from "./timeout.js";
 
@@ -68,8 +67,10 @@ export interface OperationFactOptions {
 /** A factual class only, never an effect-safety review, permission or approval.
  * `local_edit` names one captured body; `project_edit` one metadata-only
  * in-project edit; `delegation` says nothing about the child's actions. A local
- * edit can add network code when later executed, so no impact claim is made. */
-export type OperationFactKind = "inspection" | "test_run" | "shell_segments" | "command_local" | "local_edit" | "project_edit" | "delegation" | "unknown";
+ * edit can add network code when later executed, so no impact claim is made.
+ * `script_readonly` is a Code Mode program that a model judged read-only; unlike
+ * `inspection` it is never fact-only, because the target set cannot be verified. */
+export type OperationFactKind = "inspection" | "script_readonly" | "test_run" | "shell_segments" | "command_local" | "local_edit" | "project_edit" | "delegation" | "unknown";
 
 export interface OperationFactResult {
   kind: OperationFactKind;
@@ -206,6 +207,7 @@ const OPAQUE_REASON = "Opaque execution or delegation has no reusable operation 
 const DELEGATION_REASON = "Delegation operation has a complete captured prompt; authorization is reviewed separately";
 const NO_SCRIPT_REASON = "Execute operation has no bounded captured script";
 const SCRIPT_PROTECTED_REASON = "Execute script names a protected path or credential store";
+const SCRIPT_UNRESOLVED_REASON = "Execute script target cannot be validated statically";
 const WRITE_ACCESS_REASON = "Declared write access has no read-only operation fact";
 /** Shared with fact-review: a write-capable tool can never certify inspection. */
 export const WRITE_TOOL_REFUSAL_REASON = "Write-capable tool has no read-only operation fact";
@@ -552,6 +554,9 @@ const SCRIPT_TOKEN_SEPARATOR = /[^A-Za-z0-9_.-]+/;
 /** Credential-store directories anywhere in one script string. */
 const PROTECTED_DIRECTORY = /^(?:\.ssh|\.aws|\.gnupg|\.git|\.docker|\.kube)$/i;
 const NETWORK_LITERAL = /^(?:[a-z][a-z0-9+.-]*:\/\/|\/\/[^/])/i;
+/** A quote beside a `+`, or a template interpolation, assembles a target at
+ * runtime; no literal spelling in the script can be screened against the policy. */
+const UNSCREENABLE_CONCATENATION = /['"`]\s*\+|\+\s*['"`]|\$\{/;
 
 const scriptSegments = (value: string): string[] =>
   value.split(/[\\/\s]+/).filter((segment) => segment.length > 0);
@@ -561,13 +566,14 @@ const protectedSegment = (segment: string): boolean =>
   envName(segment);
 
 /** Lexical protected-name match, or the repository's path policy for a
- * path-shaped literal; unresolved metadata fails closed. */
+ * path-shaped literal; anything the policy cannot resolve to an ordinary path is
+ * refused, because an alias beyond the link limit may still name a protected store. */
 function protectedScriptString(value: string, projectDir: string | undefined): boolean {
   if (scriptSegments(value).some(protectedSegment)) return true;
   const target = value.trim();
   if (target.length === 0 || target.includes("\0") || NETWORK_LITERAL.test(target)) return false;
   try {
-    return classifyPath(target, projectDir).kind === "protected";
+    return classifyPath(target, projectDir).kind !== "ordinary";
   } catch {
     return true;
   }
@@ -596,12 +602,15 @@ function scriptNamesProtectedPath(script: string, projectDir: string | undefined
   return false;
 }
 
-/** The script must be the only, non-empty, bounded resource and must not name a protected store. */
+/** The script must be the only, non-empty, bounded resource, must resolve every
+ * target statically, and must not name a protected store. */
 function executeFactInput(evidence: DecisionEvidence): ToolFactPlan {
   const [script] = evidence.resources;
   if (evidence.resources.length !== 1 || typeof script !== "string" || script.trim().length === 0 ||
       Buffer.byteLength(script) > MAX_CAPTURED_BODY_BYTES)
     return { kind: "refuse", reason: NO_SCRIPT_REASON };
+  if (UNSCREENABLE_CONCATENATION.test(script))
+    return { kind: "refuse", reason: SCRIPT_UNRESOLVED_REASON };
   if (scriptNamesProtectedPath(script, evidence.projectDir))
     return { kind: "refuse", reason: SCRIPT_PROTECTED_REASON };
   return { kind: "input", input: { tool: EXECUTE_TOOL, access: accessOf(evidence), script } };
@@ -724,14 +733,17 @@ function inspectionFact(parsed: ParsedChoice, threshold: number): OperationFactR
   };
 }
 
-/** A true answer at or above the floor certifies the same `inspection` kind as the read-only operation question. */
-function toolReadonlyFact(parsed: ParsedChoice, threshold: number): OperationFactResult {
+/** A true answer at or above the floor certifies `inspection` for an ordinary tool
+ * call, and the distinct `script_readonly` for a Code Mode program, which always
+ * needs the full safety and authorization review. */
+function toolReadonlyFact(parsed: ParsedChoice, threshold: number,
+  kind: "inspection" | "script_readonly"): OperationFactResult {
   if (parsed.selected !== true) return unresolved("Tool call is not a read-only fact", parsed);
   if (parsed.probability < threshold) return unresolved("Tool call is below the native threshold", parsed);
   return {
-    kind: "inspection",
+    kind,
     probability: parsed.probability,
-    reason: `Tool call fact read-only at native probability ${formatProbability(parsed.probability)}`,
+    reason: `${kind === "inspection" ? "Tool call" : "Execute script"} fact read-only at native probability ${formatProbability(parsed.probability)}`,
   };
 }
 
@@ -741,7 +753,7 @@ async function toolCallFacts(ctx: DecisionContext, limits: StageLimits, input: T
     await ask(ctx, limits, TOOL_READONLY_QUESTION, JSON.stringify(input), signal),
     TOOL_READONLY_EXPECTED,
   );
-  return toolReadonlyFact(parsed, limits.minConfidence);
+  return toolReadonlyFact(parsed, limits.minConfidence, input.tool === EXECUTE_TOOL ? "script_readonly" : "inspection");
 }
 
 function unresolved(reason: string, parsed: ParsedChoice): OperationFactResult {
@@ -854,10 +866,14 @@ async function classifyEditFacts(ctx: DecisionContext, limits: StageLimits, requ
   return projectEditFact(parsed, limits.minConfidence);
 }
 
-/** POSIX segmentation and cd folding apply only when the host and the requested
- * interpreter are POSIX-reviewable; other dialects use the whole-command path. */
+/** POSIX segmentation and cd folding read bash/sh quoting and separator rules
+ * only: the request must explicitly name that interpreter on a non-win32 host.
+ * An unidentified, zsh, dash, ksh, fish, pwsh or cmd interpreter uses the
+ * whole-command path. */
+const SEGMENTABLE_INTERPRETERS = new Set(["bash", "sh"]);
 const posixReviewable = (evidence: DecisionEvidence): boolean =>
-  evidence.platform !== "win32" && supportsPosixReview(evidence.shell);
+  evidence.platform !== "win32" && evidence.shell?.interpreter !== undefined &&
+  SEGMENTABLE_INTERPRETERS.has(basename(evidence.shell.interpreter));
 
 /** Classifies split segments under the effective cwd; a folded leading `cd` must
  * stay inside the same containment root as an explicit workdir. */
