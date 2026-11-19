@@ -49,23 +49,47 @@ function model(value: unknown): value is string {
 /** One configured pipeline stage. Unknown keys are rejected per stage type. */
 function parseClassifier(stage: unknown): ClassifierOptions {
   if (!object(stage)) invalid("classifier");
-  if (stage.type === "static") {
-    only(stage, ["type", "allowInProjectEdits"]);
-    if (stage.allowInProjectEdits !== undefined && typeof stage.allowInProjectEdits !== "boolean")
-      invalid("static allowInProjectEdits");
-    return { type: "static", ...(stage.allowInProjectEdits === undefined ? {} : { allowInProjectEdits: stage.allowInProjectEdits }) };
-  }
-  if (stage.type !== "decision" && stage.type !== "llm") invalid("classifier type");
-  only(stage, stage.type === "decision" ? ["type", "model", "timeoutMs", "minConfidence"] : ["type", "model", "timeoutMs"]);
+  if (stage.type === "static") return parseStatic(stage);
+  if (!isModelStageType(stage.type)) invalid("classifier type");
+  return parseModelStage(stage.type, stage);
+}
+
+function parseStatic(stage: Record<string, unknown>): ClassifierOptions {
+  only(stage, ["type", "allowInProjectEdits"]);
+  if (stage.allowInProjectEdits !== undefined && typeof stage.allowInProjectEdits !== "boolean")
+    invalid("static allowInProjectEdits");
+  return { type: "static", ...(stage.allowInProjectEdits === undefined ? {} : { allowInProjectEdits: stage.allowInProjectEdits }) };
+}
+
+type ModelStageType = "decision" | "llm";
+const MODEL_STAGE_KEYS: Record<ModelStageType, readonly string[]> = {
+  decision: ["type", "model", "timeoutMs", "minConfidence"],
+  llm: ["type", "model", "timeoutMs"],
+};
+
+function isModelStageType(value: unknown): value is ModelStageType {
+  return value === "decision" || value === "llm";
+}
+
+function probability(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1;
+}
+
+function parseConfidence(value: unknown): number | undefined {
+  if (value === undefined) return undefined;
+  if (!probability(value)) invalid("decision minConfidence");
+  return value;
+}
+
+function parseModelStage(type: ModelStageType, stage: Record<string, unknown>): ClassifierOptions {
+  only(stage, MODEL_STAGE_KEYS[type]);
   if (!model(stage.model)) invalid("classifier model");
   if (stage.timeoutMs !== undefined && !integer(stage.timeoutMs, MAX_REVIEW_TIMEOUT_MS)) invalid("classifier timeoutMs");
-  if (stage.type === "decision" && stage.minConfidence !== undefined &&
-      (typeof stage.minConfidence !== "number" || !Number.isFinite(stage.minConfidence) ||
-        stage.minConfidence < 0 || stage.minConfidence > 1))
-    invalid("decision minConfidence");
-  return { type: stage.type, model: stage.model,
-    ...(stage.timeoutMs === undefined ? {} : { timeoutMs: stage.timeoutMs as number }),
-    ...(stage.type === "decision" && stage.minConfidence !== undefined ? { minConfidence: stage.minConfidence as number } : {}) };
+  const timeout = stage.timeoutMs === undefined ? {} : { timeoutMs: stage.timeoutMs as number };
+  if (type === "llm") return { type, model: stage.model, ...timeout };
+  const confidence = parseConfidence(stage.minConfidence);
+  const threshold = confidence === undefined ? {} : { minConfidence: confidence };
+  return { type, model: stage.model, ...timeout, ...threshold };
 }
 
 /** Required, non-empty, and at most one static stage. Exactly one static stage may

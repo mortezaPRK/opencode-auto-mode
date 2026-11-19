@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
 import { spawn, execFileSync } from "node:child_process";
-import { createServer } from "node:http";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { once } from "node:events";
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, realpathSync, symlinkSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, realpathSync, symlinkSync,
+  openSync, closeSync, fstatSync, lstatSync, constants } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { completion, FIXTURE_PROVIDER, FIXTURE_AGENT_MODEL, FIXTURE_REVIEWER_MODEL, type FixtureTool } from "./transport.js";
 import { codeModePermission } from "../src/code-mode.js";
@@ -14,7 +15,11 @@ import { codeModeIdentityRegression } from "./code-mode-identity.js";
 // Every endpoint/model below is explicitly configured test infrastructure.
 // Never patch global fetch or redirect a production provider to a fixture.
 type Verdict = "allow" | "deny" | "ask";
-type Profile = { reviewer?: string; sameModelReviewer?: boolean; timeout?: boolean; reviewerFailure?: boolean; decision?: Verdict | "low" | "invalid" | "timeout"; tool?: FixtureTool; issued?: boolean };
+type DecisionMode = Verdict | "low" | "invalid" | "timeout";
+type Profile = { reviewer?: string; sameModelReviewer?: boolean; timeout?: boolean; reviewerFailure?: boolean; decision?: DecisionMode; tool?: FixtureTool; issued?: boolean };
+type SystemOneQuestion = { type?: string; criteria?: Record<string, unknown> };
+type SystemOneBody = { model: string; state?: unknown; questions: Record<string, SystemOneQuestion> };
+type ChatCompletionBody = { model: string; messages?: unknown; tools?: { function: { name: string } }[]; stream?: boolean };
 const plugin = resolve(process.env.OPENCODE_PLUGIN_PATH ?? fileURLToPath(new URL("..", import.meta.url)));
 const tempRoot = join(tmpdir(), "opencode"); mkdirSync(tempRoot, { recursive: true });
 const root = mkdtempSync(join(realpathSync(tempRoot), "auto-mode-v2-integration-"));
@@ -29,49 +34,73 @@ const results: string[] = [];
 let caseCount = 0;
 const markers: string[] = [];
 const reviewerInputs: string[] = [];
-const provider = createServer(async (req, res) => {
+function sendJson(res: ServerResponse, value: unknown) {
+  res.writeHead(200, { "content-type": "application/json" });
+  res.end(JSON.stringify(value));
+}
+function decisionChoice(mode: DecisionMode): string {
+  return mode === "low" || mode === "invalid" ? "allow" : mode;
+}
+function decisionProbabilities(mode: DecisionMode): Record<string, number> {
+  if (mode === "invalid") return { allow: 0.98, deny: 0.98, ask: 0.98 };
+  if (mode === "low") return { allow: 0.4, deny: 0.3, ask: 0.3 };
+  const choice = decisionChoice(mode);
+  return Object.fromEntries(["allow", "deny", "ask"].map((value) => [value, value === choice ? 0.98 : 0.01]));
+}
+function handleSystemOne(res: ServerResponse, body: SystemOneBody) {
+  calls.push("decision");
+  assert.equal(body.model, "decision");
+  assert.ok(body.questions.permission && body.state, "native SDK lowered questions/input into decision wire protocol");
+  const mode = profile.decision ?? "low";
+  if (mode === "timeout") { res.writeHead(200); res.write("{"); return; }
+  // Structurally valid native output, but inconsistent probabilities in the
+  // invalid case: exercise plugin validation rather than SDK wire rejection.
+  sendJson(res, { model: "decision", answers: { permission: {
+    type: "choice", choice: decisionChoice(mode), confidence: mode === "low" ? 0.4 : 0.98, probabilities: decisionProbabilities(mode),
+  } } });
+}
+// One explicitly opted-in case uses the agent model ID as the reviewer so a
+// same-model reviewer can be exercised without inventing a second identity.
+function isReviewerModel(model: string): boolean {
+  return model === FIXTURE_REVIEWER_MODEL || (profile.sameModelReviewer === true && model === FIXTURE_AGENT_MODEL);
+}
+function selectChatTool(body: ChatCompletionBody, reviewer: boolean): FixtureTool | undefined {
+  if (reviewer || profile.issued || profile.tool === undefined) return undefined;
+  const offered = body.tools?.some((t: { function: { name: string } }) => t.function.name === profile.tool!.name);
+  return offered ? profile.tool : undefined;
+}
+function reviewerText(reviewer: boolean): string {
+  return reviewer ? profile.reviewer ?? "ALLOW: fixture authorized" : "Ready";
+}
+function handleChatCompletion(req: IncomingMessage, res: ServerResponse, body: ChatCompletionBody) {
+  assert.equal(req.url, "/v1/chat/completions");
+  const reviewer = isReviewerModel(body.model);
+  assert.ok(reviewer || body.model === FIXTURE_AGENT_MODEL, "unexpected fixture model");
+  if (reviewer) {
+    reviewerInputs.push(JSON.stringify(body.messages));
+    calls.push("reviewer");
+    if (profile.reviewerFailure) { res.writeHead(400); res.end("fixture deliberate provider error"); return; }
+    if (profile.timeout) { res.writeHead(200, { "content-type": "application/json" }); res.write("{"); return; }
+  }
+  const tool = selectChatTool(body, reviewer);
+  if (tool) profile.issued = true;
+  const output = completion(reviewerText(reviewer), body.stream === true, tool, body.model);
+  res.writeHead(200, { "content-type": output.type }); res.end(output.body);
+}
+async function readRequestBody(req: IncomingMessage): Promise<unknown> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of req) chunks.push(Buffer.from(chunk));
+  return JSON.parse(Buffer.concat(chunks).toString());
+}
+async function handleFixtureRequest(req: IncomingMessage, res: ServerResponse) {
   try {
     if (req.url?.startsWith("/marker/")) { markers.push(req.url); res.writeHead(200); res.end("fixture marker"); return; }
-    const chunks: Buffer[] = [];
-    for await (const chunk of req) chunks.push(Buffer.from(chunk));
-    const body = JSON.parse(Buffer.concat(chunks).toString());
-    if (req.url === "/v1/systemone") {
-      calls.push("decision");
-      assert.equal(body.model, "decision");
-      assert.ok(body.questions.permission && body.state, "native SDK lowered questions/input into decision wire protocol");
-      const mode = profile.decision ?? "low";
-      if (mode === "timeout") { res.writeHead(200); res.write("{"); return; }
-      const choice = mode === "low" || mode === "invalid" ? "allow" : mode;
-      const probabilities = mode === "invalid" ? { allow: 0.98, deny: 0.98, ask: 0.98 } :
-        mode === "low" ? { allow: 0.4, deny: 0.3, ask: 0.3 } :
-        Object.fromEntries(["allow", "deny", "ask"].map((value) => [value, value === choice ? 0.98 : 0.01]));
-      res.writeHead(200, { "content-type": "application/json" });
-      // Structurally valid native output, but inconsistent probabilities in the
-      // invalid case: exercise plugin validation rather than SDK wire rejection.
-      res.end(JSON.stringify({ model: "decision", answers: { permission: {
-        type: "choice", choice, confidence: mode === "low" ? 0.4 : 0.98, probabilities,
-      } } }));
-      return;
-    }
-    assert.equal(req.url, "/v1/chat/completions");
-    // One explicitly opted-in case uses the agent model ID as the reviewer so a
-    // same-model reviewer can be exercised without inventing a second identity.
-    const reviewer = body.model === FIXTURE_REVIEWER_MODEL ||
-      (profile.sameModelReviewer === true && body.model === FIXTURE_AGENT_MODEL);
-    assert.ok(reviewer || body.model === FIXTURE_AGENT_MODEL, "unexpected fixture model");
-    if (reviewer) {
-      reviewerInputs.push(JSON.stringify(body.messages));
-      calls.push("reviewer");
-      if (profile.reviewerFailure) { res.writeHead(400); res.end("fixture deliberate provider error"); return; }
-      if (profile.timeout) { res.writeHead(200, { "content-type": "application/json" }); res.write("{"); return; }
-    }
-    const tool = !reviewer && !profile.issued && profile.tool &&
-      body.tools?.some((t: { function: { name: string } }) => t.function.name === profile.tool!.name) ? profile.tool : undefined;
-    if (tool) profile.issued = true;
-    const output = completion(reviewer ? profile.reviewer ?? "ALLOW: fixture authorized" : "Ready", body.stream === true, tool, body.model);
-    res.writeHead(200, { "content-type": output.type }); res.end(output.body);
+    const body = await readRequestBody(req);
+    if (req.url === "/v1/systemone") return handleSystemOne(res, body as SystemOneBody);
+    return handleChatCompletion(req, res, body as ChatCompletionBody);
   } catch { res.writeHead(500); res.end("internal error"); }
-});
+}
+const provider = createServer(handleFixtureRequest);
 provider.listen(0, "127.0.0.1");
 await once(provider, "listening");
 const providerAddress = provider.address();
@@ -190,11 +219,99 @@ async function permission(f: Fixture, resources: string[], action = "shell", met
   return (await api(`/api/session/${f.sessionID}/permission`, { action, resources, save: resources, agent: "build", metadata })).data;
 }
 function auditRecords(f?: { sessionID?: string }): Record<string, unknown>[] {
-  if (!existsSync(auditPath)) return [];
-  const records = readFileSync(auditPath, "utf8").trim().split("\n").filter(Boolean).flatMap((line) => {
+  // Retained rotations keep earlier records readable after the active sink
+  // rolls over. Oldest-first order preserves append semantics.
+  const records = readAuditSnapshot();
+  return f?.sessionID === undefined ? records : records.filter(record => record.sessionID === f.sessionID);
+}
+/** The active audit sink plus every retained rotation, oldest first. */
+function auditFiles(): string[] {
+  const directory = dirname(auditPath);
+  const base = basename(auditPath);
+  const rotated: { file: string; sequence: number }[] = [];
+  for (const name of existsSync(directory) ? readdirSync(directory) : []) {
+    const suffix = name.startsWith(`${base}.`) ? name.slice(base.length + 1) : "";
+    if (/^\d+$/.test(suffix)) rotated.push({ file: join(directory, name), sequence: Number(suffix) });
+  }
+  rotated.sort((left, right) => left.sequence - right.sequence);
+  return [...rotated.map((entry) => entry.file), ...(existsSync(auditPath) ? [auditPath] : [])];
+}
+type AuditSnapshot = { records: Record<string, unknown>[]; stable: boolean };
+type AuditCandidate = { fd: number } | { reason: "duplicate" | "unavailable" };
+/** Rotation is link-then-unlink in another process; retry a bounded number of times. */
+const auditReadAttempts = 4;
+
+/** A rollover can invalidate a snapshot mid-read; retry it, never dedupe event IDs. */
+function readAuditSnapshot(): Record<string, unknown>[] {
+  let snapshot = readAuditFiles();
+  for (let attempt = 1; attempt < auditReadAttempts && !snapshot.stable; attempt++) snapshot = readAuditFiles();
+  return snapshot.records;
+}
+
+/** Read every name oldest-first, then confirm the active name still holds the same inode. */
+function readAuditFiles(): AuditSnapshot {
+  const before = pathIdentity(auditPath);
+  const seen = new Set<string>();
+  const snapshot: AuditSnapshot = { records: [], stable: true };
+  for (const file of auditFiles()) readAuditFile(file, seen, snapshot);
+  return { records: snapshot.records, stable: snapshot.stable && pathIdentity(auditPath) === before };
+}
+
+function readAuditFile(file: string, seen: Set<string>, snapshot: AuditSnapshot): void {
+  const candidate = openAuditCandidate(file, seen);
+  if ("reason" in candidate) { snapshot.stable &&= candidate.reason === "duplicate"; return; }
+  try { appendAuditRecords(candidate.fd, snapshot.records); }
+  catch { snapshot.stable = false; }
+  finally { closeSync(candidate.fd); }
+}
+
+/** Push line by line: one snapshot can hold tens of thousands of records. */
+function appendAuditRecords(fd: number, records: Record<string, unknown>[]): void {
+  for (const record of decodeAuditLines(readFileSync(fd, "utf8"))) records.push(record);
+}
+
+/** Rotation links the active sink to its archive before unlinking, so one inode can
+ * answer to two names. Identity comes from the open descriptor to avoid a stat race. */
+function openAuditCandidate(file: string, seen: Set<string>): AuditCandidate {
+  let fd: number;
+  try { fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK); }
+  catch { return { reason: "unavailable" }; }
+  const identity = descriptorIdentity(fd);
+  if (identity !== undefined && !seen.has(identity)) { seen.add(identity); return { fd }; }
+  closeSync(fd);
+  return { reason: identity === undefined ? "unavailable" : "duplicate" };
+}
+
+/** Device/inode of a regular file through an already-open descriptor. */
+function descriptorIdentity(fd: number): string | undefined {
+  try {
+    const stat = fstatSync(fd);
+    return stat.isFile() ? `${stat.dev}:${stat.ino}` : undefined;
+  } catch { return undefined; }
+}
+
+/** Device/inode of a path without following symlinks; undefined when it is gone. */
+function pathIdentity(file: string): string | undefined {
+  try {
+    const stat = lstatSync(file);
+    return `${stat.dev}:${stat.ino}`;
+  } catch { return undefined; }
+}
+
+function decodeAuditLines(text: string): Record<string, unknown>[] {
+  return text.split("\n").flatMap((line) => {
+    if (line.trim() === "") return [];
     try { return [JSON.parse(line) as Record<string, unknown>]; } catch { return []; }
   });
-  return f?.sessionID === undefined ? records : records.filter(record => record.sessionID === f.sessionID);
+}
+function isEvaluatedBefore(record: Record<string, unknown>, action: string): boolean {
+  return record.type === "permission.evaluate.before" &&
+    (record.payload as { action?: string } | undefined)?.action === action;
+}
+/** Raw evaluate events precede the visible effect; wait out append/rollover races. */
+async function evaluatedBefore(f: Fixture, action: string): Promise<Record<string, unknown> | undefined> {
+  const records = await until(async () => auditRecords(f), (value) => value.some((record) => isEvaluatedBefore(record, action)));
+  return records.findLast((record) => isEvaluatedBefore(record, action));
 }
 async function savedApprovals(f: { query: string }): Promise<{ id: string; action: string; resource: string }[]> {
   const response = await api(`/api/permission/saved${f.query}`);
@@ -204,10 +321,11 @@ type CapturedHostEvent = { id: string; type: string; data: { sessionID?: string;
 function capturedHostEvents(records: Record<string, unknown>[]): CapturedHostEvent[] {
   return records.filter(record => record.type === "event").map(record => record.payload as CapturedHostEvent);
 }
-async function sharedAuditRegression() {
-  // Run first: release 1.1.0 uses one fixed state sink, so the two locations
-  // below share it deliberately. This case must start with only two loads.
-  const locations = ["shared-owner", "shared-standby"].map(name => {
+type SharedAuditLocation = { directory: string; query: string };
+
+/** Two scratch checkouts deliberately sharing the release 1.1.0 fixed state sink. */
+function sharedAuditLocations(): SharedAuditLocation[] {
+  return ["shared-owner", "shared-standby"].map(name => {
     const directory = join(root, name); mkdirSync(directory);
     execFileSync("git", ["init", "--quiet", directory]);
     writeFileSync(join(directory, "opencode.json"), JSON.stringify({ permissions: [
@@ -215,6 +333,29 @@ async function sharedAuditRegression() {
     ] }));
     return { directory, query: `?location%5Bdirectory%5D=${encodeURIComponent(directory)}` };
   });
+}
+
+/** Create one session and assert the shared sink captured its native event exactly once. */
+function sharedAuditCreator(records: () => Record<string, unknown>[], sessions: { id: string; title: string; directory: string }[]) {
+  return async (directory: string, title: string) => {
+    const session = (await api("/api/session", { location: { directory }, agent: "build", title,
+      model: { id: FIXTURE_AGENT_MODEL, providerID: FIXTURE_PROVIDER } })).data;
+    const observed = await until(async () => capturedHostEvents(records()), events =>
+      events.some(event => event.type === "session.created" && event.data.sessionID === session.id));
+    const created = observed.filter(event => event.type === "session.created" && event.data.sessionID === session.id);
+    assert.equal(created.length, 1, "same shared sink captures each native session.created exactly once, never zero");
+    assert.equal(typeof created[0].id, "string", "raw host event ID retained");
+    assert.equal(created[0].data.title, title);
+    assert.equal(created[0].data.location?.directory, directory);
+    sessions.push({ id: session.id, title, directory });
+    return session.id as string;
+  };
+}
+
+async function sharedAuditRegression() {
+  // Run first: release 1.1.0 uses one fixed state sink, so the two locations
+  // below share it deliberately. This case must start with only two loads.
+  const locations = sharedAuditLocations();
   writeFileSync(configFile, JSON.stringify({ ...globalConfig, plugins: [{ package: plugin, options: {
     classifiers: [{ type: "static" }], audit: { enabled: true, maxBytes: 10_485_760 },
   } }] }));
@@ -231,19 +372,7 @@ async function sharedAuditRegression() {
   assert.equal(typeof owner.instanceID, "string");
   assert.ok(locations.some(location => location.directory === (owner.sourceLocation as { directory: string }).directory));
   const sessions: { id: string; title: string; directory: string }[] = [];
-  const create = async (directory: string, title: string) => {
-    const session = (await api("/api/session", { location: { directory }, agent: "build", title,
-      model: { id: FIXTURE_AGENT_MODEL, providerID: FIXTURE_PROVIDER } })).data;
-    const observed = await until(async () => capturedHostEvents(records()), events =>
-      events.some(event => event.type === "session.created" && event.data.sessionID === session.id));
-    const created = observed.filter(event => event.type === "session.created" && event.data.sessionID === session.id);
-    assert.equal(created.length, 1, "same shared sink captures each native session.created exactly once, never zero");
-    assert.equal(typeof created[0].id, "string", "raw host event ID retained");
-    assert.equal(created[0].data.title, title);
-    assert.equal(created[0].data.location?.directory, directory);
-    sessions.push({ id: session.id, title, directory });
-    return session.id as string;
-  };
+  const create = sharedAuditCreator(records, sessions);
   const first = await create(locations[0].directory, "Shared sink first session");
   await create(locations[1].directory, "Shared sink second session");
   // Explicit off keeps this native read grant a pure pass-through probe even
@@ -779,8 +908,7 @@ try {
     assert.equal((await toolResult(f, "shell")).state.status, "error");
     assert.equal(existsSync(join(f.directory, "native-allow-denied.txt")), false, "reviewer denial prevents the actual tool side effect");
     assert.deepEqual(calls, ["reviewer"]);
-    const evaluated = auditRecords(f).findLast(record => record.type === "permission.evaluate.before" &&
-      (record.payload as { action?: string }).action === "shell");
+    const evaluated = await evaluatedBefore(f, "shell");
     assert.equal((evaluated?.payload as { effect?: string } | undefined)?.effect, "allow", "host presented the native allow to the review hook");
   });
   await run("native allow safe allow and invalid user context", async () => {

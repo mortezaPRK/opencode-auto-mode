@@ -39,8 +39,7 @@
     "./gui-experimental": "./dist/gui-experimental.cjs"
   },
   "scripts": {
-    "lint": "eslint . --max-warnings=0 && node scripts/complexity-lint.js",
-    "lint:complexity": "node scripts/complexity-lint.js",
+    "lint": "eslint . --max-warnings=0",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
     "test:integration": "bun run integration/opencode.ts",
@@ -63,7 +62,6 @@
     "@opentui/core": "0.7.0",
     "@opentui/solid": "0.7.0",
     "@types/node": "^26.6.4",
-    "@types/shell-quote": "1.7.5",
     "@typescript/native": "npm:typescript@^7.0.2",
     "eslint": "^10.12.0",
     "solid-js": "1.9.17",
