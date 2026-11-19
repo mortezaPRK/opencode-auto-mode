@@ -6,6 +6,7 @@ import { spawnSync } from "node:child_process";
 
 const MODEL = { providerID: "fixture", id: "judge" };
 const T0 = "2026-01-01T00:00:00.000Z";
+const RECORDED_PLATFORM = process.platform === "win32" ? "linux" : "win32";
 
 function event(type: string, reviewID: string, stageIndex: number | null, payload: unknown, extra: Record<string, unknown> = {}) {
   return {
@@ -23,12 +24,15 @@ function decisionStart(reviewID: string, stageIndex = 1, minConfidence = 0.9) {
   return event("classifier.start", reviewID, stageIndex, { type: "decision", model: `${MODEL.providerID}/${MODEL.id}`, minConfidence, timeoutMs: 3000 });
 }
 
-function decisionBefore(reviewID: string, evidence: unknown, format: "predicate" | "legacy", callID = "call_1", stageIndex = 1) {
+function decisionBefore(reviewID: string, evidence: Record<string, unknown>, format: "predicate" | "legacy", callID = "call_1", stageIndex = 1) {
   const questions = format === "predicate"
     ? [{ type: "predicate", name: "safety", instructions: "safety" }, { type: "predicate", name: "authorization", instructions: "authorization" }]
     : [{ type: "choice", name: "permission", instructions: "permission", choices: [{ value: "allow" }, { value: "deny" }, { value: "ask" }] }];
+  // Real records always carry the recording host's platform; fixtures model that
+  // unless a test deliberately drops or overrides it.
+  const text = JSON.stringify({ platform: process.platform, ...evidence });
   return event("generate.decisions.before", reviewID, stageIndex, {
-    model: MODEL, input: [{ type: "text", text: JSON.stringify(evidence) }], questions,
+    model: MODEL, input: [{ type: "text", text }], questions,
   }, { callID });
 }
 
@@ -203,6 +207,26 @@ function writeRows(root: string, rows: unknown[]): string {
   const file = join(root, "audit.jsonl");
   writeFileSync(file, `${rows.map((row) => JSON.stringify(row)).join("\n")}\n`);
   return file;
+}
+
+interface DecisionRowOptions { tool?: string; input?: unknown; metadata?: unknown; callID?: string; capture?: boolean }
+
+function decisionRows(reviewID: string, evidence: Record<string, unknown>, options: DecisionRowOptions = {}): unknown[] {
+  const action = String(evidence.action);
+  const resources = evidence.resources as string[];
+  const callID = options.callID ?? `call_${reviewID}`;
+  const messageID = `msg_${reviewID}`;
+  const capture = options.capture === false ? [] : [
+    toolCall(messageID, callID, options.tool ?? action, options.input ?? { path: resources[0] }),
+  ];
+  return [
+    ...capture,
+    permission(reviewID, action, resources, options.metadata, { type: "tool", messageID, id: callID }),
+    decisionStart(reviewID),
+    decisionBefore(reviewID, evidence, "predicate", callID),
+    decisionAfter(reviewID, PREDICATE_HIGH.answers, callID),
+    stageEnd(reviewID, "allow"),
+  ];
 }
 
 function fakeCli(root: string): string {
@@ -458,4 +482,116 @@ test("model filter is required instead of defaulting to a personal model", () =>
   const result = run([]);
   expect(result.status).not.toBe(0);
   expect(result.stderr).toContain("--model <provider>/<id> is required");
+});
+
+test("recorded platform and shell context survive reconstruction into live evidence", () => {
+  const root = mkdtempSync(join(tmpdir(), "auto-mode-platform-"));
+  try {
+    const input = writeRows(root, decisionRows("review-platform", {
+      action: "shell", resources: ["echo %TOKEN%"], userMessages: ["run echo %TOKEN%"],
+      platform: RECORDED_PLATFORM, shell: { platform: "win32", interpreter: "cmd.exe" },
+    }, { tool: "shell", input: { command: "echo %TOKEN%" }, metadata: { input: { command: "echo %TOKEN%" } } }));
+    const dry = run(["--input", input, "--model", "fixture/judge", "--json"]);
+    expect(dry.status).toBe(0);
+    expect(JSON.parse(dry.stdout).eligibility.eligible).toBe(1);
+    const body = join(root, "body.json");
+    const result = run(["--input", input, "--model", "fixture/judge", "--live", "--limit", "1",
+      "--opencode-bin", fakeCli(root), "--json"], { FAKE_BODY: body });
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout).live.selected).toBe(1);
+    const sent = JSON.parse(readFileSync(body, "utf8"));
+    const evidence = JSON.parse(sent.input[0].text);
+    expect(evidence.platform).toBe(RECORDED_PLATFORM);
+    expect(evidence.shell).toEqual({ platform: "win32", interpreter: "cmd.exe" });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("missing or malformed recorded execution context is pre-generation and never live-generated", () => {
+  const root = mkdtempSync(join(tmpdir(), "auto-mode-context-loss-"));
+  try {
+    const input = writeRows(root, [
+      ...decisionRows("review-no-platform", {
+        action: "read", resources: ["/tmp/fixture-project/a.ts"], userMessages: ["read a"], platform: undefined,
+      }),
+      ...decisionRows("review-bad-shell", {
+        action: "shell", resources: ["echo hi"], userMessages: ["say hi"],
+        platform: process.platform, shell: { interpreter: 7 },
+      }, { tool: "shell", input: { command: "echo hi" }, metadata: { input: { command: "echo hi" } } }),
+      ...decisionRows("review-truncated-shell", {
+        action: "shell", resources: ["echo hi"], userMessages: ["say hi"],
+        platform: process.platform, shell: { platform: "win32", interpreter: "cmd.exe" }, incompleteEvidenceKind: "shell",
+      }, { tool: "shell", input: { command: "echo hi" }, metadata: { input: { command: "echo hi" } } }),
+    ]);
+    const dry = run(["--input", input, "--model", "fixture/judge", "--json"]);
+    expect(dry.status).toBe(0);
+    const report = JSON.parse(dry.stdout);
+    expect(report.evidence.preGeneration).toEqual({ platform: 1, shell: 2 });
+    expect(report.predicate.outcomes).toEqual({ "pre-generation": 3 });
+    expect(report.eligibility.eligible).toBe(0);
+    const live = run(["--input", input, "--model", "fixture/judge", "--live", "--limit", "1", "--json"]);
+    expect(live.status).toBe(0);
+    const liveReport = JSON.parse(live.stdout);
+    expect(liveReport.live.eligible).toBe(0);
+    expect(liveReport.live.modelCalls).toBe(0);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("untrusted actions get their own summaries instead of inherited properties", () => {
+  const root = mkdtempSync(join(tmpdir(), "auto-mode-action-names-"));
+  try {
+    const rows = ["constructor", "__proto__"].flatMap((action) => decisionRows(`review-${action}`, {
+      action, resources: [`/tmp/fixture-project/${action}.ts`], userMessages: [`read ${action}`],
+    }, { capture: false, metadata: { input: { path: `/tmp/fixture-project/${action}.ts` } } }));
+    const input = writeRows(root, rows);
+    const dry = run(["--input", input, "--model", "fixture/judge", "--json"]);
+    expect(dry.status).toBe(0);
+    const report = JSON.parse(dry.stdout);
+    for (const action of ["constructor", "__proto__"]) {
+      expect(report.actions[action].requests).toBe(1);
+      expect(report.actions[action].predicate).toEqual({ allow: 1 });
+    }
+    const result = run(["--input", input, "--model", "fixture/judge", "--live", "--limit", "2",
+      "--opencode-bin", fakeCli(root), "--json"], { FAKE_BODY: join(root, "body.json") });
+    expect(result.status).toBe(0);
+    const liveReport = JSON.parse(result.stdout);
+    expect(liveReport.live.selected).toBe(2);
+    for (const action of ["constructor", "__proto__"]) {
+      expect(liveReport.live.actions[action].requests).toBe(1);
+      expect(liveReport.live.actions[action].statuses).toEqual({ allow: 1 });
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("--details --json includes bounded normalized request rows without prompts or evidence", () => {
+  const root = mkdtempSync(join(tmpdir(), "auto-mode-details-"));
+  try {
+    const rows: unknown[] = [];
+    for (let index = 0; index < 205; index++) {
+      const reviewID = `review-detail-${index}`;
+      const callID = `call_${index}`;
+      rows.push(
+        decisionStart(reviewID),
+        decisionBefore(reviewID, {
+          action: "read", resources: [`/tmp/fixture-project/${index}.ts`], userMessages: [`TOY_SECRET read ${index}`],
+        }, "predicate", callID),
+        decisionAfter(reviewID, PREDICATE_HIGH.answers, callID),
+      );
+    }
+    const input = writeRows(root, rows);
+    const result = run(["--input", input, "--model", "fixture/judge", "--details", "--json"]);
+    expect(result.status).toBe(0);
+    const report = JSON.parse(result.stdout);
+    expect(report.details.total).toBe(205);
+    expect(report.details.rows).toHaveLength(200);
+    expect(report.details.rows[0]).toMatchObject({
+      format: "predicate", split: "primary", threshold: 0.9, action: "read",
+      predicate: "allow", recorded: "none", llm: "none", final: "none",
+    });
+    expect(report.details.rows[0].reviewID).toStartWith("review-detail-");
+    expect(Object.keys(report.details.rows[0])).not.toContain("resources");
+    expect(Object.keys(report.details.rows[0])).not.toContain("userMessages");
+    expect(result.stdout).not.toContain("TOY_SECRET");
+    const plain = run(["--input", input, "--model", "fixture/judge", "--json"]);
+    expect(JSON.parse(plain.stdout).details).toBeUndefined();
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });

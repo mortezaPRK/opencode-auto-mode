@@ -214,16 +214,25 @@ function boundedShellField(value: unknown): { value?: string; loss: boolean } {
   return { value, loss: false };
 }
 
+function shellContext(request: DecisionEvidenceRequest): { shell?: DecisionEvidence["shell"]; loss: boolean } {
+  if (request.shell === undefined) return { loss: false };
+  const platform = boundedShellField(request.shell.platform);
+  const interpreter = boundedShellField(request.shell.interpreter);
+  return {
+    shell: defined({ platform: platform.value, interpreter: interpreter.value }),
+    loss: platform.loss || interpreter.loss,
+  };
+}
+
 /** Execution context is safety evidence: `echo %TOKEN%` is literal in POSIX
  * shells but expands an environment variable in cmd.exe. */
 function shellEvidence(request: DecisionEvidenceRequest): Pick<DecisionEvidence, "platform"> & { shell?: DecisionEvidence["shell"]; loss: boolean } {
-  const platform = boundedShellField(request.shell?.platform);
-  const interpreter = boundedShellField(request.shell?.interpreter);
-  const shell = request.shell === undefined ? undefined : defined({ platform: platform.value, interpreter: interpreter.value });
+  const recorded = request.platform === undefined ? undefined : boundedShellField(request.platform);
+  const context = shellContext(request);
   return {
-    platform: process.platform,
-    ...(shell === undefined ? {} : { shell }),
-    loss: platform.loss || interpreter.loss,
+    platform: recorded?.value ?? process.platform,
+    ...(context.shell === undefined ? {} : { shell: context.shell }),
+    loss: context.loss || recorded?.loss === true,
   };
 }
 

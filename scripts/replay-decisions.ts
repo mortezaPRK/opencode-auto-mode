@@ -30,6 +30,8 @@ const MAX_PENDING_HOSTS = 512;
 const MAX_PENDING_REVIEWS = 4096;
 const MAX_TOOL_CAPTURES = 256;
 const MAX_DETAIL_ROWS = 200;
+const MAX_RECORDED_PLATFORM_CHARS = 64;
+const MAX_RECORDED_SHELL_CHARS = 500;
 const MAX_PROBLEMS = 8;
 const CLI_MAX_BUFFER = 2 * 1024 * 1024;
 const DELEGATION_LOSS = "Delegated context was redacted or lost";
@@ -164,6 +166,11 @@ interface RecordedEvidence {
   projectDir?: string;
   worktreeRoot?: string;
   scopeResolution?: "unknown";
+  platform?: string;
+  shell?: { platform?: string; interpreter?: string };
+  /** Recorded execution context that cannot be replayed faithfully; the request
+   * must abstain before generation instead of substituting the replay host. */
+  contextLoss?: "platform" | "shell";
   userMessages?: string[];
   delegations?: string[];
   /** True when the recorded delegation list was dropped (bounds or invalid entries). */
@@ -183,7 +190,7 @@ interface Candidate {
   metadataInvalid: boolean;
   codeModeError: boolean;
   terminal?: "opaque";
-  preGeneration?: "resources" | "operation" | "delegations" | "too-large";
+  preGeneration?: "resources" | "platform" | "shell" | "operation" | "delegations" | "too-large";
   bytes: number;
   readOnly: boolean;
   userMessagesRetained: boolean;
@@ -273,6 +280,24 @@ interface ActionSummary {
   predicateVsLlm: Counts;
   fallback: number;
 }
+
+interface RequestDetail {
+  reviewID: string;
+  format: RequestView["format"];
+  split: RequestView["split"];
+  threshold: number;
+  action: string;
+  predicate: string;
+  legacy: string;
+  recorded: string;
+  llm: string;
+  final: string;
+  safety?: number;
+  authorization?: number;
+  confidence?: number;
+}
+
+interface DetailsReport { total: number; rows: RequestDetail[] }
 
 interface EligibilityReport {
   total: number;
@@ -381,6 +406,7 @@ interface Report {
   eligibility: EligibilityReport;
   rebuild: RebuildReport;
   problems: Problem[];
+  details?: DetailsReport;
   live?: LiveSummary;
   fidelity: string;
 }
@@ -1046,6 +1072,35 @@ function gitState(value: unknown): RecordedEvidence["gitState"] {
   return Object.values(state).some((item) => item !== undefined) ? state : undefined;
 }
 
+/** The recorded platform must be a bounded, whitespace-free host identifier;
+ * otherwise replay would silently substitute the current machine. */
+function recordedPlatform(value: unknown): { value?: string; loss: boolean } {
+  if (typeof value !== "string" || value.length === 0 || value.length > MAX_RECORDED_PLATFORM_CHARS || /\s/.test(value))
+    return { loss: true };
+  return { value, loss: false };
+}
+
+function recordedShellField(value: unknown): { value?: string; loss: boolean } {
+  if (value === undefined) return { loss: false };
+  if (typeof value !== "string" || value.length > MAX_RECORDED_SHELL_CHARS) return { loss: true };
+  return { value, loss: false };
+}
+
+function recordedShell(value: unknown): { shell?: RecordedEvidence["shell"]; loss: boolean } {
+  if (value === undefined) return { loss: false };
+  const object = jsonRecord(value);
+  if (!object) return { loss: true };
+  const platform = recordedShellField(object.platform);
+  const interpreter = recordedShellField(object.interpreter);
+  return {
+    shell: {
+      ...(platform.value === undefined ? {} : { platform: platform.value }),
+      ...(interpreter.value === undefined ? {} : { interpreter: interpreter.value }),
+    },
+    loss: platform.loss || interpreter.loss,
+  };
+}
+
 function recordedEvidence(text: string | undefined): RecordedEvidence | undefined {
   if (text === undefined || text.length > MAX_EVIDENCE_TEXT_CHARS) return undefined;
   let parsed: unknown;
@@ -1055,6 +1110,9 @@ function recordedEvidence(text: string | undefined): RecordedEvidence | undefine
   if (!object) return undefined;
   const scope = object.scopeResolution === "unknown" ? "unknown" as const : undefined;
   const delegations = recordedDelegations(object.delegations);
+  const platform = recordedPlatform(object.platform);
+  const shell = recordedShell(object.shell);
+  const recordedShellLoss = object.incompleteEvidenceKind === "shell" ? "shell" as const : undefined;
   return {
     action: optionalString(object.action),
     resources: stringArray(object.resources),
@@ -1062,6 +1120,9 @@ function recordedEvidence(text: string | undefined): RecordedEvidence | undefine
     projectDir: optionalString(object.projectDir),
     worktreeRoot: optionalString(object.worktreeRoot),
     scopeResolution: scope,
+    platform: platform.value,
+    shell: shell.shell,
+    contextLoss: platform.loss ? "platform" : shell.loss ? "shell" : recordedShellLoss,
     userMessages: chronology(object.userMessages),
     delegations: delegations.delegations,
     delegationsLost: delegations.lost,
@@ -1076,7 +1137,8 @@ function requestFromRecorded(recorded: RecordedEvidence | undefined): DecisionEv
   return {
     action: recorded.action, resources: recorded.resources, agent: recorded.agent,
     projectDir: recorded.projectDir, worktreeRoot: recorded.worktreeRoot,
-    scopeResolution: recorded.scopeResolution, userMessages: recorded.userMessages,
+    scopeResolution: recorded.scopeResolution, platform: recorded.platform, shell: recorded.shell,
+    userMessages: recorded.userMessages,
     delegations: recorded.delegations,
     transcript: recorded.transcript, staticAnalysis: recorded.staticAnalysis, gitState: recorded.gitState,
   };
@@ -1107,6 +1169,7 @@ function requestFromHost(host: HostEvent, recorded: RecordedEvidence | undefined
   return {
     action: host.action, resources, agent: hostAgent(host, recorded), projectDir: hostProjectDir(host, recorded),
     worktreeRoot: recorded?.worktreeRoot, scopeResolution: recorded?.scopeResolution,
+    platform: recorded?.platform, shell: recorded?.shell,
     userMessages: recorded?.userMessages, delegations: recorded?.delegations,
     transcript: recorded?.transcript,
     staticAnalysis: recorded?.staticAnalysis, gitState: recorded?.gitState, operation,
@@ -1131,8 +1194,11 @@ function delegationLoss(recorded: RecordedEvidence | undefined, evidence: Decisi
   return { ...evidence, incompleteEvidence: DELEGATION_LOSS, incompleteEvidenceKind: "delegations" };
 }
 
-function preGenerationOf(evidence: DecisionEvidence, bytes: number, request: DecisionEvidenceRequest): Candidate["preGeneration"] {
+function preGenerationOf(evidence: DecisionEvidence, bytes: number, request: DecisionEvidenceRequest,
+  contextLoss: RecordedEvidence["contextLoss"]): Candidate["preGeneration"] {
   if (resourceLoss(request)) return "resources";
+  if (contextLoss !== undefined) return contextLoss;
+  if (evidence.incompleteEvidenceKind === "shell") return "shell";
   if (evidence.incompleteEvidenceKind === "delegations") return "delegations";
   if (evidence.operation?.complete === false) return "operation";
   return bytes > 60_000 ? "too-large" : undefined;
@@ -1178,7 +1244,7 @@ function missingHostCandidate(recorded: RecordedEvidence | undefined): Candidate
     request: fallback ?? { action: "", resources: [] }, evidence,
     hostJoined: false, missingHost: true, missingChronology: missingChronologyOf(recorded), operationMissing: true,
     metadataInvalid: false, codeModeError: false,
-    preGeneration: fallback === undefined ? undefined : preGenerationOf(evidence, bytes, fallback), bytes,
+    preGeneration: fallback === undefined ? undefined : preGenerationOf(evidence, bytes, fallback, recorded?.contextLoss), bytes,
     ...rebuildFlags(recorded, evidence),
   };
 }
@@ -1208,7 +1274,7 @@ function candidateFor(review: ReviewState, request: DecisionRequestAudit): Candi
     missingChronology: missingChronologyOf(recorded), operationMissing: evidence.operation === undefined,
     metadataInvalid: review.host.metadataInvalid, codeModeError: false,
     terminal: opaqueOperation(evidence, built) ? "opaque" : undefined,
-    preGeneration: preGenerationOf(evidence, bytes, built), bytes, ...rebuildFlags(recorded, evidence),
+    preGeneration: preGenerationOf(evidence, bytes, built, recorded?.contextLoss), bytes, ...rebuildFlags(recorded, evidence),
   };
 }
 
@@ -1573,7 +1639,7 @@ function bumpAction(summary: ActionSummary, view: RequestView): void {
 }
 
 function actionsReport(views: readonly RequestView[]): Record<string, ActionSummary> {
-  const actions: Record<string, ActionSummary> = {};
+  const actions: Record<string, ActionSummary> = Object.create(null) as Record<string, ActionSummary>;
   for (const view of views) {
     const action = view.candidate.request.action || "unknown";
     const summary = actions[action] ??= emptyActionSummary();
@@ -1651,7 +1717,8 @@ function buildReport(state: State, views: readonly RequestView[], options: CliOp
       holdout: splitSummary(views.filter((view) => view.split === "holdout")),
     },
     actions: actionsReport(views), eligibility: eligibilityReport(views), rebuild: rebuildReport(views),
-    problems: state.problems, ...(live === undefined ? {} : { live }),
+    problems: state.problems, ...(options.details ? { details: detailsReport(views) } : {}),
+    ...(live === undefined ? {} : { live }),
     fidelity: "Recorded-audit replay only. The dry-run predicate section replays recorded answers against rebuilt evidence; it is not a fresh model result. LLM verdicts are not ground truth; thresholds are not tuned; config is unchanged.",
   };
 }
@@ -1777,7 +1844,7 @@ async function liveReplay(views: readonly RequestView[], options: CliOptions): P
   const statuses: Counts = {};
   const comparisons: Counts = {};
   const vsLlm: Counts = {};
-  const actions: Record<string, LiveActionSummary> = {};
+  const actions: Record<string, LiveActionSummary> = Object.create(null) as Record<string, LiveActionSummary>;
   const detail: LiveResult[] = [];
   let modelCalls = 0, modelErrors = 0, preGeneration = 0;
   for (const item of results) {
@@ -1840,6 +1907,34 @@ function legacyDetail(view: RequestView): string {
 
 function detailLine(view: RequestView): string {
   return `${view.reviewID} ${view.format} split=${view.split} threshold=${view.threshold} predicate=${predicateDetail(view)} legacy=${legacyDetail(view)} recorded=${view.recordedEnd?.decision ?? "none"} llm=${view.llmEnd?.decision ?? "none"} final=${view.final?.decision ?? "none"} action=${view.candidate.request.action || "?"}`;
+}
+
+function stageDecision(end: StageEnd | undefined): string {
+  return end?.decision ?? (end === undefined ? "none" : "error");
+}
+
+function detailNumbers(view: RequestView): Pick<RequestDetail, "safety" | "authorization" | "confidence"> {
+  const values: Pick<RequestDetail, "safety" | "authorization" | "confidence"> = {};
+  if (view.predicate?.safety !== undefined) values.safety = view.predicate.safety;
+  if (view.predicate?.authorization !== undefined) values.authorization = view.predicate.authorization;
+  if (view.legacy?.confidence !== undefined) values.confidence = view.legacy.confidence;
+  return values;
+}
+
+function detailOf(view: RequestView): RequestDetail {
+  return {
+    reviewID: view.reviewID, format: view.format, split: view.split, threshold: view.threshold,
+    action: view.candidate.request.action || "unknown",
+    predicate: view.predicate === undefined ? "none" : view.predicate.status,
+    legacy: view.legacy === undefined ? "none" : view.legacy.status,
+    recorded: stageDecision(view.recordedEnd), llm: stageDecision(view.llmEnd),
+    final: view.final === undefined ? "none" : view.final.decision,
+    ...detailNumbers(view),
+  };
+}
+
+function detailsReport(views: readonly RequestView[]): DetailsReport {
+  return { total: views.length, rows: views.slice(0, MAX_DETAIL_ROWS).map(detailOf) };
 }
 
 function printDetails(views: readonly RequestView[]): void {
