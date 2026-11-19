@@ -32,6 +32,8 @@ review expectations.
 | `src/user-files.ts` | JSONC parsing and user-owned-file checks. |
 | `src/timeout.ts`, `src/errors.ts` | Bounded provider calls and stable error categories. |
 | `scripts/replay.ts` | Checkout-only offline audit replay with static diagnostics. |
+| `scripts/replay-decisions.ts` | Checkout-only audit-backed decision evaluation: recorded-answer dry-run by default, opt-in `--live` native replay. |
+| `scripts/decision-candidate.ts` | Checkout-only recorded/`--live` decision-candidate evaluator. Requires an explicit model and a threshold of at least 0.9, reports raw probability distributions with optional expected values only as comparison labels, and stores no prompts or raw inputs. |
 | `scripts/no-personal-defaults.test.ts` | Privacy guard for models, endpoints, credentials, and allowlist-shaped defaults. |
 | `scripts/dev-reload.sh` | Optional GUI build plus an explicit `opencode reload` request. Never restarts the live service. |
 | `integration/opencode.ts` | Real `opencode serve` integration harness using scratch HOME/XDG roots and fixture providers. |
@@ -121,8 +123,8 @@ Focused checks while touching docs, scripts, or a narrow module:
 ```sh
 bun test src/score.test.ts src/score-security.test.ts src/shell.test.ts
 bun test src/fact-review.test.ts src/fact-verdict.test.ts
-bun test scripts/no-personal-defaults.test.ts scripts/replay.test.ts
-bunx eslint scripts/replay.ts scripts/replay.test.ts scripts/no-personal-defaults.test.ts
+bun test scripts/no-personal-defaults.test.ts scripts/replay.test.ts scripts/decision-candidate.test.ts scripts/replay-decisions.test.ts
+bunx eslint scripts/replay.ts scripts/replay.test.ts scripts/no-personal-defaults.test.ts scripts/decision-candidate.ts scripts/decision-candidate.test.ts scripts/replay-decisions.ts scripts/replay-decisions.test.ts
 git diff --check
 ```
 
@@ -221,7 +223,7 @@ bun run lint
 bun run typecheck
 bun run build:gui
 bun run test:integration
-bun test scripts/no-personal-defaults.test.ts scripts/replay.test.ts
+bun test scripts/no-personal-defaults.test.ts scripts/replay.test.ts scripts/decision-candidate.test.ts scripts/replay-decisions.test.ts
 git diff --check
 npm pack --dry-run
 ```
@@ -233,10 +235,11 @@ models, endpoints, credentials, or allowlists are present. Verify the actual
 `npm pack` result rather than assuming the link layout.
 
 Last recorded results: 44 integration scenarios passed against OpenCode `2.2.5`;
-the full unit suite also passed (396 tests when recorded, 399 on the current
-tree). Manual desktop acceptance and multi-day dogfood have not been executed. A
-green local unit/lint/typecheck/pack run is not a release readiness claim; record
-the actual real-server, desktop, and dogfood results before claiming one.
+the full unit suite also passed (396 tests when the integration run was recorded,
+814 on the current tree). Manual desktop acceptance and multi-day dogfood have
+not been executed. A green local unit/lint/typecheck/pack run is not a release
+readiness claim; record the actual real-server, desktop, and dogfood results
+before claiming one.
 
 Do not commit, tag, publish, restart a live service, or change personal
 configuration as part of a code change unless the owner has explicitly authorized

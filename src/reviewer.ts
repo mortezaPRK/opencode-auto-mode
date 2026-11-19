@@ -34,6 +34,9 @@ export interface PermissionRequest {
   delegations?: readonly string[];
   staticAnalysis?: { band: string; reason: string; findings?: readonly string[] };
   scopeResolution?: "unknown";
+  /** Host platform override for replaying recorded evidence faithfully; live
+   * requests omit it so the current host platform is used. */
+  platform?: string;
   shell?: { platform?: string; interpreter?: string };
   /** Selected, bounded operation evidence from the permission event; never raw metadata/source. */
   operation?: OperationEvidence;

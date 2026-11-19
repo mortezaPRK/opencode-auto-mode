@@ -373,6 +373,26 @@ contents, prompts, and model outputs. If enabled, the fixed path is
 absolute). Rotated archives are retained; delete them manually. See
 [README.llm.md](README.llm.md#audit-and-replay) before enabling it.
 
+For decision-quality evaluation, `bun scripts/replay-decisions.ts --model '<provider>/<model>'` reads the local audit and rotations by default, filters that
+exact decision model, deduplicates request identities, joins actual host metadata,
+and builds candidate compact evidence. It prints aggregate recorded-answer
+predicate replay, legacy/LLM agreement, per-action coverage, malformed, error, fallback, probability and
+session-holdout statistics; prompts and raw audit rows are not printed. The
+dry-run re-evaluates recorded answers against rebuilt evidence and is not a fresh
+model result. `--live` is opt-in and replays stateless decisions through the
+authenticated OpenCode CLI with a conservative request limit and concurrency.
+Never commit or upload raw audit files.
+
+A separate `bun scripts/decision-candidate.ts --input '<manifest.json>' --model '<provider>/<model>'`
+evaluates a private manifest of recorded native decision responses offline;
+`--live` calls the native decision CLI instead. It requires an acceptance
+threshold of at least `0.9` (lower values are rejected), checks every question's
+reported probability (and each choice distribution) rather than a label or
+confidence, and counts failed cases in the attempted denominator. Reports
+contain case keys, verdicts, probabilities, and error categories only—no
+prompts, questions, responses, or raw inputs. No `80%` claim or dataset
+statistics are made; local results can be stale.
+
 ## More documentation
 
 - [README.llm.md](README.llm.md) — installation instructions for an AI agent,

@@ -112,6 +112,11 @@ export interface CapturedToolInput {
 export interface OperationEvidenceOptions {
   projectDir?: string;
   capture?: CapturedToolInput;
+  /** Canonical targets recorded on the original host. When present, replay uses
+   * them instead of resolving this host's spellings or filesystem, so target
+   * loss cannot make the rebuilt operation incomplete; failures unrelated to
+   * targets (redacted arguments, missing capture, invalid metadata) still do. */
+  targets?: readonly string[];
 }
 
 export interface ToolInputStore {
@@ -471,7 +476,9 @@ function knownEvidence(event: OperationEvent, metadata: Record<string, unknown> 
   const compatible = capture === undefined || toolMatchesAction(event.action, capture.tool);
   const merged = mergeArguments(selected.arguments, capturedArguments(event.action, capture));
   const tool = boundedTool(compatible ? capture?.tool ?? event.action : event.action);
-  const targets = operationTargets(event.action, event.resources, merged.arguments, options.projectDir);
+  const targets = options.targets === undefined
+    ? operationTargets(event.action, event.resources, merged.arguments, options.projectDir)
+    : { targets: [...options.targets], complete: true };
   const checks = [!metadataInvalid, selected.complete, tool.complete, targets.complete, merged.complete, !PAYLOAD_TOOLS.has(event.action)];
   if (capture !== undefined) checks.push(compatible, capture.complete);
   const evidence = composeOperation(tool.tool, TOOL_ACCESS[event.action] ?? "unknown", targets.targets, merged.arguments, allComplete(checks));
@@ -534,22 +541,37 @@ function accessForTool(tool: string | undefined): OperationAccess {
   return tool === undefined ? "unknown" : TOOL_ACCESS[tool] ?? "unknown";
 }
 
+function externalTargetOutcome(canonical: readonly string[] | undefined, event: OperationEvent,
+  metadata: Record<string, unknown> | undefined, args: Record<string, unknown> | undefined,
+  options: OperationEvidenceOptions): { targets: { targets?: string[]; complete: boolean }; conflict: boolean } {
+  if (canonical !== undefined) return { targets: { targets: [...canonical], complete: true }, conflict: false };
+  const conflict = externalTargetConflict(metadata, args, options.projectDir) ||
+    !externalScopeContained(event.resources, metadata, args, options.projectDir);
+  return { targets: externalTargets(options.capture, conflict, metadata, args, options.projectDir), conflict };
+}
+
+function missingExactShellTarget(tool: string | undefined, metadata: Record<string, unknown> | undefined,
+  args: Record<string, unknown> | undefined, canonical: readonly string[] | undefined): boolean {
+  return canonical === undefined && (tool === "shell" || tool === "bash") && !hasExactTargets(metadata, args);
+}
+
 function externalEvidence(event: OperationEvent, metadata: Record<string, unknown> | undefined, metadataInvalid: boolean,
   options: OperationEvidenceOptions): OperationEvidence {
   const capture = options.capture;
   const nested = metadata?.input === undefined ? { complete: true } : sanitizeArguments(metadata.input);
   const merged = mergeArguments(nested.arguments, capture?.arguments);
   const tool = boundedTool(capture?.tool);
-  const conflict = externalTargetConflict(metadata, merged.arguments, options.projectDir) ||
-    !externalScopeContained(event.resources, metadata, merged.arguments, options.projectDir);
-  const targets = externalTargets(capture, conflict, metadata, merged.arguments, options.projectDir);
-  const shellWithoutExact = (tool.tool === "shell" || tool.tool === "bash") && !hasExactTargets(metadata, merged.arguments);
+  const canonical = options.targets === undefined ? undefined : [...options.targets];
+  const scope = externalTargetOutcome(canonical, event, metadata, merged.arguments, options);
+  const shellWithoutExact = missingExactShellTarget(tool.tool, metadata, merged.arguments, canonical);
   // A correlated payload tool never captured its content, so the evidence is
-  // incomplete even though the verified destination targets are retained.
+  // incomplete even though the verified destination targets are retained; a
+  // canonical replay target cannot restore a payload the capture omitted.
   const payloadOmitted = capture !== undefined && PAYLOAD_TOOLS.has(capture.tool);
   const checks = [!metadataInvalid, capture !== undefined, capture?.complete === true, nested.complete,
-    tool.complete, targets.complete, targets.targets !== undefined, merged.complete, !conflict, !shellWithoutExact, !payloadOmitted];
-  return composeOperation(tool.tool, accessForTool(tool.tool), targets.targets, merged.arguments, allComplete(checks));
+    tool.complete, scope.targets.complete, scope.targets.targets !== undefined, merged.complete, !scope.conflict,
+    !shellWithoutExact, !payloadOmitted];
+  return composeOperation(tool.tool, accessForTool(tool.tool), scope.targets.targets, merged.arguments, allComplete(checks));
 }
 
 /** Selects bounded evidence from untrusted metadata and one exact captured call;
