@@ -593,6 +593,9 @@ interface ProjectEditScope {
 
 function projectEditTool(operation: OperationEvidence | undefined): string | undefined {
   if (operation === undefined || operation.tool === undefined || !PROJECT_EDIT_TOOLS.has(operation.tool)) return undefined;
+  // An explicit correlation failure is not an omitted body: the capture could
+  // not be matched to this call, so its retained tool and targets are not proof.
+  if (operation.correlated === false) return undefined;
   return operation.access === undefined || operation.access === "write" ? operation.tool : undefined;
 }
 

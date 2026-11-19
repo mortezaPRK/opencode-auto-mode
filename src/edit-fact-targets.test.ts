@@ -173,6 +173,17 @@ it("rejects a symlinked parent component before lexical normalization", () => {
   blocksMetadata(metadataRequest(traversal, { path: traversal }), "metadata target through a symlinked parent");
 });
 
+it("rejects an explicitly uncorrelated capture even with matching targets", () => {
+  const target = join(PROJECT, "parser.ts");
+  const request = metadataRequest(target, { path: target });
+  const uncorrelated: EditFactRequest = {
+    ...request,
+    operation: { ...request.operation!, correlated: false },
+  };
+  blocksMetadata(uncorrelated, "an explicitly uncorrelated operation must not become a candidate");
+  assert.equal(prepareProjectEditCandidate(request).ok, true, "an omitted correlation stays eligible");
+});
+
 it("does not let an unverified worktree root widen the metadata boundary", () => {
   const target = join(DECLARED, "outside", "parser.ts");
   blocksMetadata(metadataRequest(target, { path: target }, {
