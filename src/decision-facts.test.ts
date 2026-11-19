@@ -151,13 +151,14 @@ const EDIT_PATH = join(FIXTURE_ROOT, "src", "parser.ts");
 const OTHER_PATH = join(FIXTURE_ROOT, "src", "other.ts");
 
 // Real shell cwd fixture: existing roots are confined by realpathSync, so these
-// cases need a physical tree plus a symlink that leaves it.
+// cases need a physical tree plus symlinks that leave it or point deeper inside.
 const SHELL_ROOT = realpathSync(mkdtempSync(join(tmpdir(), "opencode-shell-facts-")));
 const SHELL_OUTSIDE = realpathSync(mkdtempSync(join(tmpdir(), "opencode-shell-outside-")));
 mkdirSync(join(SHELL_ROOT, "sub"), { recursive: true });
 mkdirSync(join(SHELL_ROOT, "pkg", "sub"), { recursive: true });
 mkdirSync(join(SHELL_OUTSIDE, "deep"), { recursive: true });
 symlinkSync(SHELL_OUTSIDE, join(SHELL_ROOT, "link"));
+symlinkSync(join(SHELL_ROOT, "pkg", "sub"), join(SHELL_ROOT, "inner"));
 const SHELL_SUB = realpathSync(join(SHELL_ROOT, "sub"));
 after(() => {
   rmSync(SHELL_ROOT, { recursive: true, force: true });
@@ -552,6 +553,16 @@ it("abstains before any call for a missing cwd under an existing root", async ()
   assert.equal(fake.calls(), 0);
 });
 
+it("abstains after inspection for a folded cd target missing under an existing root", async () => {
+  const fake = responder([inspectionReply(false, 0.02), inspectionReply(true, 0.99)]);
+  const result = await classifyOperationFacts(fake.ctx, options(),
+    realShellRequest(`cd ${join(SHELL_ROOT, "missing")} && git status`));
+  assert.equal(result.kind, "unknown");
+  assert.equal(result.errorKind, "context");
+  assert.match(result.reason, /leading cd/);
+  assert.equal(fake.calls(), 1);
+});
+
 it("accepts an existing subdirectory inside the real root as the explicit workdir", async () => {
   const texts: string[] = [];
   const replies: Reply[] = [inspectionReply(false, 0.02), inspectionReply(true, 0.96)];
@@ -583,6 +594,32 @@ it("does not flatten a symlink followed by .. before the physical cwd check", as
   assert.equal(result.errorKind, "context");
   assert.match(result.reason, /leading cd/);
   assert.equal(fake.calls(), 1);
+});
+
+it("abstains after inspection when a folded cd climbs past an internal symlink", async () => {
+  // Bash folds `inner/../..` logically to the root's parent, while the physical
+  // walk names an in-root directory; the fold must not certify a cwd at all.
+  const fake = responder([inspectionReply(false, 0.02), inspectionReply(true, 0.99)]);
+  const result = await classifyOperationFacts(fake.ctx, options(), realShellRequest("cd inner/../.. && rm victim"));
+  assert.equal(result.kind, "unknown");
+  assert.equal(result.errorKind, "context");
+  assert.match(result.reason, /leading cd/);
+  assert.equal(fake.calls(), 1);
+});
+
+it("still folds a parent step with no symlink component", async () => {
+  const texts: string[] = [];
+  const replies: Reply[] = [inspectionReply(false, 0.02), inspectionReply(true, 0.96)];
+  const ctx = context(async (input) => {
+    texts.push(input.input[0]?.type === "text" ? input.input[0].text : "");
+    const reply = replies[texts.length - 1];
+    return reply === undefined ? undefined : reply();
+  });
+  const result = await classifyOperationFacts(ctx, options(), realShellRequest("cd pkg/../sub && git status"));
+  assert.equal(result.kind, "inspection");
+  assert.equal(texts[1], JSON.stringify({
+    command: "git status", fullCommand: "cd pkg/../sub && git status", segmentIndex: 0, cwd: SHELL_SUB,
+  }));
 });
 
 it("omits an unknown shell cwd but still sends the complete captured command", async () => {
@@ -1043,19 +1080,13 @@ it("folds one leading literal cd and classifies every segment under the confined
     const reply = replies[texts.length - 1];
     return reply === undefined ? undefined : reply();
   });
-  const request: OperationFactRequest = {
-    action: "shell", resources: ["/root"], projectDir: "/root", worktreeRoot: "/root",
-    operation: {
-      tool: "shell", access: "execute", targets: ["/root"], complete: true,
-      arguments: { command: "cd /root/sub && git status && git log -3", workdir: "/root" },
-    },
-  };
-  const result = await classifyOperationFacts(ctx, options(), request);
+  const command = `cd ${SHELL_SUB} && git status && git log -3`;
+  const result = await classifyOperationFacts(ctx, options(), realShellRequest(command));
   assert.equal(result.kind, "inspection");
   assert.equal(result.probability, 0.97);
   assert.deepEqual(texts.slice(1), [
-    `{"command":"git status","fullCommand":"cd /root/sub && git status && git log -3","segmentIndex":0,"cwd":"/root/sub"}`,
-    `{"command":"git log -3","fullCommand":"cd /root/sub && git status && git log -3","segmentIndex":1,"cwd":"/root/sub"}`,
+    JSON.stringify({ command: "git status", fullCommand: command, segmentIndex: 0, cwd: SHELL_SUB }),
+    JSON.stringify({ command: "git log -3", fullCommand: command, segmentIndex: 1, cwd: SHELL_SUB }),
   ]);
 });
 
@@ -1198,6 +1229,22 @@ it("abstains without a tool call when an execute script names a protected path",
     "const git = await tools.read({ path: '.git/config' });",
     "const other = await tools.read({ path: 'id_ed25519' });",
     "const netrc = await tools.read({ path: '.netrc' });",
+  ];
+  for (const script of scripts) {
+    const fake = responder([toolReadonlyReply(true, 0.99)]);
+    const result = await classifyOperationFacts(fake.ctx, options(), executeRequest(script));
+    assert.equal(result.kind, "unknown", script);
+    assert.equal(result.errorKind, "context", script);
+    assert.equal(fake.calls(), 0, script);
+  }
+});
+
+it("abstains without a tool call when an execute script hides a protected path behind escapes", async () => {
+  const scripts = [
+    "const env = await tools.read({ path: '\\u002eenv' });",
+    "const env = await tools.read({ path: '\\x2eenv' });",
+    "const env = await tools.read({ path: '\\056env' });",
+    "const env = await tools.read({ path: `${'.'}env` });",
   ];
   for (const script of scripts) {
     const fake = responder([toolReadonlyReply(true, 0.99)]);

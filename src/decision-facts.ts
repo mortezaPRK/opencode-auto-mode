@@ -1,5 +1,5 @@
 /** Fact classification only: never a permission, approval or safety verdict. */
-import { realpathSync } from "node:fs";
+import { lstatSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, parse, resolve, sep } from "node:path";
 import { Model } from "@opencode/schema/model";
@@ -306,28 +306,38 @@ function capturedCommand(evidence: DecisionEvidence): string | undefined {
 
 type ExplicitCwd = { value?: string; unusable: boolean };
 
+type PhysicalWalk = { readonly path: string; readonly parentAfterSymlink: boolean };
+
 /** Physical path, resolved component by component so a captured `..` follows the
  * link target's parent instead of lexically erasing the link (as macOS realpath
- * normalizes `link/..`); undefined when any component does not resolve. */
-function physicalPath(value: string): string | undefined {
+ * normalizes `link/..`); undefined when any component does not resolve. Also
+ * reports a `..` after a symlink: Bash folds a folded `cd` logically (`link/..`
+ * deletes the name), so such a walk names a directory Bash never enters. */
+function physicalWalk(value: string): PhysicalWalk | undefined {
   if (!isAbsolute(value)) return undefined;
   const root = parse(value).root;
   let current = root;
+  let symlinked = false;
+  let parentAfterSymlink = false;
   for (const part of value.slice(root.length).split(sep)) {
     if (part === "" || part === ".") continue;
     if (part === "..") {
+      parentAfterSymlink = parentAfterSymlink || symlinked;
       current = dirname(current);
       continue;
     }
     const candidate = current.endsWith(sep) ? `${current}${part}` : `${current}${sep}${part}`;
     try {
+      symlinked = symlinked || lstatSync(candidate).isSymbolicLink();
       current = realpathSync(candidate);
     } catch {
       return undefined;
     }
   }
-  return current;
+  return { path: current, parentAfterSymlink };
 }
+
+const physicalPath = (value: string): string | undefined => physicalWalk(value)?.path;
 
 /** Absolute spelling against its base before normalization: realpath must see the
  * literal components so a symlink followed by `..` cannot be flattened. */
@@ -360,12 +370,16 @@ function confinedWorkdir(value: string, projectDir: string | undefined,
 }
 
 /** Folded leading `cd` resolved against the effective shell cwd with the same
- * containment as an explicit workdir. */
+ * containment as an explicit workdir; a `..` after a symlink has no usable cwd
+ * because Bash's logical `cd` lands where the physical walk does not. */
 function foldedCwd(target: string, cwd: string | undefined, evidence: DecisionEvidence): string | undefined {
   const root = evidence.worktreeRoot ?? evidence.projectDir;
   if (root === undefined || !isAbsolute(root)) return undefined;
   const value = absoluteTarget(target, cwd);
-  return value === undefined ? undefined : confinedPath(value, root);
+  if (value === undefined) return undefined;
+  const walk = physicalWalk(value);
+  if (walk?.parentAfterSymlink === true) return undefined;
+  return confinedPath(value, root);
 }
 
 /** First explicit workdir, cwd or directory in canonical key order; expansion or
@@ -502,10 +516,18 @@ function protectedScriptString(value: string, projectDir: string | undefined): b
   }
 }
 
-/** Code Mode is opaque code: any quoted protected path abstains before asking. */
+/** A raw literal with an escape or template interpolation is not the string the
+ * runtime sees (`'\u002eenv'`, `` `${'.'}env` ``), so it cannot be screened. */
+function unresolvedLiteral(quote: string, value: string): boolean {
+  return value.includes("\\") || (quote === "`" && value.includes("${"));
+}
+
+/** Code Mode is opaque code: any quoted protected path, or any literal that
+ * hides one behind escapes or interpolation, abstains before asking. */
 function scriptNamesProtectedPath(script: string, projectDir: string | undefined): boolean {
   for (const match of script.matchAll(SCRIPT_STRING)) {
-    if (protectedScriptString(match[2] ?? "", projectDir)) return true;
+    const value = match[2] ?? "";
+    if (unresolvedLiteral(match[1] ?? "", value) || protectedScriptString(value, projectDir)) return true;
   }
   return false;
 }
