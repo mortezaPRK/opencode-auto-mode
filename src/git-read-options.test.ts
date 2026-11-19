@@ -50,17 +50,72 @@ it("requires both opt-outs for diff and only textconv for log and show patches",
   ]) allows(words);
 });
 
-it("keeps blob-only show output read-only without driver opt-outs", () => {
+it("requires textconv opt-out for show revisions that may name blobs", () => {
   for (const words of [
     ["git", "show", "HEAD:file.txt"], ["git", "show", "HEAD:src/main.ts"],
     ["git", "show", "--format=short", "HEAD:file.txt"],
-    ["git", "show", "HEAD:file.txt", "--stat"],
     ["git", "show", "HEAD:file.txt", "--"],
+    ["git", "show", "HEAD:file.txt", "HEAD"],
+    ["git", "show", "--", "HEAD:file.txt"],
+    ["git", "show", "HEAD^{/fix:}"], ["git", "show", "HEAD@{12:00}"],
+    ["git", "show", "HEAD:submodule"],
+    ["git", "show", "-p", "HEAD:file.txt"],
+  ]) reviews(words);
+  for (const words of [
+    ["git", "show", "HEAD:file.txt", "--no-textconv"],
+    ["git", "show", "--format=short", "HEAD:file.txt", "--no-textconv"],
+    ["git", "show", "HEAD:file.txt", "--stat"],
     ["git", "show", "-p", "--no-textconv", "HEAD:file.txt"],
   ]) allows(words);
-  reviews(["git", "show", "-p", "HEAD:file.txt"]);
-  reviews(["git", "show", "HEAD:file.txt", "HEAD"]);
-  reviews(["git", "show", "--", "HEAD:file.txt"]);
+});
+
+it("treats word-diff options as patch-producing", () => {
+  for (const words of [
+    ["git", "log", "--word-diff"], ["git", "log", "--word-diff=plain"],
+    ["git", "log", "--color-words"], ["git", "log", "--word-diff-regex=."],
+    ["git", "diff", "--stat", "--word-diff=plain"],
+    ["git", "diff", "--stat", "--color-words"],
+    ["git", "show", "--stat", "HEAD", "--word-diff"],
+    ["git", "log", "--no-patch", "--word-diff"],
+  ]) reviews(words);
+  for (const words of [
+    ["git", "log", "--word-diff", "--no-textconv"],
+    ["git", "diff", "--stat", "--word-diff=plain", "--no-textconv", "--no-ext-diff"],
+    ["git", "show", "--word-diff", "HEAD", "--no-textconv"],
+    ["git", "log", "--word-diff", "--no-patch"],
+  ]) allows(words);
+});
+
+it("reviews pickaxe filters that can run textconv without patch output", () => {
+  for (const words of [
+    ["git", "log", "-Sneedle"], ["git", "log", "-Gneedle"], ["git", "log", "-S", "needle"],
+    ["git", "log", "--pickaxe-all"], ["git", "log", "--pickaxe-regex"],
+    ["git", "diff", "--name-only", "-Gneedle"],
+    ["git", "diff", "--stat", "-Sneedle"],
+    ["git", "diff", "--name-only", "--pickaxe-all"],
+    ["git", "diff", "--name-only", "-Gneedle", "--no-textconv"],
+  ]) reviews(words);
+  for (const words of [
+    ["git", "log", "-Sneedle", "--no-textconv"],
+    ["git", "log", "-Gneedle", "--no-textconv"],
+    ["git", "diff", "--name-only", "-Gneedle", "--no-textconv", "--no-ext-diff"],
+  ]) allows(words);
+});
+
+it("requires textconv opt-out for quiet and exit-status probes", () => {
+  for (const words of [
+    ["git", "log", "-p", "--quiet"], ["git", "log", "--quiet"],
+    ["git", "log", "--no-patch", "--exit-code"],
+    ["git", "show", "--quiet", "HEAD"],
+    ["git", "show", "--no-patch", "--exit-code"],
+    ["git", "show", "--stat", "--quiet", "HEAD"],
+  ]) reviews(words);
+  for (const words of [
+    ["git", "log", "-p", "--quiet", "--no-textconv"],
+    ["git", "log", "--no-patch", "--exit-code", "--no-textconv"],
+    ["git", "show", "--quiet", "HEAD", "--no-textconv"],
+    ["git", "show", "--no-patch", "--exit-code", "--no-textconv"],
+  ]) allows(words);
 });
 
 it("applies last-option semantics to patch suppression", () => {

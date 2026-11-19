@@ -2311,7 +2311,7 @@ export function isReadOnlyInvocation(words: readonly string[], globs: readonly b
 }
 
 type GitOutputEffect = "patch" | "no-patch" | "non-patch" | "non-patch-keep" |
-  "quiet" | "unquiet" | "exit" | "no-exit";
+  "quiet" | "unquiet" | "exit" | "no-exit" | "pickaxe";
 type GitScanValue = "flag" | "value" | "optional";
 
 interface GitScanState {
@@ -2320,6 +2320,7 @@ interface GitScanState {
   nonPatchFormat: boolean;
   quiet: boolean;
   exitStatus: boolean;
+  pickaxe: boolean;
   textconvOff: boolean;
   extDiffOff: boolean;
   revisions: string[];
@@ -2335,6 +2336,8 @@ const GIT_OUTPUT_EFFECTS = new Map<string, GitOutputEffect>([
   ["--patch", "patch"], ["--patch-with-raw", "patch"], ["--patch-with-stat", "patch"],
   ["--binary", "patch"], ["--remerge-diff", "patch"], ["--cc", "patch"], ["--dense-combined", "patch"],
   ["--dd", "patch"], ["--diff-merges", "patch"], ["--unified", "patch"],
+  ["--word-diff", "patch"], ["--word-diff-regex", "patch"], ["--color-words", "patch"],
+  ["--pickaxe-all", "pickaxe"], ["--pickaxe-regex", "pickaxe"],
   ["--no-patch", "no-patch"],
   ["--stat", "non-patch"], ["--stat-width", "non-patch"], ["--stat-name-width", "non-patch"],
   ["--stat-graph-width", "non-patch"], ["--stat-count", "non-patch"], ["--compact-summary", "non-patch"],
@@ -2389,7 +2392,7 @@ const GIT_SHORT_SCAN_FLAGS = new Set(["p", "u", "s", "m", "c", "a", "v", "z", "R
 
 function newGitScanState(): GitScanState {
   return { patch: false, noOutput: false, nonPatchFormat: false, quiet: false, exitStatus: false,
-    textconvOff: false, extDiffOff: false, revisions: [], paths: [], certain: true };
+    pickaxe: false, textconvOff: false, extDiffOff: false, revisions: [], paths: [], certain: true };
 }
 
 function gitLongKind(option: string): GitScanValue | undefined {
@@ -2409,6 +2412,7 @@ function applyGitEffect(state: GitScanState, option: string): void {
   else if (effect === "unquiet") state.quiet = false;
   else if (effect === "exit") state.exitStatus = true;
   else if (effect === "no-exit") state.exitStatus = false;
+  else if (effect === "pickaxe") state.pickaxe = true;
 }
 
 function applyGitLongOption(state: GitScanState, part: { option: string; attached?: string }): GitScanValue | undefined {
@@ -2425,16 +2429,25 @@ function applyGitShortFlag(state: GitScanState, letter: string): void {
   else if (letter === "s") { state.patch = false; state.noOutput = true; state.nonPatchFormat = false; }
 }
 
-function applyGitShortOption(state: GitScanState, word: string, args: readonly string[], index: number): number | undefined {
-  if (/^-\d+$/.test(word)) return index + 1;
-  const flags = shortFlags(word, GIT_SHORT_SCAN_VALUES);
+function applyGitShortFlags(state: GitScanState, flags: string): boolean {
   for (const letter of flags) {
-    if (!GIT_SHORT_SCAN_FLAGS.has(letter)) return undefined;
+    if (!GIT_SHORT_SCAN_FLAGS.has(letter)) return false;
     applyGitShortFlag(state, letter);
   }
+  return true;
+}
+
+function applyGitShortValue(state: GitScanState, parsed: ShortValue): void {
+  if (parsed.letter === "L" || parsed.letter === "U") { state.patch = true; state.noOutput = false; }
+  if (parsed.letter === "S" || parsed.letter === "G") state.pickaxe = true;
+}
+
+function applyGitShortOption(state: GitScanState, word: string, args: readonly string[], index: number): number | undefined {
+  if (/^-\d+$/.test(word)) return index + 1;
+  if (!applyGitShortFlags(state, shortFlags(word, GIT_SHORT_SCAN_VALUES))) return undefined;
   const parsed = shortOption(word, GIT_SHORT_SCAN_VALUES);
   if (parsed === undefined) return index + 1;
-  if (parsed.letter === "L" || parsed.letter === "U") { state.patch = true; state.noOutput = false; }
+  applyGitShortValue(state, parsed);
   if (GIT_SHORT_SCAN_OPTIONAL.has(parsed.letter) || parsed.attached !== undefined) return index + 1;
   return index + 1 < args.length ? index + 2 : undefined;
 }
@@ -2476,8 +2489,10 @@ function gitPatchPossible(scan: GitScanState, defaultPatch: boolean): boolean {
   return scan.patch || (defaultPatch && !scan.noOutput && !scan.nonPatchFormat);
 }
 
-function isGitBlobSpec(word: string): boolean {
-  return /^[^:]+:.+/.test(word);
+/** True when a git read may run textconv or an external diff helper. */
+function gitDiffRisk(scan: GitScanState, defaultPatch: boolean): boolean {
+  return gitPatchPossible(scan, defaultPatch) || scan.pickaxe || scan.quiet ||
+    (scan.noOutput && scan.exitStatus);
 }
 
 function hasGitGlobalOverride(args: readonly string[]): boolean {
@@ -2489,22 +2504,21 @@ function hasGitGlobalOverride(args: readonly string[]): boolean {
 function isReadOnlyGitDiff(args: readonly string[]): boolean {
   const scan = scanGitOptions(args);
   if (!scan.certain) return false;
-  const drivers = gitPatchPossible(scan, true) || scan.quiet || (scan.noOutput && scan.exitStatus);
-  return !drivers || (scan.textconvOff && scan.extDiffOff);
+  return !gitDiffRisk(scan, true) || (scan.textconvOff && scan.extDiffOff);
 }
 
 function isReadOnlyGitLog(args: readonly string[]): boolean {
   const scan = scanGitOptions(args);
   if (!scan.certain) return false;
-  return !gitPatchPossible(scan, false) || scan.textconvOff;
+  return !gitDiffRisk(scan, false) || scan.textconvOff;
 }
 
+/** No static blob exemption: `<rev>:<path>` may name a gitlink commit, so only
+ * non-patch output or an explicit textconv opt-out is safe. */
 function isReadOnlyGitShow(args: readonly string[]): boolean {
   const scan = scanGitOptions(args);
   if (!scan.certain) return false;
-  const blobOnly = scan.paths.length === 0 && scan.revisions.length > 0 &&
-    scan.revisions.every(isGitBlobSpec);
-  return !gitPatchPossible(scan, !blobOnly) || scan.textconvOff;
+  return !gitDiffRisk(scan, true) || scan.textconvOff;
 }
 
 function isReadOnlyGitBranch(args: readonly string[]): boolean {
