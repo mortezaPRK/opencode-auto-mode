@@ -11,7 +11,9 @@
  * `safety`/`authorization` review. Zero-finding read-only inspections,
  * project-local `shell_segments`, metadata-only `project_edit` and a hash-bound
  * `local_edit` change candidate allow on their facts; callers still apply the
- * mandatory score guards first.
+ * mandatory score guards first. A captured command that conflicts with the
+ * evaluated resources, or an unresolved shell scope, is carried by the score as
+ * a blocking finding, so those fact-only paths fall through to the full review.
  */
 import { createHash } from "node:crypto";
 import { Model } from "@opencode/schema/model";
@@ -312,7 +314,9 @@ function factCallFlowMatches(kind: CertifiedOperationKind, calls: readonly FactC
 }
 
 /** Zero static findings is enough only because the certified provenance already
- * proves every fact-stage call was read-only. */
+ * proves every fact-stage call was read-only. Conflict or scope findings from
+ * the score remain blocking, so a command that the shell guards never evaluated
+ * cannot ride this shortcut. */
 function readOnlyInspection(fact: CertifiedOperationFact, snapshot: FactReviewSnapshot): boolean {
   return fact.kind === "inspection" && snapshot.staticAnalysis !== undefined &&
     (snapshot.staticAnalysis.findings?.length ?? 0) === 0;

@@ -184,7 +184,8 @@ function mandatoryShellScore(resources: readonly string[], unsafe: RequestScore 
 
 function conflictScore(unsafe: RequestScore | undefined): RequestScore {
   const conflict = high("Shell command evidence is missing or conflicts with the permission resources");
-  return unsafe?.findings === undefined ? conflict : { ...conflict, findings: unsafe.findings };
+  const findings = ["Captured command differs from the evaluated permission resources; shell guards did not inspect it"];
+  return { ...conflict, findings: [...findings, ...(unsafe?.findings ?? [])] };
 }
 
 /** Captured evidence may only clear commands it still describes from a base the
@@ -194,7 +195,13 @@ function evidenceScore(request: PermissionRequest, resources: readonly string[],
   worktreeRoot?: string): RequestScore | undefined {
   if (commandEvidenceConflicts(request.operation, resources)) return conflictScore(unsafe);
   if (location.unverified || (located !== request && worktreeRoot === undefined))
-    return high("Shell working directory evidence is unresolved; static scope cannot be verified");
+    return {
+      ...high("Shell working directory evidence is unresolved; static scope cannot be verified"),
+      findings: [
+        "Shell working directory could not be verified against the containment root",
+        ...(unsafe?.findings ?? []),
+      ],
+    };
   return undefined;
 }
 

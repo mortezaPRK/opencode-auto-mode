@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { parseOptions } from "./config.js";
 import type { DecisionContext, DecisionInput } from "./decision.js";
 import type { OperationEvidence } from "./decision-evidence.js";
 import {
@@ -14,6 +15,7 @@ import {
   type FactReviewRequest,
 } from "./fact-review.js";
 import { freshDelegationReviewQuestions, freshReviewQuestions } from "./fact-verdict.js";
+import { scoreRequest } from "./score.js";
 import { MAX_SEGMENTS } from "./shell-segments.js";
 
 type Decisions = DecisionContext["experimental"]["generate"]["decisions"];
@@ -1143,6 +1145,72 @@ it("keeps the full review for shell_segments with a static finding", async () =>
   assert.equal(result.decision, "allow");
   assert.deepEqual(fake.calls.at(-1), ["safety", "authorization"]);
   assert.equal(fake.calls.filter((names) => names.includes("safety")).length, 1);
+});
+
+const scoreOptions = parseOptions({ classifiers: [{ type: "static" }] });
+
+/** `pwd` is the scored resource while the captured command reads a protected
+ * store: the score must carry a blocking finding instead of a bare high band. */
+function scoredCommandConflict(): { request: FactReviewRequest; score: ReturnType<typeof scoreRequest> } {
+  const operation: OperationEvidence = {
+    tool: "shell", access: "execute", targets: ["/repo"],
+    arguments: { command: "cat .env", workdir: "/repo" }, complete: true,
+  };
+  const score = scoreRequest({ action: "shell", resources: ["pwd"], projectDir: "/repo", operation }, scoreOptions);
+  return {
+    request: {
+      action: "shell", resources: ["pwd"], projectDir: "/repo", worktreeRoot: "/repo",
+      operation, userMessages: ["Show the working directory."], shell: { interpreter: "bash" },
+      staticAnalysis: {
+        band: score.band, reason: score.reason,
+        ...(score.findings === undefined ? {} : { findings: score.findings }),
+      },
+    },
+    score,
+  };
+}
+
+it("keeps the full review when the captured command conflicts with the scored resources", async () => {
+  const { request, score } = scoredCommandConflict();
+  assert.equal(score.band, "high");
+  const inspection = pipeline({
+    inspection: inspectionReply(true, 0.95),
+    review: reply(reviewAnswer(0.99, 0.99)),
+  });
+  const inspectionResult = await reviewWithOperationFact(inspection.ctx, options, request);
+  assert.equal(inspectionResult.decision, "allow");
+  assert.deepEqual(inspection.calls, [["inspection"], ["safety", "authorization"]]);
+  assert.doesNotMatch(inspectionResult.reason, /review skipped/);
+  const segments = pipeline({
+    inspections: [inspectionReply(false, 0.02), inspectionReply(false, 0.02)],
+    segments: [segmentLocalReply(true, 0.97)],
+    review: reply(reviewAnswer(0.99, 0.99)),
+  });
+  const segmentResult = await reviewWithOperationFact(segments.ctx, options, request);
+  assert.equal(segmentResult.decision, "allow");
+  assert.deepEqual(segments.calls, [
+    ["inspection"],
+    ["inspection"],
+    ["segment_local"],
+    ["safety", "authorization"],
+  ]);
+  assert.doesNotMatch(segmentResult.reason, /review skipped/);
+  assert.ok((score.findings?.length ?? 0) > 0, "the command conflict is a blocking finding");
+});
+
+it("carries lost or unresolved shell scope evidence as blocking findings", () => {
+  const lost = scoreRequest({
+    action: "shell", resources: ["pwd"], projectDir: "/repo",
+    operation: { tool: "shell", access: "execute", complete: false },
+  }, scoreOptions);
+  assert.equal(lost.band, "high");
+  assert.ok((lost.findings?.length ?? 0) > 0);
+  const unresolved = scoreRequest({
+    action: "shell", resources: ["pwd"], projectDir: "/repo",
+    operation: { tool: "shell", access: "execute", complete: true, arguments: { command: "pwd", workdir: "~" } },
+  }, scoreOptions);
+  assert.equal(unresolved.band, "high");
+  assert.ok((unresolved.findings?.length ?? 0) > 0);
 });
 
 it("allows a project-local shell_segments fact exactly at the .8 floor", async () => {
