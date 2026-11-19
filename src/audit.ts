@@ -168,10 +168,33 @@ const CREDENTIAL_PARAM_NAME = /(?:^|[_.-])(?:token|tokens|secrets?|password|pass
 const CREDENTIAL_HEADER = /(^|[^A-Za-z0-9_-])((?:authorization|proxy-authorization|cookie|set-cookie|x-api-key|api-key|x-auth-token|x-access-token|x-amz-security-token)["']?\s*:\s*["']?)[^"'\r\n]+/gi;
 const AUTH_SCHEME = /\b(Bearer\s+)[A-Za-z0-9._~+/=-]{6,}/gi;
 const WELL_KNOWN_TOKEN = /\b(?:gh[pousr]_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,}|xox[abposr]-[A-Za-z0-9-]{8,}|sk-[A-Za-z0-9_-]{8,}|sk_(?:live|test)_[A-Za-z0-9]{8,}|AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{20,}|ya29\.[0-9A-Za-z_-]{8,}|glpat-[A-Za-z0-9_-]{10,}|npm_[A-Za-z0-9]{20,}|pypi-[A-Za-z0-9_-]{20,}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,})\b/g;
+const QUERY_PARAM = /([?&])([^=&\s#]+)=([^&#\s"']*)/g;
+const PARAM_WORD_BOUNDARY = /([a-z0-9])([A-Z])/g;
+const PARAM_SEPARATOR = /[^A-Za-z0-9]+/g;
+const ENCODED_OCTET = /%[0-9A-Fa-f]{2}/;
+const MAX_PARAM_DECODES = 4;
+
+/** Malformed or still-encoded escapes cannot prove a name harmless, so either
+ * counts as credential-bearing. */
+function decodedParamName(name: string): string | undefined {
+  let decoded = name;
+  for (let pass = 0; pass < MAX_PARAM_DECODES && ENCODED_OCTET.test(decoded); pass++) {
+    try { decoded = decodeURIComponent(decoded); } catch { return undefined; }
+  }
+  return ENCODED_OCTET.test(decoded) ? undefined : decoded;
+}
+
+/** `accessToken`, `access%5Ftoken` and `X-Api-Key` share the snake-case word
+ * boundaries the credential-name check understands. */
+function credentialParamName(name: string): boolean {
+  const decoded = decodedParamName(name);
+  if (decoded === undefined) return true;
+  return CREDENTIAL_PARAM_NAME.test(decoded.replace(PARAM_WORD_BOUNDARY, "$1_$2").replace(PARAM_SEPARATOR, "_"));
+}
 
 function redactQueryCredentials(value: string): string {
-  return value.replace(/([?&])([^=&\s#]+)=([^&#\s"']*)/g, (match, prefix: string, name: string) =>
-    CREDENTIAL_PARAM_NAME.test(name) ? `${prefix}${name}=${REDACTED}` : match);
+  return value.replace(QUERY_PARAM, (match, prefix: string, name: string) =>
+    credentialParamName(name) ? `${prefix}${name}=${REDACTED}` : match);
 }
 
 /** Screens the literal credential shapes that can survive HTTP-body screening. */

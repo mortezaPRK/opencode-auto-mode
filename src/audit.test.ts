@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { createAuditLog, defaultAuditPath, redactHttpBodies } from "./audit.js";
+import { createAuditLog, defaultAuditPath, redactCredentialSyntax, redactHttpBodies } from "./audit.js";
 import { DEFAULT_AUDIT_MAX_BYTES } from "./config.js";
 
 const record = { ts: "2026-01-01T00:00:00Z", reviewID: "r", sessionID: "s", action: "shell", resources: ["x".repeat(2000)], hostEffect: "ask", decision: "allow", stage: "score", reason: "ok", durationMs: 1 };
@@ -78,6 +78,23 @@ describe("unsafe opt-in audit log", () => {
 });
 
 describe("reviewer evidence redaction regressions", () => {
+  it("redacts decoded and word-split credential query names", () => {
+    const values = [
+      "https://example.invalid/?accessToken=SECRET_CAMEL",
+      "https://example.invalid/?access%5Ftoken=SECRET_ENCODED",
+      "https://example.invalid/?access%5ftoken=SECRET_LOWERCASE",
+      "https://example.invalid/?%61ccessToken=SECRET_PREFIX",
+      "https://example.invalid/?X-Api-Key=SECRET_KEBAB",
+      "https://example.invalid/?x%2Dapi%2Dkey=SECRET_KEBAB_ENCODED",
+    ];
+    for (const value of values) {
+      const redacted = redactCredentialSyntax(value);
+      assert.doesNotMatch(redacted, /SECRET_/, value);
+      assert.match(redacted, /REDACTED/, value);
+    }
+    assert.equal(redactCredentialSyntax("https://example.invalid/?query=kept&next=1"),
+      "https://example.invalid/?query=kept&next=1");
+  });
   it("preserves JSON formatting when no evidence is redacted", () => {
     for (const value of ["[ 1, 2 ]", '{ "command": "pwd", "nested": [ 3, 4 ] }'])
       assert.equal(redactHttpBodies(value), value);

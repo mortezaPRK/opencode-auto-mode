@@ -71,7 +71,10 @@ function segmentEffects(segment: ShellSegment): boolean {
 }
 
 interface CommandShape {
-  keys: Set<string>;
+  /** Ordered simple-command identities, including empty trailing segments. */
+  keys: string[];
+  /** Control operators between those segments, in order. */
+  operators: string[];
   effects: boolean;
 }
 
@@ -79,7 +82,8 @@ function commandShape(value: string): CommandShape | undefined {
   const parsed = parseShellCommands(value);
   if (parsed === undefined || !parsed.complete || parsed.segments.length === 0) return undefined;
   return {
-    keys: new Set(parsed.segments.map(segmentKey)),
+    keys: parsed.segments.map(segmentKey),
+    operators: [...parsed.operators],
     effects: parsed.redirects.length > 0 || parsed.segments.some(segmentEffects),
   };
 }
@@ -94,8 +98,26 @@ function commandShapes(values: readonly string[]): CommandShape[] | undefined {
   return shapes;
 }
 
-function sameSegments(left: ReadonlySet<string>, right: ReadonlySet<string>): boolean {
-  return left.size === right.size && [...left].every((key) => right.has(key));
+/** Separate permission resources are sequential commands, never a pipeline. */
+function combinedShape(shapes: readonly CommandShape[]): CommandShape {
+  const combined: CommandShape = { keys: [], operators: [], effects: false };
+  for (const shape of shapes) {
+    if (combined.keys.length > 0) combined.operators.push("\n");
+    combined.keys.push(...shape.keys);
+    combined.operators.push(...shape.operators);
+    combined.effects ||= shape.effects;
+  }
+  return combined;
+}
+
+function sameList(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+/** `|`, `;`, `&&`, `||` and newline are identity-bearing: a captured pipeline
+ * must not reconcile with a scored sequence. */
+function sameCommands(left: CommandShape, right: CommandShape): boolean {
+  return sameList(left.keys, right.keys) && sameList(left.operators, right.operators);
 }
 
 /** The only escape from the effect gate: the same text after continuation
@@ -110,8 +132,7 @@ function commandConflict(captured: CommandShape, scored: readonly CommandShape[]
   resources: readonly string[]): boolean {
   if (captured.effects || scored.some((shape) => shape.effects))
     return !exactCommandMatch(command, resources);
-  const keys = new Set(scored.flatMap((shape) => [...shape.keys]));
-  return !sameSegments(captured.keys, keys);
+  return !sameCommands(captured, combinedShape(scored));
 }
 
 function capturedCommand(operation: OperationEvidence): string | undefined {
@@ -152,6 +173,31 @@ function guardScore(guarded: ReviewResult | undefined, resources: readonly strin
   return undefined;
 }
 
+/** Mandatory deny/ask verdicts are evaluated on the scored resources before any
+ * evidence-conflict or scope exit, because a later model may allow HIGH. */
+function mandatoryShellScore(resources: readonly string[], unsafe: RequestScore | undefined,
+  projectDir?: string, worktreeRoot?: string): RequestScore | undefined {
+  const visible = visibleShellDeny(resources, projectDir, worktreeRoot);
+  if (visible !== undefined) return deny(visible);
+  return unsafe?.deny || unsafe?.ask ? unsafe : undefined;
+}
+
+function conflictScore(unsafe: RequestScore | undefined): RequestScore {
+  const conflict = high("Shell command evidence is missing or conflicts with the permission resources");
+  return unsafe?.findings === undefined ? conflict : { ...conflict, findings: unsafe.findings };
+}
+
+/** Captured evidence may only clear commands it still describes from a base the
+ * worktree can contain; otherwise the request stays at review HIGH. */
+function evidenceScore(request: PermissionRequest, resources: readonly string[],
+  unsafe: RequestScore | undefined, location: ShellLocation, located: PermissionRequest,
+  worktreeRoot?: string): RequestScore | undefined {
+  if (commandEvidenceConflicts(request.operation, resources)) return conflictScore(unsafe);
+  if (location.unverified || (located !== request && worktreeRoot === undefined))
+    return high("Shell working directory evidence is unresolved; static scope cannot be verified");
+  return undefined;
+}
+
 /** Scores one shell request: visible denies, safety checks, then residual band. */
 export function scoreShellRequest(request: PermissionRequest, worktreeRoot?: string): RequestScore {
   const { resources } = request;
@@ -161,15 +207,14 @@ export function scoreShellRequest(request: PermissionRequest, worktreeRoot?: str
   const guarded = guardShell(resources, located.projectDir);
   const rejected = guardScore(guarded, resources, located.projectDir, worktreeRoot);
   if (rejected) return rejected;
-  // The parsed resources are the scored command; captured command evidence that
-  // is missing or points at different commands cannot grant static clearance.
-  if (commandEvidenceConflicts(request.operation, resources))
-    return high("Shell command evidence is missing or conflicts with the permission resources");
-  // A relocated base without the original containment root cannot prove scope.
-  if (location.unverified || (located !== request && worktreeRoot === undefined))
-    return high("Shell working directory evidence is unresolved; static scope cannot be verified");
   const scan: ShellScan = scanShell(resources);
   const unsafe = shellSafetyScore(scan, located, worktreeRoot);
+  const mandatory = mandatoryShellScore(resources, unsafe, located.projectDir, worktreeRoot);
+  if (mandatory) return mandatory;
+  // The parsed resources are the scored command; captured command evidence that
+  // is missing or points at different commands cannot grant static clearance.
+  const refused = evidenceScore(request, resources, unsafe, location, located, worktreeRoot);
+  if (refused) return refused;
   if (unsafe) return unsafe;
   if (guarded?.decision === "ask") return high(guarded.reason);
   return scoreShellBaseline(scan, guarded, located.projectDir, worktreeRoot);

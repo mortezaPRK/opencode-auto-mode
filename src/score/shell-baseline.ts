@@ -105,6 +105,11 @@ function readOnlyScore(scan: ShellScan, projectDir?: string, worktreeRoot?: stri
   const scopeRoot = canonical(worktreeRoot ?? projectRoot(projectDir ?? process.cwd()));
   if (pathTargets(scan).some((operand) => escapesProject(operand, locationDir, scopeRoot)))
     return high("Shell path operand resolves outside the project");
+  // `du`, operand-free `ls`, `find`, recursive `grep` and similar commands read
+  // their working directory implicitly, so a relocated base outside the
+  // worktree can never be a low read-only score.
+  if (!isInProject(locationDir, scopeRoot))
+    return high("Shell execution directory resolves outside the project");
   return low("Parsed read-only command with protected-path checks");
 }
 
