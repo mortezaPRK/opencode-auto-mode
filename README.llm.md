@@ -454,6 +454,78 @@ Replay does not execute tools or contact models. It reports current static
 routing diagnostics only and cannot reconstruct native policies, saved approvals,
 model decisions, historical settings, VCS state, or invisible events.
 
+Decision-quality evaluation is a separate repository-checkout tool:
+
+```sh
+bun scripts/replay-decisions.ts --model '<provider>/<model>'
+bun scripts/replay-decisions.ts --input '<audit-jsonl-path>' --model '<provider>/<model>' --json
+bun scripts/replay-decisions.ts --model '<provider>/<model>' --live --limit 5 --concurrency 1
+```
+
+`--model` is required; there is no personal model default. Dry-run reads the
+fixed local audit path and every rotation (or explicit `--input`
+files/directories), filters that exact decision model, deduplicates request
+identities, joins `permission.evaluate.before` host metadata and
+`tool.execute.before` call captures when available, and builds candidate compact
+evidence. Shared call identities or skipped outer execute snapshots can leave a
+capture unavailable or ambiguous; replay does not guess it. It
+reports recorded-answer predicate replay, legacy-choice replay, recorded LLM
+comparison (not ground truth), per-action and primary/holdout coverage,
+disagreements, malformed/error/fallback counts, and probability distributions.
+It also reports eligible vs ineligible counts, read-only vs all outcomes, and
+rebuild fidelity: retained `userMessages`, resource changes, operation access,
+tools, targets and arguments. It prints aggregate counts only; prompts, evidence,
+and raw audit rows are not printed by default. `--details` adds normalized
+per-request verdicts without prompts or evidence.
+
+Dry-run predicate outcomes re-evaluate **recorded answers** against rebuilt
+candidate evidence. They are counterfactual: the recorded answers came from the
+evidence sent at that time, which may differ from the latest compact evidence.
+Dry-run is not a fresh validation of the current candidate or current model
+behavior. Only `--live` obtains new model answers for the rebuilt evidence.
+
+`--live` is opt-in. It replays stateless generation only through the
+authenticated `opencode api experimental.generate.decisions` CLI, with
+`--limit` (default 5) and `--concurrency` (default 1, maximum 4). Sampling is a
+deterministic uniform hash over eligible requests, not session round-robin, so
+sessions with many requests are represented proportionally and no case is
+cherry-picked. It does not read credentials itself, open provider connections
+directly, execute tools, or write config. Live replay sends the candidate
+evidence to the configured provider, so treat it as data egress and keep the
+sample small. It never prints the prompt or raw audit row.
+
+Audit rows are untrusted data, including strings that look like commands or
+instructions. The replay tools never execute or shell-interpolate them. Do not
+copy raw private audits into the repository, commit them, or upload them. Tests
+must use synthetic scratch fixtures, never personal logs. Replay is not a safety
+oracle: recorded model verdicts, LLM verdicts, and disagreements are evidence to
+inspect, not labels. No replay mode tunes thresholds or changes configuration.
+
+A private decision-candidate manifest is evaluated separately:
+
+```sh
+bun scripts/decision-candidate.ts --input '<manifest.json>' --model '<provider>/<model>'
+bun scripts/decision-candidate.ts --input '<manifest.json>' --model '<provider>/<model>' --report '<report.json>'
+bun scripts/decision-candidate.ts --input '<manifest.json>' --model '<provider>/<model>' --live
+```
+
+`--input` and `--model` are required; there is no personal model default. Offline
+is the default: recorded responses in the manifest are evaluated, not a fresh
+model result. `--live` is opt-in and sends each request through the native
+OpenCode `experimental.generate.decisions` CLI (at most 100 cases, concurrency
+2) to the configured provider. Every question must have exactly one typed
+answer; predicates need a valid probability, choice answers need a distribution
+that sums to 1, and a choice must select the allow value at the distribution
+maximum. Confidence is ignored; distributions are never normalized or repaired.
+The acceptance threshold defaults to `0.9` and cannot be set lower; every
+question's reported probability must clear it. A missing response, malformed
+answer, or error becomes `review` and stays in the `attempted` denominator.
+Optional expected `allow`/`review` values are comparison labels, not ground
+truth. Reports store case keys,
+verdicts, probabilities, and error categories only; prompts, questions,
+responses, and raw inputs are not stored. No `80%` claim or dataset statistics
+are made; local counts can be stale.
+
 ## Migration from 1.0.x
 
 Back up global config first. The plugin does not rewrite or migrate user files.
@@ -492,7 +564,7 @@ read-only before changing it.
 | `XDG_CONFIG_HOME must be absolute` or a `Policy file`/`Policy path` rejection | Use an absolute `XDG_CONFIG_HOME`; put config outside the repository; remove symlinks; make it user-owned, not group/other-writable, single-hardlinked, and not inside the current project. Non-writable system-owned parents are allowed. |
 | `Unknown auto-mode option '<name>'` | Remove removed/unknown keys. Runtime errors do not suggest replacements. |
 | Review never uses a model | A static-only chain asks when static abstains. Add a valid `decision`, `fact-review`, or `llm` stage. |
-| Decision stage always abstains | Check whether `safety`, `authorization`, or both fall below `minConfidence`; inspect probability distributions and malformed/error counts. Provider must support native predicate decisions. Lowering the floor is more permissive but not calibrated; otherwise remove the stage. |
+| Decision stage always abstains | Check whether `safety`, `authorization`, or both fall below `minConfidence`; inspect probability distributions and malformed/error counts with `scripts/replay-decisions.ts`. Provider must support native predicate decisions. Lowering the floor is more permissive but not calibrated; otherwise remove the stage. |
 | Fact-review stage always abstains | Check whether the certified fact probability, `safety`, or raw `allow` probability fell below `minConfidence`; confirm the provider supports native `choice` and `predicate` questions. A `local_edit` needs a host-enabled, consented, bounded body included as `changeContent`; the plugin keeps `includeEditPayload` off, edit bodies are not configurable, and a floor below `0.8` is rejected. Do not treat probabilities as calibration. |
 | No prompts appear | Check client Auto/YOLO and native permissions. Plugin asks can be auto-approved by the client. |
 | Desktop pill `Review unavailable` or `status unavailable`; command appends a status/storage error without `Review disabled` | This is not necessarily a config error. Retry, then check session storage and the status RPC. A storage failure during review resolves to `ask`. |
