@@ -3,7 +3,8 @@ import { spawn, execFileSync } from "node:child_process";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { once } from "node:events";
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, realpathSync, symlinkSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, realpathSync, symlinkSync,
+  openSync, closeSync, fstatSync, lstatSync, constants } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -219,9 +220,8 @@ async function permission(f: Fixture, resources: string[], action = "shell", met
 }
 function auditRecords(f?: { sessionID?: string }): Record<string, unknown>[] {
   // Retained rotations keep earlier records readable after the active sink
-  // rolls over. Oldest-first order preserves append semantics; unreadable
-  // paths (a rollover can unlink the active name) are skipped for the next read.
-  const records = auditFiles().flatMap(readAuditRecords);
+  // rolls over. Oldest-first order preserves append semantics.
+  const records = readAuditSnapshot();
   return f?.sessionID === undefined ? records : records.filter(record => record.sessionID === f.sessionID);
 }
 /** The active audit sink plus every retained rotation, oldest first. */
@@ -236,14 +236,73 @@ function auditFiles(): string[] {
   rotated.sort((left, right) => left.sequence - right.sequence);
   return [...rotated.map((entry) => entry.file), ...(existsSync(auditPath) ? [auditPath] : [])];
 }
-/** A rollover can unlink the active name mid-read; the caller retries. */
-function readAuditRecords(file: string): Record<string, unknown>[] {
+type AuditSnapshot = { records: Record<string, unknown>[]; stable: boolean };
+type AuditCandidate = { fd: number } | { reason: "duplicate" | "unavailable" };
+/** Rotation is link-then-unlink in another process; retry a bounded number of times. */
+const auditReadAttempts = 4;
+
+/** A rollover can invalidate a snapshot mid-read; retry it, never dedupe event IDs. */
+function readAuditSnapshot(): Record<string, unknown>[] {
+  let snapshot = readAuditFiles();
+  for (let attempt = 1; attempt < auditReadAttempts && !snapshot.stable; attempt++) snapshot = readAuditFiles();
+  return snapshot.records;
+}
+
+/** Read every name oldest-first, then confirm the active name still holds the same inode. */
+function readAuditFiles(): AuditSnapshot {
+  const before = pathIdentity(auditPath);
+  const seen = new Set<string>();
+  const snapshot: AuditSnapshot = { records: [], stable: true };
+  for (const file of auditFiles()) readAuditFile(file, seen, snapshot);
+  return { records: snapshot.records, stable: snapshot.stable && pathIdentity(auditPath) === before };
+}
+
+function readAuditFile(file: string, seen: Set<string>, snapshot: AuditSnapshot): void {
+  const candidate = openAuditCandidate(file, seen);
+  if ("reason" in candidate) { snapshot.stable &&= candidate.reason === "duplicate"; return; }
+  try { appendAuditRecords(candidate.fd, snapshot.records); }
+  catch { snapshot.stable = false; }
+  finally { closeSync(candidate.fd); }
+}
+
+/** Push line by line: one snapshot can hold tens of thousands of records. */
+function appendAuditRecords(fd: number, records: Record<string, unknown>[]): void {
+  for (const record of decodeAuditLines(readFileSync(fd, "utf8"))) records.push(record);
+}
+
+/** Rotation links the active sink to its archive before unlinking, so one inode can
+ * answer to two names. Identity comes from the open descriptor to avoid a stat race. */
+function openAuditCandidate(file: string, seen: Set<string>): AuditCandidate {
+  let fd: number;
+  try { fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK); }
+  catch { return { reason: "unavailable" }; }
+  const identity = descriptorIdentity(fd);
+  if (identity !== undefined && !seen.has(identity)) { seen.add(identity); return { fd }; }
+  closeSync(fd);
+  return { reason: identity === undefined ? "unavailable" : "duplicate" };
+}
+
+/** Device/inode of a regular file through an already-open descriptor. */
+function descriptorIdentity(fd: number): string | undefined {
   try {
-    return readFileSync(file, "utf8").split("\n").flatMap((line) => {
-      if (line.trim() === "") return [];
-      try { return [JSON.parse(line) as Record<string, unknown>]; } catch { return []; }
-    });
-  } catch { return []; }
+    const stat = fstatSync(fd);
+    return stat.isFile() ? `${stat.dev}:${stat.ino}` : undefined;
+  } catch { return undefined; }
+}
+
+/** Device/inode of a path without following symlinks; undefined when it is gone. */
+function pathIdentity(file: string): string | undefined {
+  try {
+    const stat = lstatSync(file);
+    return `${stat.dev}:${stat.ino}`;
+  } catch { return undefined; }
+}
+
+function decodeAuditLines(text: string): Record<string, unknown>[] {
+  return text.split("\n").flatMap((line) => {
+    if (line.trim() === "") return [];
+    try { return [JSON.parse(line) as Record<string, unknown>]; } catch { return []; }
+  });
 }
 function isEvaluatedBefore(record: Record<string, unknown>, action: string): boolean {
   return record.type === "permission.evaluate.before" &&
