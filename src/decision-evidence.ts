@@ -56,7 +56,10 @@ const SHELL_LOSS = "Shell platform or interpreter evidence was truncated; comman
 const OPERATION_LOSS = "Selected operation evidence is incomplete; essential arguments or scope are unavailable";
 const RESOURCE_LOSS = "Inline HTTP body or remaining arguments omitted; do not approve from partial evidence";
 const DELEGATION_LOSS = "Delegated context was redacted";
-const GIT_CONTEXT = /\b(?:git|gh)\b/i;
+// `_` is a word character, so `\b` missed MCP names like `mcp__git__push`.
+// Treat any non-alphanumeric as a delimiter so underscores, dashes and dots
+// separate too; `digit`, `legit` and `github` stay unrelated words.
+const GIT_CONTEXT = /(?:^|[^a-z0-9])(?:git|gh)(?![a-z0-9])/i;
 
 function accessOf(value: unknown): OperationAccess {
   return value === "read" || value === "write" || value === "execute" || value === "unknown"

@@ -117,6 +117,21 @@ it("keeps the whole action, relevant scope, operation and concrete findings only
     assert.equal(buildDecisionEvidence({ action: "shell", resources: ["git status"], gitState: undefined }).gitState, undefined);
   });
 
+  it("recognizes delimited git and gh identifiers without unrelated words", () => {
+    const { gitState } = request;
+    const included = ["mcp__git__push", "mcp_git-push", "mcp.git.push", "MCP__GIT__STATUS", "mcp__gh__pr__create", "git.exe status"];
+    for (const resource of included) {
+      assert.deepEqual(buildDecisionEvidence({ action: "mcp", resources: [resource], gitState }).gitState,
+        { branch: "topic", defaultBranch: "trunk", clean: true }, resource);
+    }
+    const action = buildDecisionEvidence({ action: "mcp__git__push", resources: ["*"], gitState });
+    assert.deepEqual(action.gitState, { branch: "topic", defaultBranch: "trunk", clean: true });
+    const excluded = ["digit", "legit", "nightly", "ghost", "github_search_code", "mcp__github__search_code", ".gitignore"];
+    for (const resource of excluded) {
+      assert.equal(buildDecisionEvidence({ action: "tool", resources: [resource], gitState }).gitState, undefined, resource);
+    }
+  });
+
   it("retains raw commands while preserving HTTP-body redaction and incomplete evidence", () => {
     const command = `echo ${"x".repeat(5_000)}`;
     assert.deepEqual(buildDecisionEvidence({ action: "shell", resources: [command] }).resources, [command]);
