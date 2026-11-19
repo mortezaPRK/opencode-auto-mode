@@ -141,3 +141,15 @@ test("printed case keys are single-line and clipped", () => {
   expect(run.stdout).not.toContain("\nFORGED");
   expect(run.stdout).not.toContain("x".repeat(120));
 });
+
+test("printed probability names are single-line and clipped", () => {
+  const name = `safety\nFORGED\u001b[2J ${"x".repeat(120)}`;
+  const question = { type: "predicate", name, instructions: "synthetic check" };
+  const response = { answers: [{ type: "predicate", name, probability: 0.95 }] };
+  const run = cli([candidate("question-name", question, response, "allow")]);
+  expect(run.status).toBe(0);
+  expect(run.stdout).not.toContain("\nFORGED");
+  expect(run.stdout).not.toContain("\u001b");
+  expect(run.stdout).not.toContain("x".repeat(120));
+  expect(run.stdout).toContain("safety FORGED [2J");
+});

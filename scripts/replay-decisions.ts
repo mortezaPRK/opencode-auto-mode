@@ -15,7 +15,7 @@ import type { DecisionEvidence, DecisionEvidenceRequest } from "../src/decision-
 import { ReviewFailure } from "../src/errors.js";
 import { buildOperationEvidence, createToolInputStore, type CapturedToolInput, type ToolInputStore } from "../src/operation-evidence.js";
 import { isOpaqueOperationLoss, type OperationEvidence, type StageResult } from "../src/reviewer.js";
-import { argFailure, isRecord, mapLimit } from "./lib.js";
+import { argFailure, isRecord, mapLimit, printableLabel } from "./lib.js";
 
 const DEFAULT_THRESHOLD = 0.9;
 const DEFAULT_HOLDOUT = 0.2;
@@ -1200,7 +1200,7 @@ function recordedEvidence(text: string | undefined): RecordedEvidence | undefine
     contextLoss: platform.loss ? "platform" : shell.loss ? "shell" : recordedShellLoss,
     userMessages: chronology(object.userMessages),
     delegations: delegations.delegations,
-    delegationsLost: delegations.lost,
+    delegationsLost: delegations.lost || object.incompleteEvidenceKind === "delegations",
     transcript: boundedTranscript(object.userInstruction),
     staticAnalysis: staticAnalysis(object.staticAnalysis),
     gitState: gitState(object.gitState),
@@ -1985,7 +1985,7 @@ function formatSummary(summary: ReturnType<typeof numericSummary>): string {
 function printCounts(label: string, counts: Counts): void {
   const entries = Object.entries(counts);
   if (entries.length === 0) { console.log(`${label}: none`); return; }
-  console.log(`${label}: ${entries.map(([key, value]) => `${key}=${value}`).join(", ")}`);
+  console.log(`${label}: ${entries.map(([key, value]) => `${printableLabel(key)}=${value}`).join(", ")}`);
 }
 
 function printSplit(name: string, split: SplitSummary): void {
@@ -1996,13 +1996,13 @@ function printSplit(name: string, split: SplitSummary): void {
 }
 
 function inlineCounts(counts: Counts): string {
-  return Object.entries(counts).map(([key, value]) => `${key}=${value}`).join(",") || "none";
+  return Object.entries(counts).map(([key, value]) => `${printableLabel(key)}=${value}`).join(",") || "none";
 }
 
 function printActions(actions: Record<string, ActionSummary>): void {
   console.log(`Actions (top ${Math.min(Object.keys(actions).length, 12)} of ${Object.keys(actions).length}):`);
   for (const [action, summary] of Object.entries(actions).slice(0, 12)) {
-    console.log(`  ${action}: n=${summary.requests} primary=${summary.primary} holdout=${summary.holdout} predicate=${inlineCounts(summary.predicate)} legacy=${inlineCounts(summary.legacy)} llm=${inlineCounts(summary.llm)} recorded=${inlineCounts(summary.recorded)} fallback=${summary.fallback} predicate-vs-llm=${inlineCounts(summary.predicateVsLlm)}`);
+    console.log(`  ${printableLabel(action)}: n=${summary.requests} primary=${summary.primary} holdout=${summary.holdout} predicate=${inlineCounts(summary.predicate)} legacy=${inlineCounts(summary.legacy)} llm=${inlineCounts(summary.llm)} recorded=${inlineCounts(summary.recorded)} fallback=${summary.fallback} predicate-vs-llm=${inlineCounts(summary.predicateVsLlm)}`);
   }
 }
 
@@ -2018,7 +2018,7 @@ function legacyDetail(view: RequestView): string {
 }
 
 function detailLine(view: RequestView): string {
-  return `${view.reviewID} ${view.format} split=${view.split} threshold=${view.threshold} predicate=${predicateDetail(view)} legacy=${legacyDetail(view)} recorded=${view.recordedEnd?.decision ?? "none"} llm=${view.llmEnd?.decision ?? "none"} final=${view.final?.decision ?? "none"} action=${view.candidate.request.action || "?"}`;
+  return `${printableLabel(view.reviewID)} ${view.format} split=${view.split} threshold=${view.threshold} predicate=${predicateDetail(view)} legacy=${legacyDetail(view)} recorded=${view.recordedEnd?.decision ?? "none"} llm=${view.llmEnd?.decision ?? "none"} final=${view.final?.decision ?? "none"} action=${printableLabel(view.candidate.request.action || "?")}`;
 }
 
 function stageDecision(end: StageEnd | undefined): string {
@@ -2102,7 +2102,7 @@ function printHuman(report: Report, views: readonly RequestView[], options: CliO
     printCounts("  live vs recorded", report.live.comparisons);
     printCounts("  live vs LLM", report.live.vsLlm);
     for (const [action, summary] of Object.entries(report.live.actions)) {
-      console.log(`  live ${action}: n=${summary.requests} primary=${summary.primary} holdout=${summary.holdout} statuses=${inlineCounts(summary.statuses)}`);
+      console.log(`  live ${printableLabel(action)}: n=${summary.requests} primary=${summary.primary} holdout=${summary.holdout} statuses=${inlineCounts(summary.statuses)}`);
     }
   } else {
     console.log("Live: disabled (dry-run). No model calls made.");

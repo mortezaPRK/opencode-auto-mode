@@ -3,6 +3,17 @@ import { isRecord } from "../src/guards.js";
 export type Json = Record<string, unknown>;
 export { isRecord };
 
+/** Manifest- and audit-derived labels can carry newlines, ESC, or other control
+ * characters. Human output must stay one inert line, so control characters
+ * collapse to spaces before the label is bounded. */
+export function printableLabel(value: string): string {
+  const cleaned = Array.from(value, (char) => {
+    const code = char.codePointAt(0)!;
+    return code < 32 || (code >= 127 && code <= 159) ? " " : char;
+  }).join("").replace(/\s+/g, " ").trim();
+  return cleaned.length > 64 ? `${cleaned.slice(0, 61)}...` : cleaned;
+}
+
 export async function mapLimit<T, R>(items: readonly T[], concurrency: number, work: (item: T, index: number) => Promise<R>): Promise<R[]> {
   const results: R[] = new Array(items.length);
   let next = 0;

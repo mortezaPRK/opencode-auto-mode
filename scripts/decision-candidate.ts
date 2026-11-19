@@ -4,7 +4,7 @@ import { execFile } from "node:child_process";
 import { readFile, writeFile } from "node:fs/promises";
 import { parseArgs as parseCliArgs, promisify, type ParseArgsOptionsConfig } from "node:util";
 import { isProbability, probabilityDistribution } from "../src/guards.js";
-import { argFailure, isRecord, mapLimit } from "./lib.js";
+import { argFailure, isRecord, mapLimit, printableLabel } from "./lib.js";
 const THRESHOLD = 0.9, TOLERANCE = 1e-6, MAX_LIVE_CALLS = 100, LIVE_CONCURRENCY = 2, LIVE_TIMEOUT_MS = 120_000;
 const execFileAsync = promisify(execFile);
 type ChoiceValue = string | boolean;
@@ -160,21 +160,14 @@ function buildReport(options: Options, cases: readonly CaseReport[], mode: Repor
   return { tool: "decision-candidate", mode, model: options.modelText, threshold: options.threshold, aggregate: aggregateOf(cases), cases: [...cases],
     fidelity: mode === "recorded" ? "Recorded responses only; not a fresh model result. No prompts or raw inputs stored. No threshold or config changes." : "Opt-in live evaluation; requests go to the configured provider, but the report stores no prompts or raw inputs. No threshold or config changes." };
 }
-function printableKey(key: string): string {
-  const cleaned = Array.from(key, (char) => {
-    const code = char.codePointAt(0)!;
-    return code < 32 || code === 127 ? " " : char;
-  }).join("").replace(/\s+/g, " ").trim();
-  return cleaned.length > 64 ? `${cleaned.slice(0, 61)}...` : cleaned;
-}
 function printReport(report: Report): void {
   const a = report.aggregate;
   console.log(`decision-candidate mode=${report.mode} model=${report.model} threshold=${report.threshold.toFixed(3)}`);
   console.log(`attempted=${a.attempted} accepted=${a.accepted} reviewed=${a.reviewed} errors=${a.errors} expected=${a.expected} matched=${a.matched} mismatched=${a.mismatched}`);
   for (const item of report.cases) {
-    const probs = Object.entries(item.probabilities).map(([name, value]) => `${name}=${value.toFixed(3)}`).join(",");
+    const probs = Object.entries(item.probabilities).map(([name, value]) => `${printableLabel(name)}=${value.toFixed(3)}`).join(",");
     const match = item.match === undefined ? "-" : item.match ? "yes" : "no";
-    console.log(`case ${printableKey(item.key)} verdict=${item.verdict} expected=${item.expected ?? "-"} match=${match} probs=${probs || "-"}${item.error ? ` error=${item.error}` : ""}`);
+    console.log(`case ${printableLabel(item.key)} verdict=${item.verdict} expected=${item.expected ?? "-"} match=${match} probs=${probs || "-"}${item.error ? ` error=${item.error}` : ""}`);
   }
   console.log(`fidelity: ${report.fidelity}`);
 }

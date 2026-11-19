@@ -445,6 +445,26 @@ test("redacted delegations are incomplete evidence", () => {
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test("already-redacted delegations recorded as incomplete stay pre-generation", () => {
+  const root = mkdtempSync(join(tmpdir(), "auto-mode-delegation-recorded-loss-"));
+  try {
+    const input = writeSingleReview(root, {
+      action: "read", resources: ["/tmp/fixture-project/a.ts"], userMessages: ["read a"],
+      delegations: ["inspect only a.ts [REDACTED]"],
+      incompleteEvidence: "Delegated context was redacted or lost", incompleteEvidenceKind: "delegations",
+    });
+    const dry = run(["--input", input, "--model", "fixture/judge", "--json"]);
+    expect(dry.status).toBe(0);
+    const report = JSON.parse(dry.stdout);
+    expect(report.evidence.preGeneration).toEqual({ delegations: 1 });
+    expect(report.predicate.outcomes).toEqual({ "pre-generation": 1 });
+    expect(report.eligibility.eligible).toBe(0);
+    const live = run(["--input", input, "--model", "fixture/judge", "--live", "--limit", "1", "--json"]);
+    expect(live.status).toBe(0);
+    expect(JSON.parse(live.stdout).live.modelCalls).toBe(0);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test("failed generation calls pair as after-error instead of missing-after", () => {
   const root = mkdtempSync(join(tmpdir(), "auto-mode-decisions-error-"));
   try {
@@ -691,6 +711,43 @@ test("unsupported recorded verdict and error categories collapse to a fixed cate
     expect(result.stdout).not.toContain("ALLOW");
     expect(result.stdout).not.toContain("EXPLOIT");
     expect(result.stdout).not.toContain("FORGED");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+const FORGED_LABEL = "\nFORGED\u001b[2J";
+
+test("human output escapes audit-derived action, tool, and review labels", () => {
+  const root = mkdtempSync(join(tmpdir(), "auto-mode-labels-"));
+  try {
+    const label = `read${FORGED_LABEL}${"x".repeat(120)}`;
+    const reviewID = `review-forged${FORGED_LABEL}`;
+    const input = writeRows(root, decisionRows(reviewID, {
+      action: label, resources: ["/tmp/fixture-project/a.ts"], userMessages: ["read a"],
+    }, { tool: label, input: { path: "/tmp/fixture-project/a.ts" } }));
+    const result = run(["--input", input, "--model", "fixture/judge", "--details"]);
+    expect(result.status).toBe(0);
+    expect(result.stdout).not.toContain("\nFORGED");
+    expect(result.stdout).not.toContain("\u001b");
+    expect(result.stdout).not.toContain("x".repeat(120));
+    expect(result.stdout).toContain("read FORGED [2J");
+    expect(result.stdout).toContain("review-forged FORGED [2J");
+    expect(result.stdout).toContain("operation-tools=read FORGED [2J");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("live human output escapes audit-derived action labels", () => {
+  const root = mkdtempSync(join(tmpdir(), "auto-mode-live-labels-"));
+  try {
+    const label = `read${FORGED_LABEL}${"x".repeat(120)}`;
+    const input = writeRows(root, decisionRows("review-live-labels", {
+      action: label, resources: ["/tmp/fixture-project/a.ts"], userMessages: ["read a"],
+    }, { tool: label, input: { path: "/tmp/fixture-project/a.ts" } }));
+    const result = run(["--input", input, "--model", "fixture/judge", "--live", "--limit", "1", "--holdout", "0",
+      "--opencode-bin", fakeCli(root)], { FAKE_BODY: join(root, "body.json") });
+    expect(result.status).toBe(0);
+    expect(result.stdout).not.toContain("\nFORGED");
+    expect(result.stdout).not.toContain("\u001b");
+    expect(result.stdout).toContain("live read FORGED [2J");
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
