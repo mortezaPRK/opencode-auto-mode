@@ -3,7 +3,7 @@ import type { PermissionRequest } from "../reviewer.js";
 import { projectRoot } from "../tiers.js";
 import { isFileAction, scoreFileAction } from "./files.js";
 import { checkRequestLimits } from "./limits.js";
-import { operationPathApproval } from "./operation.js";
+import { operationPathApproval, operationScopeApproval } from "./operation.js";
 import { scoreShellRequest } from "./shell.js";
 import { high, low, type RequestScore } from "./types.js";
 
@@ -29,7 +29,7 @@ export function scoreRequest(request: PermissionRequest & { worktreeRoot?: strin
   if (protectedOperation) return protectedOperation;
   const worktreeRoot = resolveWorktreeRoot(request);
   if (action === "shell") return scopeScore(request, scoreShellRequest(request, worktreeRoot));
-  if (isFileAction(action)) return scopeScore(request, scoreFileAction(action, resources, options, projectDir, worktreeRoot));
+  if (isFileAction(action)) return fileActionScore(request, options, worktreeRoot);
   // No host allowlist exists, so a URL/query name cannot bound what is fetched.
   if (NETWORK_ACTIONS.has(action)) return high("Network fetch/search has no verified host allowlist");
   if (INTERACTIVE_ACTIONS.has(action)) return low("User interaction without host side effects");
@@ -46,4 +46,13 @@ export function scoreRequest(request: PermissionRequest & { worktreeRoot?: strin
 function scopeScore(request: PermissionRequest, score: RequestScore): RequestScore {
   if (request.scopeResolution !== "unknown" || score.deny || score.ask) return score;
   return { ...high("Project containment is unverified"), findings: [score.reason, "Scope lookup unavailable; no containment facts inferred"] };
+}
+
+/** A low file band still needs captured targets reconciled with the permission
+ * scope; otherwise a captured path outside the envelope could ride a safe name. */
+function fileActionScore(request: PermissionRequest, options: AutoModeOptions, worktreeRoot?: string): RequestScore {
+  const { action, resources, projectDir } = request;
+  const scored = scopeScore(request, scoreFileAction(action, resources, options, projectDir, worktreeRoot));
+  if (scored.band !== "low") return scored;
+  return operationScopeApproval(request.operation, action, resources, projectDir, worktreeRoot) ?? scored;
 }

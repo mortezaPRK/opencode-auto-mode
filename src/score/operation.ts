@@ -1,6 +1,7 @@
 import { classifyPath, pathFindings } from "../path-policy.js";
 import type { OperationEvidence } from "../reviewer.js";
-import { deny, type RequestScore } from "./types.js";
+import { isScopedPath, projectRoot, safeTarget } from "../tiers.js";
+import { deny, high, type RequestScore } from "./types.js";
 
 /** Explicit operation fields that name a filesystem location. Tool names and
  * arbitrary identifiers are deliberately excluded. */
@@ -46,4 +47,33 @@ export function operationPathApproval(operation: OperationEvidence | undefined, 
   const facts = targets.map((target) => classifyPath(target, projectDir));
   if (!facts.some((fact) => fact.kind === "protected")) return undefined;
   return { ...deny("Protected path access"), findings: pathFindings(facts) };
+}
+
+const WRITE_ACTIONS = new Set(["edit", "write"]);
+const PATTERN = /[*?]/;
+
+function namesPermissionResource(resources: readonly string[], target: string, projectDir?: string): boolean {
+  const resolved = classifyPath(target, projectDir).resolved;
+  if (resolved === undefined) return false;
+  return resources.some((resource) => !PATTERN.test(resource) && !nonPath(resource) &&
+    classifyPath(resource, projectDir).resolved === resolved);
+}
+
+function verifiedTarget(target: string, write: boolean, projectDir?: string, worktreeRoot?: string): boolean {
+  if (projectDir === undefined) return false;
+  if (write) return safeTarget(target, projectDir, worktreeRoot);
+  return isScopedPath(target, projectDir, worktreeRoot ?? projectRoot(projectDir));
+}
+
+/** A low file score needs every captured target to name a permission resource
+ * that stays verified in scope; omitted payloads add no target, so they alone
+ * do not block. Conflicting or external targets must not clear statically. */
+export function operationScopeApproval(operation: OperationEvidence | undefined, action: string,
+  resources: readonly string[], projectDir?: string, worktreeRoot?: string): RequestScore | undefined {
+  const targets = operationTargets(operation, action);
+  if (targets.length === 0) return undefined;
+  const write = WRITE_ACTIONS.has(action);
+  const verified = targets.every((target) => namesPermissionResource(resources, target, projectDir) &&
+    verifiedTarget(target, write, projectDir, worktreeRoot));
+  return verified ? undefined : high("Operation target differs from the verified permission scope");
 }

@@ -140,6 +140,26 @@ function resolveLink(target: string, follow: boolean, depth: number): Resolution
   return { ...fact, symlink: true, envDesignation: fact.envDesignation === true || envName(fact.designation) || envName(target) };
 }
 
+/** Walks the original spelling component by component so a `..` after a symlink
+ * keeps its filesystem meaning. Unverifiable traversal yields no resolution. */
+function physicalResolution(target: string, directory: string): Resolution {
+  let base: string;
+  try { base = realpathSync(directory); } catch { base = path.resolve(directory); }
+  if (!target || /[\0]/.test(target)) return uncertain();
+  return resolveComponents(target, base, true);
+}
+
+export function resolvePhysicalPath(target: string, directory = process.cwd()): string | undefined {
+  const fact = physicalResolution(target, directory);
+  return fact.uncertain ? undefined : fact.resolved;
+}
+
+export function resolvePhysicalDirectory(target: string, directory = process.cwd()): string | undefined {
+  const fact = physicalResolution(target, directory);
+  if (fact.uncertain || fact.type === "file" || fact.type === "other") return undefined;
+  return fact.resolved;
+}
+
 export function classifyPath(target: string, directory = process.cwd(), roots = policyRoots(), followFinal = true): PathPolicy {
   if (!target || /[\0]/.test(target)) return { kind: "unresolved", review: true, reason: "Path spelling is unresolved" };
   let base: string;

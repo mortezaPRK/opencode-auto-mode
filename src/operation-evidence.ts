@@ -1,6 +1,7 @@
 import { dirname, isAbsolute, normalize, resolve } from "node:path";
 import { redactHttpBodies } from "./audit.js";
 import { isRecord } from "./guards.js";
+import { resolvePhysicalPath } from "./path-policy.js";
 import type { OperationAccess, OperationEvidence } from "./reviewer.js";
 
 export type { OperationAccess, OperationEvidence } from "./reviewer.js";
@@ -78,6 +79,9 @@ const TRUNCATED = "[TRUNCATED]";
 const UNSERIALIZABLE = "[UNSERIALIZABLE]";
 const HOME_PREFIX = /^(?:~|\$HOME)(?:[\\/]|$)/;
 const INVALID_PATH = /^(?:undefined|null)$/i;
+/** Scheme and protocol-relative spellings are network arguments, not paths. */
+const NETWORK_TARGET = /^(?:[a-z][a-z0-9+.-]*:\/\/|\/\/[^/])/i;
+const PARENT_SEGMENT = /(?:^|[\\/])\.\.(?:[\\/]|$)/;
 
 function usableTarget(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0 && !INVALID_PATH.test(value.trim());
@@ -280,14 +284,29 @@ function boundedTool(value: string | undefined): { tool?: string; complete: bool
   return { tool: value, complete: true };
 }
 
-function resolveTarget(value: string, projectDir: string | undefined): string {
-  if (HOME_PREFIX.test(value)) return normalize(value);
-  return isAbsolute(value)
-    ? normalize(value)
-    : projectDir !== undefined && isAbsolute(projectDir) ? resolve(projectDir, value) : normalize(value);
+interface ResolvedTarget {
+  target: string;
+  complete: boolean;
 }
 
-function limitTargets(values: readonly string[], transform: (value: string) => string): { targets?: string[]; complete: boolean } {
+function resolvedSpelling(value: string, projectDir: string | undefined): string {
+  if (isAbsolute(value)) return normalize(value);
+  if (projectDir !== undefined && isAbsolute(projectDir)) return resolve(projectDir, value);
+  return normalize(value);
+}
+
+/** Network spellings keep their identity for the scorer's URL filter. A `..`
+ * traversal is resolved physically rather than collapsed, so a symlink before
+ * it cannot reassign the target; unresolvable traversal keeps the raw spelling. */
+function resolveTarget(value: string, projectDir: string | undefined): ResolvedTarget {
+  if (NETWORK_TARGET.test(value)) return { target: value, complete: true };
+  if (HOME_PREFIX.test(value)) return { target: PARENT_SEGMENT.test(value) ? value : normalize(value), complete: false };
+  if (!PARENT_SEGMENT.test(value)) return { target: resolvedSpelling(value, projectDir), complete: true };
+  const resolved = resolvePhysicalPath(value, projectDir ?? process.cwd());
+  return resolved === undefined ? { target: value, complete: false } : { target: resolved, complete: true };
+}
+
+function limitTargets(values: readonly string[], transform: (value: string) => ResolvedTarget): { targets?: string[]; complete: boolean } {
   const targets: string[] = [];
   let complete = values.length <= MAX_TARGETS;
   for (const value of values.slice(0, MAX_TARGETS)) {
@@ -296,10 +315,11 @@ function limitTargets(values: readonly string[], transform: (value: string) => s
       continue;
     }
     if (HOME_PREFIX.test(value)) complete = false;
-    const rendered = transform(value);
-    if (rendered.length > MAX_TARGET_CHARS) complete = false;
-    const redacted = redactHttpBodies(rendered);
-    if (redacted !== rendered) complete = false;
+    const resolved = transform(value);
+    if (!resolved.complete) complete = false;
+    if (resolved.target.length > MAX_TARGET_CHARS) complete = false;
+    const redacted = redactHttpBodies(resolved.target);
+    if (redacted !== resolved.target) complete = false;
     const target = redacted.slice(0, MAX_TARGET_CHARS);
     if (!targets.includes(target)) targets.push(target);
   }
@@ -311,7 +331,7 @@ function boundedTargets(values: readonly string[], projectDir?: string): { targe
 }
 
 function rawTargets(values: readonly string[]): { targets?: string[]; complete: boolean } {
-  return limitTargets(values, (value) => value);
+  return limitTargets(values, (value) => ({ target: value, complete: true }));
 }
 
 function stringArgument(args: Record<string, unknown> | undefined, key: string): string | undefined {
@@ -320,11 +340,11 @@ function stringArgument(args: Record<string, unknown> | undefined, key: string):
 }
 
 function metadataPath(value: unknown, projectDir?: string): string | undefined {
-  return usableTarget(value) ? resolveTarget(value, projectDir) : undefined;
+  return usableTarget(value) ? resolveTarget(value, projectDir).target : undefined;
 }
 
 function capturedExactTargets(args: Record<string, unknown> | undefined, projectDir?: string): string[] {
-  return targetValues(args, EXACT_TARGET_KEYS).map((value) => resolveTarget(value, projectDir));
+  return targetValues(args, EXACT_TARGET_KEYS).map((value) => resolveTarget(value, projectDir).target);
 }
 
 function externalTargetConflict(metadata: Record<string, unknown> | undefined, args: Record<string, unknown> | undefined,

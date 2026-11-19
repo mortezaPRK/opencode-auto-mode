@@ -1,4 +1,5 @@
-import { isAbsolute, normalize, resolve } from "node:path";
+import { isAbsolute } from "node:path";
+import { resolvePhysicalDirectory } from "../path-policy.js";
 import type { OperationEvidence, PermissionRequest, ReviewResult } from "../reviewer.js";
 import { guardShell, visibleShellDeny } from "../shell.js";
 import { scanShell, type ShellScan } from "./shell-argv.js";
@@ -25,9 +26,10 @@ function directoryValues(value: unknown): string[] {
 function resolveDirectory(value: string, projectDir?: string): string | undefined {
   const trimmed = value.trim();
   if (!trimmed || INVALID_DIRECTORY.test(trimmed) || UNRESOLVABLE_DIRECTORY.test(trimmed)) return undefined;
-  if (isAbsolute(trimmed)) return normalize(trimmed);
-  if (projectDir === undefined || !isAbsolute(projectDir)) return undefined;
-  return resolve(projectDir, trimmed);
+  if (!isAbsolute(trimmed) && (projectDir === undefined || !isAbsolute(projectDir))) return undefined;
+  // Physical traversal keeps `..` after a symlink selecting the directory the
+  // host would actually enter; lexical collapsing would silently change it.
+  return resolvePhysicalDirectory(trimmed, projectDir ?? process.cwd());
 }
 
 /** Exactly one captured execution directory may become the scoring base;

@@ -1,5 +1,8 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, mkdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { buildOperationEvidence, createToolInputStore } from "./operation-evidence.js";
 import { isOpaqueOperationLoss, reviewEvidence, reviewRequest, type ReviewerContext } from "./reviewer.js";
 import { scoreRequest } from "./score.js";
@@ -443,5 +446,54 @@ describe("operation evidence in review prompts", () => {
     assert.match(seen, /incompleteEvidence/);
     assert.match(seen, /"url":"https:\/\/example.invalid"/);
     assert.doesNotMatch(seen, /SECRET|PRIVATE_BODY/);
+  });
+});
+
+describe("symlink-sensitive and network target spellings", () => {
+  it("resolves a symlink followed by dot-dot physically instead of collapsing it lexically", () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "auto-mode-target-traversal-")));
+    const home = join(root, "home");
+    mkdirSync(home);
+    const previous = process.env.HOME;
+    process.env.HOME = home;
+    try {
+      mkdirSync(join(home, ".aws"));
+      mkdirSync(join(root, "child"));
+      writeFileSync(join(root, "child", "credentials"), "fixture");
+      symlinkSync(join(root, "child"), join(home, ".aws", "alias"));
+      // `.aws/alias/..` selects the external parent, not `.aws`. Lexical
+      // collapsing would assert the credential store and force a false deny.
+      const path = `${home}/.aws/alias/../credentials`; // Deliberately not join: it removes `..`.
+      const evidence = buildOperationEvidence({ action: "grep", resources: ["needle"],
+        metadata: { pattern: "needle", path } }, { projectDir: root });
+      assert.deepEqual(evidence.targets, [join(root, "credentials")]);
+      assert.equal(evidence.complete, true);
+      const options = parseOptions({ classifiers: [{ type: "static" }] });
+      const score = scoreRequest({ action: "grep", resources: ["needle"], projectDir: root, operation: evidence }, options);
+      assert.equal(score.deny, undefined);
+      assert.equal(score.band, "high");
+    } finally {
+      if (previous === undefined) delete process.env.HOME; else process.env.HOME = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps the raw spelling and marks an unresolvable traversal incomplete", () => {
+    const evidence = buildOperationEvidence({ action: "grep", resources: ["needle"],
+      metadata: { pattern: "needle", path: "missing/../needle.ts" } }, { projectDir: "/repo" });
+    assert.equal(evidence.complete, false);
+    assert.deepEqual(evidence.targets, ["missing/../needle.ts"]);
+  });
+
+  it("keeps URL spellings as network arguments instead of filesystem targets", () => {
+    const options = parseOptions({ classifiers: [{ type: "static" }] });
+    for (const path of ["https://example.invalid/.env", "HTTPS://example.invalid/.env", "//example.invalid/.env"]) {
+      const evidence = buildOperationEvidence({ action: "grep", resources: ["needle"],
+        metadata: { pattern: "needle", path } }, { projectDir: "/repo" });
+      assert.deepEqual(evidence.targets, [path], path);
+      const score = scoreRequest({ action: "grep", resources: ["needle"], projectDir: "/repo", operation: evidence }, options);
+      assert.equal(score.deny, undefined, path);
+      assert.equal(score.band, "high", path);
+    }
   });
 });

@@ -1,9 +1,11 @@
 import { it } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, mkdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { policyRoots } from "../path-policy.js";
 import { parseOptions } from "../config.js";
-import { buildOperationEvidence } from "../operation-evidence.js";
+import { buildOperationEvidence, createToolInputStore } from "../operation-evidence.js";
 import { scoreRequest } from "../score.js";
 
 const options = parseOptions({ classifiers: [{ type: "static" }] });
@@ -139,4 +141,68 @@ it("resolves shell operands against the verified working directory and fails clo
     assert.equal(result.band, "high", JSON.stringify(operationArguments));
     assert.equal(result.deny, undefined, JSON.stringify(operationArguments));
   }
+});
+
+it("resolves a symlink-bearing working directory physically instead of collapsing dot-dot", () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "auto-mode-workdir-symlink-")));
+  try {
+    mkdirSync(join(root, ".git"));
+    symlinkSync("/", join(root, "alias"));
+    const command = "cat etc/shadow";
+    // The same relative read stays ordinary from the project directory.
+    assert.equal(scoreRequest({ action: "shell", resources: [command], projectDir: root }, options).band, "low");
+    // alias -> "/" makes alias/.. select "/", although lexical normalization
+    // would select the project root and leave the protected file unchecked.
+    const workdir = `${root}/alias/..`;
+    const result = scoreRequest({
+      action: "shell", resources: [command], projectDir: root,
+      operation: { tool: "shell", access: "execute", complete: true, arguments: { command, workdir } },
+    }, options);
+    assert.equal(result.deny, true);
+    assert.match(result.reason, /protected path access/i);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+it("does not clear a file action when the captured target leaves the permission scope", () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "auto-mode-file-scope-")));
+  try {
+    mkdirSync(join(root, ".git"));
+    writeFileSync(join(root, "safe.txt"), "");
+    const edits = parseOptions({ classifiers: [{ type: "static", allowInProjectEdits: true }] });
+    const write = (filePath: string) => ({
+      tool: "write", access: "write" as const, complete: false, arguments: { filePath },
+    });
+    for (const action of ["edit", "write"] as const) {
+      for (const filePath of ["/outside/private.txt", "other.txt"]) {
+        const score = scoreRequest({ action, resources: ["safe.txt"], projectDir: root, operation: write(filePath) }, edits);
+        assert.equal(score.band, "high", `${action} ${filePath}`);
+        assert.equal(score.deny, undefined, `${action} ${filePath}`);
+        assert.equal(score.ask, undefined, `${action} ${filePath}`);
+      }
+      const verified = scoreRequest({ action, resources: ["safe.txt"], projectDir: root, operation: write("safe.txt") }, edits);
+      assert.equal(verified.band, "low", action);
+    }
+    const read = scoreRequest({
+      action: "read", resources: ["safe.txt"], projectDir: root,
+      operation: { tool: "read", access: "read", complete: false, arguments: { filePath: "/outside/private.txt" } },
+    }, options);
+    assert.equal(read.band, "high");
+    assert.equal(read.deny, undefined);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+it("keeps a verified in-project edit low when only its payload was omitted", () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "auto-mode-file-payload-")));
+  try {
+    mkdirSync(join(root, ".git"));
+    writeFileSync(join(root, "safe.txt"), "");
+    const store = createToolInputStore();
+    store.capture({ sessionID: "s", messageID: "m", id: "c", tool: "write", input: { filePath: "safe.txt", content: "payload" } });
+    const operation = buildOperationEvidence({ action: "edit", resources: ["safe.txt"] },
+      { projectDir: root, capture: store.get({ type: "tool", messageID: "m", id: "c" }, "s") });
+    assert.equal(operation.complete, false);
+    assert.equal(operation.arguments?.content, undefined);
+    const edits = parseOptions({ classifiers: [{ type: "static", allowInProjectEdits: true }] });
+    assert.equal(scoreRequest({ action: "edit", resources: ["safe.txt"], projectDir: root, operation }, edits).band, "low");
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
