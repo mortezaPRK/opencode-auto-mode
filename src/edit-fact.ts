@@ -461,11 +461,29 @@ function scopedPath(target: string): boolean {
   return policy.kind === "ordinary" && !policy.review;
 }
 
-/** A relative or missing root is never widened into the process directory. */
+/** A relative root is never widened into the process directory, and the
+ * compatibility-only `worktreeRoot` declaration is never containment proof:
+ * only a Git root discovered from the project directory may widen it, with the
+ * canonical project directory itself as the non-Git fallback. */
 function projectRoot(request: EditFactRequest): string | undefined {
-  const root = request.worktreeRoot ?? request.projectDir;
-  if (root === undefined || !isAbsolute(root)) return undefined;
-  try { return realpathSync(root); } catch { return normalize(root); }
+  const projectDir = request.projectDir;
+  if (projectDir === undefined || !isAbsolute(projectDir)) return undefined;
+  const canonical = canonicalPath(projectDir);
+  return discoveredRoot(canonical) ?? canonical;
+}
+
+/** Keeps the lexical spelling when the project directory does not exist yet. */
+function canonicalPath(value: string): string {
+  try { return realpathSync(value); } catch { return normalize(value); }
+}
+
+/** A discovered root still needs a real marker and containment of the project
+ * directory before it may stand in for the project-directory boundary. */
+function discoveredRoot(projectDir: string): string | undefined {
+  try {
+    const root = getWorktreeScope(projectDir).worktreeRoot;
+    return gitMarker(root) && isInside(root, projectDir, true) ? root : undefined;
+  } catch { return undefined; }
 }
 
 /** Keeps a not-yet-created suffix so a symlinked ancestor cannot move the target. */
@@ -572,18 +590,28 @@ function projectEditScope(request: EditFactRequest): ProjectEditScope | undefine
   return root === undefined ? undefined : { tool, projectDir, root };
 }
 
-/** The spelling prefix of `resolved` that resolves to the checkout root, so a
- * symlinked root spelling still anchors the component walk. */
-function rootSpelling(root: string, resolved: string): string | undefined {
-  let current = resolved;
+/** Ancestor spellings of `value`, outermost filesystem root first. */
+function ancestorSpellings(value: string): string[] {
+  const spellings: string[] = [];
+  let current = value;
   while (true) {
-    try {
-      if (realpathSync(current) === root) return current;
-    } catch { /* missing suffix: climb to the nearest existing prefix */ }
+    spellings.push(current);
     const parent = dirname(current);
-    if (parent === current) return undefined;
+    if (parent === current) return spellings.reverse();
     current = parent;
   }
+}
+
+/** The outermost spelling prefix of `resolved` that resolves to the checkout
+ * root. Choosing the outermost one keeps a symlinked root spelling working
+ * while any descendant alias of the root stays visible to the component walk. */
+function rootSpelling(root: string, resolved: string): string | undefined {
+  for (const spelling of ancestorSpellings(resolved)) {
+    try {
+      if (realpathSync(spelling) === root) return spelling;
+    } catch { /* missing suffix: keep walking toward the filesystem root */ }
+  }
+  return undefined;
 }
 
 interface ProjectTarget { readonly canonical: string; readonly rel: string }

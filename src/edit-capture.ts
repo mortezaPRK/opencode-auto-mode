@@ -75,6 +75,7 @@ const MAX_PATH_CHARS = 2_048;
 const SHA256 = /^[0-9a-f]{64}$/;
 const NUL = /\0/;
 const WILDCARD = /[*?]/;
+const PARENT_COMPONENT = /(?:^|[\\/])\.\.(?:[\\/]|$)/;
 const HOME_PREFIX = /^(?:~|\$HOME)(?:[\\/]|$)/;
 const NO_KEYS: ReadonlySet<string> = new Set();
 const EDIT_ARG_REQUIRED = new Set(["oldString", "newString"]);
@@ -106,11 +107,14 @@ function idText(value: unknown): value is string {
     value.trim().length > 0 && !NUL.test(value);
 }
 
-/** Shared with the operation-path guard so both checks reject the same shapes. */
+/** Shared with the operation-path guard so both checks reject the same shapes.
+ * A parent component is rejected before lexical normalization can collapse it,
+ * because `link/../file` resolves the link first on the filesystem even though
+ * `normalize` would keep only the sibling spelling. */
 export function isUsableEditPath(value: string): boolean {
   const trimmed = value.trim();
   return trimmed.length > 0 && trimmed.length <= MAX_PATH_CHARS && !NUL.test(value) &&
-    !WILDCARD.test(value) && !HOME_PREFIX.test(trimmed);
+    !WILDCARD.test(value) && !PARENT_COMPONENT.test(value) && !HOME_PREFIX.test(trimmed);
 }
 
 function usableAlias(value: unknown): string | undefined {

@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import {
   capturedEditArgs,
+  isUsableEditPath,
   prepareCapturedEdit,
   readEditCapture,
   sameEditCapture,
@@ -122,6 +123,11 @@ it("rejects args that are not the exact recognized edit/write shape", () => {
     ["write", "unknown write field", { path: PATH, content: "x", extra: true }],
     ["edit", "non-string path", { path: 1, oldString: "a", newString: "b" }],
     ["edit", "wildcard path", { path: "/repo/*.ts", oldString: "a", newString: "b" }],
+    ["edit", "parent path", { path: "/repo/src/../parser.ts", oldString: "a", newString: "b" }],
+    ["edit", "parent filePath",
+      { filePath: "/repo/src/../parser.ts", oldString: "a", newString: "b" }],
+    ["write", "parent path", { path: "/repo/src/../parser.ts", content: "x" }],
+    ["write", "parent filePath", { filePath: "/repo/src/../parser.ts", content: "x" }],
     ["edit", "home path", { path: "~/parser.ts", oldString: "a", newString: "b" }],
     ["edit", "nul path", { path: "/repo/a\0b", oldString: "a", newString: "b" }],
     ["write", "non-filePath wildcard", { filePath: "/repo/*.ts", content: "x" }],
@@ -189,4 +195,11 @@ it("validates capture identity shape without granting provenance", () => {
   assert.equal(sameEditCapture({ ...payload.capture, callID: "other" }, payload.capture), false);
   assert.equal(readEditCapture({ ...payload.capture, argsSha256: "ABC" }), undefined);
   assert.equal(readEditCapture({ ...payload.capture, extra: true }), undefined);
+});
+
+it("treats only a whole parent component as traversal", () => {
+  for (const value of ["/repo/src/a..b.ts", "/repo/src/..cache/parser.ts"])
+    assert.equal(isUsableEditPath(value), true, value);
+  for (const value of ["/repo/src/../parser.ts", "../parser.ts", "/repo/..", "..\\parser.ts"])
+    assert.equal(isUsableEditPath(value), false, value);
 });

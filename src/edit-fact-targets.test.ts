@@ -3,12 +3,13 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { linkSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, sep } from "node:path";
 import { prepareCapturedEdit, type EditPayload } from "./edit-capture.js";
 import { prepareEditCandidate, prepareProjectEditCandidate, type EditFactRequest } from "./edit-fact.js";
 
 const ROOT = realpathSync(mkdtempSync(join(tmpdir(), "edit-fact-targets-")));
 const OUTSIDE = realpathSync(mkdtempSync(join(tmpdir(), "edit-fact-outside-")));
+const DECLARED = realpathSync(mkdtempSync(join(tmpdir(), "edit-fact-declared-")));
 const ALIAS = join(dirname(ROOT), `edit-fact-alias-${process.pid}`);
 const PROJECT = join(ROOT, "packages", "a");
 const SIBLING = join(ROOT, "packages", "b");
@@ -17,18 +18,27 @@ const IDENTITY = { sessionID: "session-1", messageID: "message-1", callID: "call
 mkdirSync(PROJECT, { recursive: true });
 mkdirSync(join(SIBLING, "real"), { recursive: true });
 mkdirSync(join(ROOT, ".git"));
+mkdirSync(join(OUTSIDE, "child"), { recursive: true });
+mkdirSync(join(DECLARED, "repo", ".git"), { recursive: true });
+mkdirSync(join(DECLARED, "outside"), { recursive: true });
 writeFileSync(join(OUTSIDE, "parser.ts"), "const a = 1;\n");
+writeFileSync(join(OUTSIDE, "child", "parser.ts"), "const a = 1;\n");
+writeFileSync(join(DECLARED, "outside", "parser.ts"), "const a = 1;\n");
+writeFileSync(join(ROOT, "parser.ts"), "const a = 1;\n");
 writeFileSync(join(PROJECT, "parser.ts"), "const a = 1;\n");
 writeFileSync(join(SIBLING, "parser.ts"), "const a = 1;\n");
 writeFileSync(join(PROJECT, "hardlinked.ts"), "const a = 1;\n");
 linkSync(join(PROJECT, "hardlinked.ts"), join(PROJECT, "linked.ts"));
 symlinkSync(join(PROJECT, "parser.ts"), join(PROJECT, ".env"));
 symlinkSync(join(SIBLING, "real"), join(SIBLING, "inner"));
+symlinkSync(join(OUTSIDE, "child"), join(ROOT, "escape"));
+symlinkSync(ROOT, join(ROOT, "loop"));
 symlinkSync(ROOT, ALIAS);
 after(() => {
   unlinkSync(ALIAS);
   rmSync(ROOT, { recursive: true, force: true });
   rmSync(OUTSIDE, { recursive: true, force: true });
+  rmSync(DECLARED, { recursive: true, force: true });
 });
 
 function mint(tool: "edit" | "write", path: string): EditPayload {
@@ -121,4 +131,43 @@ it("still rejects targets outside the checkout and symlink components inside it"
   blocksMetadata(metadataRequest(outside, { path: outside }), "target outside the declared checkout");
   const inner = join(SIBLING, "inner", "new.ts");
   blocksMetadata(metadataRequest(inner, { path: inner }), "inner symlink below the checkout root");
+});
+
+it("rejects parent components in every captured alias and operation target", () => {
+  const traversal = [join(PROJECT, "nested"), "..", "parser.ts"].join(sep);
+  assert.equal(prepareCapturedEdit({
+    tool: "edit", args: { path: traversal, oldString: "const a = 1;", newString: "const a = 2;" },
+  }, IDENTITY, true), undefined, "edit path alias");
+  assert.equal(prepareCapturedEdit({
+    tool: "write", args: { filePath: traversal, content: "const a = 2;\n" },
+  }, IDENTITY, true), undefined, "write filePath alias");
+  const target = join(PROJECT, "parser.ts");
+  const request = fullRequest("edit", target);
+  const traversing: EditFactRequest = {
+    ...request,
+    resources: [traversal],
+    operation: { ...request.operation!, targets: [traversal], arguments: { path: traversal } },
+  };
+  assert.equal(prepareEditCandidate(traversing, true).ok, false, "full payload operation target");
+  blocksMetadata(metadataRequest(traversal, { path: traversal }), "metadata operation target");
+});
+
+it("rejects a symlinked parent component before lexical normalization", () => {
+  const traversal = [join(ROOT, "escape"), "..", "parser.ts"].join(sep);
+  assert.equal(prepareCapturedEdit({
+    tool: "edit", args: { path: traversal, oldString: "const a = 1;", newString: "const a = 2;" },
+  }, IDENTITY, true), undefined, "captured payload");
+  blocksMetadata(metadataRequest(traversal, { path: traversal }), "metadata target through a symlinked parent");
+});
+
+it("does not let an unverified worktree root widen the metadata boundary", () => {
+  const target = join(DECLARED, "outside", "parser.ts");
+  blocksMetadata(metadataRequest(target, { path: target }, {
+    projectDir: join(DECLARED, "repo"), worktreeRoot: DECLARED,
+  }), "declared ancestor root");
+});
+
+it("walks components from the outermost spelling that resolves to the checkout root", () => {
+  const looped = join(ROOT, "loop", "parser.ts");
+  blocksMetadata(metadataRequest(looped, { path: looped }), "descendant symlink back to the root");
 });
