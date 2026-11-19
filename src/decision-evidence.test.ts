@@ -132,6 +132,21 @@ it("keeps the whole action, relevant scope, operation and concrete findings only
     }
   });
 
+  it("keeps Git facts for a wrapper operation whose arguments carry the command", () => {
+    const wrapper: OperationEvidence = {
+      tool: "mcp__shellish__run", access: "execute", targets: ["*"],
+      arguments: { command: "git reset --hard HEAD~1" }, complete: true,
+    };
+    const evidence = buildDecisionEvidence({ action: "mcp", resources: ["*"], operation: wrapper, gitState: request.gitState });
+    assert.deepEqual(evidence.gitState, { branch: "topic", defaultBranch: "trunk", clean: true });
+    assert.equal(evidence.incompleteEvidence, undefined);
+    const chained: OperationEvidence = { ...wrapper, arguments: { command: ["bash", "-lc", "git push --force"] } };
+    assert.deepEqual(buildDecisionEvidence({ action: "mcp", resources: ["*"], operation: chained, gitState: request.gitState }).gitState,
+      { branch: "topic", defaultBranch: "trunk", clean: true });
+    const unrelated: OperationEvidence = { ...wrapper, arguments: { command: "npm run build" } };
+    assert.equal(buildDecisionEvidence({ action: "mcp", resources: ["*"], operation: unrelated, gitState: request.gitState }).gitState, undefined);
+  });
+
   it("retains raw commands while preserving HTTP-body redaction and incomplete evidence", () => {
     const command = `echo ${"x".repeat(5_000)}`;
     assert.deepEqual(buildDecisionEvidence({ action: "shell", resources: [command] }).resources, [command]);

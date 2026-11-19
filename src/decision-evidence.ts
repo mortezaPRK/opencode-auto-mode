@@ -60,6 +60,8 @@ const DELEGATION_LOSS = "Delegated context was redacted";
 // Treat any non-alphanumeric as a delimiter so underscores, dashes and dots
 // separate too; `digit`, `legit` and `github` stay unrelated words.
 const GIT_CONTEXT = /(?:^|[^a-z0-9])(?:git|gh)(?![a-z0-9])/i;
+// Wrapper tools (`mcp__shellish__run`) carry the real command in their arguments.
+const COMMAND_ARGUMENT = /command|cmd/i;
 
 function accessOf(value: unknown): OperationAccess {
   return value === "read" || value === "write" || value === "execute" || value === "unknown"
@@ -177,9 +179,27 @@ function staticEvidence(request: DecisionEvidenceRequest): DecisionEvidence["sta
   return { findings: [...findings] };
 }
 
+function argumentStrings(value: unknown): string[] {
+  if (typeof value === "string") return [value];
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is string => typeof item === "string");
+}
+
+/** The selected operation can be a wrapper whose arguments carry the Git
+ * command, so its tool and command-like arguments count as Git context. */
+function operationGitText(operation: OperationEvidence | undefined): string[] {
+  const text = operation?.tool === undefined ? [] : [operation.tool];
+  for (const [key, value] of Object.entries(operation?.arguments ?? {})) {
+    if (COMMAND_ARGUMENT.test(key)) text.push(...argumentStrings(value));
+  }
+  return text;
+}
+
 function gitEvidence(request: DecisionEvidenceRequest): DecisionEvidence["gitState"] {
   const state = request.gitState;
-  if (state === undefined || !GIT_CONTEXT.test([request.action, ...request.resources].join("\n"))) return undefined;
+  if (state === undefined) return undefined;
+  const context = [request.action, ...request.resources, ...operationGitText(request.operation)];
+  if (!GIT_CONTEXT.test(context.join("\n"))) return undefined;
   return {
     ...(state.branch === undefined ? {} : { branch: state.branch }),
     ...(state.defaultBranch === undefined ? {} : { defaultBranch: state.defaultBranch }),
